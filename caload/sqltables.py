@@ -6,13 +6,13 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
 # Set WAL
-# @event.listens_for(Engine, 'connect')
-# def set_sqlite_pragma(dbapi_connection, connection_record):
-#     cursor = dbapi_connection.cursor()
-#     print('Set timeout and WAL')
-#     cursor.execute('PRAGMA journal_mode=WAL;')
-#     cursor.execute('PRAGMA busy_timeout = 30000;')
-#     cursor.close()
+@event.listens_for(Engine, 'connect')
+def set_sqlite_pragma(dbapi_connection, connection_record):
+    cursor = dbapi_connection.cursor()
+    # print('Set timeout and WAL')
+    cursor.execute('PRAGMA journal_mode=WAL;')
+    cursor.execute('PRAGMA busy_timeout=30000;')
+    cursor.close()
 
 
 class SQLBase(DeclarativeBase):

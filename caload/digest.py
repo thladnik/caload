@@ -16,14 +16,6 @@ from caload import base, utils
 log = logging.getLogger(__name__)
 
 
-def _recording_id_from_path(path: Union[Path, str]) -> Tuple[str, str]:
-    return Path(path).as_posix().split('/')[-1].split('_') # type: ignore
-
-
-def _animal_id_from_path(path: Union[Path, str]) -> str:
-    return Path(path).as_posix().split('/')[-2]
-
-
 def create_analysis(analysis_path: str, data_root: str) -> base.Analysis:
 
     # Create analysis data folder
@@ -39,6 +31,16 @@ def create_analysis(analysis_path: str, data_root: str) -> base.Analysis:
 
     # Start digesting recordings
     digest_folder(recording_folders, analysis)
+
+    return analysis
+
+
+def _recording_id_from_path(path: Union[Path, str]) -> Tuple[str, str]:
+    return Path(path).as_posix().split('/')[-1].split('_')  # type: ignore
+
+
+def _animal_id_from_path(path: Union[Path, str]) -> str:
+    return Path(path).as_posix().split('/')[-2]
 
 
 def scan_folder(root_path: str, recording_list: List[str]) -> List[str]:
@@ -71,13 +73,16 @@ def digest_folder(folder_list: List[str], analysis: base.Analysis):
 
         # Get animal
         animal_id = _animal_id_from_path(current_path)
-        _animal_list = analysis.animal(animal_id=animal_id)
+        _animal_list = analysis.animals(animal_id=animal_id)
         # Add new animal
         if len(_animal_list) == 0:
             animal = analysis.add_animal(animal_id=animal_id)
             animal['animal_id'] = animal_id
         else:
             animal = _animal_list[0]
+
+        # Commit animal
+        analysis.session.commit()
 
         # Create debug folder
         debug_folder_path = os.path.join(current_path, 'debug')
@@ -87,6 +92,7 @@ def digest_folder(folder_list: List[str], analysis: base.Analysis):
         # Get recording
         # Expected recording folder format "<rec_date('YYYY-mm-dd'>_<rec_id>"
         rec_date, rec_id, *_ = _recording_id_from_path(current_path)
+        rec_date = utils.parse_date(rec_date)
         _recording_list = analysis.recordings(animal_id=animal.id, rec_date=rec_date, rec_id=rec_id)
         # Add recording
         if len(_recording_list) > 0:
@@ -94,7 +100,8 @@ def digest_folder(folder_list: List[str], analysis: base.Analysis):
             continue
 
         recording = animal.add_recording(rec_date=rec_date, rec_id=rec_id)
-        recording['rec_date'] = utils.parse_date(rec_date)
+        recording['animal_id'] = animal_id
+        recording['rec_date'] = rec_date
         recording['rec_id'] = rec_id
 
         # Load s2p processed data
@@ -152,13 +159,21 @@ def digest_folder(folder_list: List[str], analysis: base.Analysis):
         recording['signal_length'] = fluorescence.shape[0]
         recording['imaging_rate'] = imaging_rate
         recording['ca_times'] = frame_times
-        recording['record_group_ids'] = ca_rec_group_id_fun(frame_times)
+        record_group_ids = ca_rec_group_id_fun(frame_times)
+        recording['record_group_ids'] = record_group_ids
+
+        # Commit recording
+        analysis.session.commit()
 
         # Add suite2p's analysis ROI stats
         print('Add ROI stats and calculate signals')
         for roi_id in tqdm(range(fluorescence.shape[0])):
             # Create ROI
             roi = recording.add_roi(roi_id=roi_id)
+            roi['animal_id'] = animal_id
+            roi['rec_date'] = rec_date
+            roi['rec_id'] = rec_id
+            roi['roi_id'] = roi_id
 
             roi_stats = roi_stats_all[roi_id]
 
@@ -172,6 +187,9 @@ def digest_folder(folder_list: List[str], analysis: base.Analysis):
             roi['fluorescence'] = fluores
             roi['spikes'] = spikes
             roi['iscell'] = iscell
+
+        # Commit rois
+        analysis.session.commit()
 
         print('Add display phase data')
         with h5py.File(os.path.join(current_path, 'Display.hdf5'), 'r') as disp_file:
@@ -191,7 +209,20 @@ def digest_folder(folder_list: List[str], analysis: base.Analysis):
                 # Add phase
                 if 'phase' in key1:
 
-                    phase = recording.add_phase(phase_id=int(key1.replace('phase', '')))
+                    phase_id = int(key1.replace('phase', ''))
+                    phase = recording.add_phase(phase_id=phase_id)
+                    phase['animal_id'] = animal_id
+                    phase['rec_date'] = rec_date
+                    phase['rec_id'] = rec_id
+                    phase['phase_id'] = phase_id
+
+                    # Add calcium start/end indices
+                    in_phase_idcs = np.where(record_group_ids == phase_id)[0]
+                    start_index = np.argmin(np.abs(frame_times - frame_times[in_phase_idcs[0]]))
+                    end_index = np.argmin(np.abs(frame_times - frame_times[in_phase_idcs[-1]]))
+                    phase['ca_start_index'] = start_index
+                    phase['ca_end_index'] = end_index
+
                     # Write attributes
                     phase.update({k: v for k, v in member1.attrs.items()})
 
@@ -210,7 +241,8 @@ def digest_folder(folder_list: List[str], analysis: base.Analysis):
                         if isinstance(member2, h5py.Dataset):
                             recording[f'display/{key1}/{key2}'] = member2[:]
 
-            analysis.session.commit()
+        # Commit phases and display data
+        analysis.session.commit()
 
 
 def load_metadata(folder_path: str) -> Dict[str, Any]:

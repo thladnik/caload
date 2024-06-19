@@ -4,16 +4,16 @@ import os
 from caload import base
 from caload import sqltables as sql
 
-__all__ = ['sql', 'base', 'open_analysis']
+__all__ = ['base', 'sql', 'digest', 'open_analysis', 'less', 'lessequal', 'equal', 'greaterequal', 'greater']
 
 
-def open_analysis(analysis_path: str) -> base.Analysis:
+def open_analysis(analysis_path: str, mode=base.Mode.analyse) -> base.Analysis:
 
     meta_path = f'{analysis_path}/metadata.db'
     if not os.path.exists(meta_path):
         raise ValueError(f'Path {meta_path} not found')
 
-    summary = base.Analysis(analysis_path)
+    summary = base.Analysis(analysis_path, mode=mode)
 
     return summary
 
@@ -40,7 +40,6 @@ def greaterequal(name, value):
 
 if __name__ == '__main__':
 
-
     # path = '../../../../TEMP_testdata/default_orientation/analysis01'
     # analysis = open_analysis(path)
 
@@ -50,7 +49,5 @@ if __name__ == '__main__':
 
     # Filter examples
     analysis.rois(greater('s2p/radius', 1.))
-
-
 
     print('Fin')
