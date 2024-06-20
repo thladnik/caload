@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import os.path
 import pickle
+import sys
 import time
-from abc import  abstractmethod
-from datetime import datetime, date
+from abc import abstractmethod
+from datetime import datetime, date, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Tuple, Type, Union
@@ -128,7 +129,7 @@ class Analysis:
             except Exception as _exc:
                 import traceback
                 last_exception = traceback.format_exc()
-                if (time.perf_counter()-start) > self.write_timeout:
+                if (time.perf_counter() - start) > self.write_timeout:
                     pending = False
             else:
                 pending = False
@@ -142,30 +143,60 @@ class Analysis:
         for entity in entities:
             entity.export(path)
 
-    def distribute_work(self, fun: Callable, entities: List[entities], chunksize: int = None) -> Any:
+    def distribute_work(self, fun: Callable, entities: List[entities],
+                        chunk_size: int = None, worker_num: int = None) -> Any:
         # Close session first
         self.close_session()
 
         import multiprocessing as mp
-        worker_num = mp.cpu_count()-1
+        if worker_num is None:
+            worker_num = mp.cpu_count() - 1
         print(f'Start pool with {worker_num} workers')
         # pool = mp.Pool(processes=worker_num, initializer=self.initialize_worker, initargs=(self,))
         pool = mp.Pool(processes=worker_num)
         # pool.map(fun, enitites)
-        
-        if chunksize is None:
+
+        if chunk_size is None:
             worker_args = [(fun, e) for e in entities]
         else:
-            chunk_num = int(np.ceil(len(entities) / chunksize))
-            worker_args = [(fun, entities[i*chunksize:(i+1)*chunksize]) for i in range(chunk_num)]
+            chunk_num = int(np.ceil(len(entities) / chunk_size))
+            worker_args = [(fun, entities[i * chunk_size:(i + 1) * chunk_size]) for i in range(chunk_num)]
+        print(f'Entity chunksize {chunk_size}')
 
-        for _ in tqdm(pool.imap_unordered(self.worker_wrapper, worker_args) , total=len(worker_args)):
-            pass
+        execution_times = []
+        start_time = time.perf_counter()
+        iter_num = 0
+        for exec_time in pool.imap_unordered(self.worker_wrapper, worker_args):
+            iter_num += 1
 
+            # Calcualate timing info
+            execution_times.append(exec_time)
+            mean_exec_time = np.mean(execution_times)
+            time_per_entity = mean_exec_time / (worker_num * chunk_size)
+            iter_rest = len(worker_args) - iter_num
+            time_elapsed = time.perf_counter() - start_time
+            time_rest = time_per_entity * (len(entities) - iter_num * chunk_size)
+
+            # Print timing info
+            sys.stdout.write('\r'
+                             f'[{iter_num * chunk_size}/{len(entities)}] '
+                             f'{time_per_entity:.2f}s/iter '
+                             f'- {timedelta(seconds=int(time_elapsed))}'
+                             f'/{timedelta(seconds=int(time_elapsed + time_rest))} '
+                             f'-> {timedelta(seconds=int(time_rest))} remaining ')
+
+            # Truncate
+            if len(execution_times) > 100:
+                execution_times = execution_times[len(execution_times) - 100:]
+
+        # Re-open session
         self.open_session()
 
     @staticmethod
     def worker_wrapper(args):
+
+        start_time = time.perf_counter()
+        # Unpack args
         fun: Callable = args[0]
         entity: Union[Entity, List[Entity]] = args[1]
 
@@ -184,13 +215,7 @@ class Analysis:
         else:
             entity.analysis.close_session()
 
-        # return inner
-
-    # @staticmethod
-    # def initialize_worker(analysis: Analysis):
-    #     pass
-    #     # analysis.open_session()
-    #     # locals()['sql_session'] = analysis.session
+        return time.perf_counter() - start_time
 
 
 class Entity:
@@ -329,7 +354,8 @@ class Entity:
     def analysis(self) -> Analysis:
         return self._analysis
 
-    def _query_attribute_row(self, key: str) -> Union[sql.AnimalAttribute, sql.RecordingAttribute, sql.RoiAttribute, None]:
+    def _query_attribute_row(self, key: str) -> Union[
+        sql.AnimalAttribute, sql.RecordingAttribute, sql.RoiAttribute, None]:
 
         # Build Entity-specific query
         query = (self.analysis.session.query(self._attribute_table)
@@ -439,10 +465,12 @@ class Recording(Entity):
         return Phase.create(*args, recording=self, analysis=self.analysis, **kwargs)
 
     def rois(self, *args, **kwargs) -> List[Roi]:
-        return Roi.filter(self.analysis, animal_id=self.animal_id, rec_id=self.id, rec_date=self.rec_date, *args, **kwargs)
+        return Roi.filter(self.analysis, animal_id=self.animal_id, rec_id=self.id, rec_date=self.rec_date, *args,
+                          **kwargs)
 
     def phases(self, *args, **kwargs) -> List[Phase]:
-        return Phase.filter(self.analysis, animal_id=self.animal_id, rec_id=self.id, rec_date=self.rec_date, *args, **kwargs)
+        return Phase.filter(self.analysis, animal_id=self.animal_id, rec_id=self.id, rec_date=self.rec_date, *args,
+                            **kwargs)
 
     @property
     def path(self) -> str:
@@ -659,7 +687,6 @@ def _filter(analysis: Analysis,
             rec_id: str = None,
             roi_id: int = None,
             phase_id: int = None) -> List[Union[sql.Animal, sql.Recording, sql.Roi]]:
-
     # Convert date
     rec_date = utils.parse_date(rec_date)
 
