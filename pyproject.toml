@@ -17,23 +17,27 @@ classifiers = [
         'Operating System :: Microsoft :: Windows',
         'Operating System :: Microsoft :: Windows :: Windows 11',
         'Programming Language :: Python',
+        'Programming Language :: Python :: 3.6',
+        'Programming Language :: Python :: 3.7',
+        'Programming Language :: Python :: 3.8',
+        'Programming Language :: Python :: 3.9',
         'Programming Language :: Python :: 3.10',
         'Programming Language :: Python :: 3.11',
         'Topic :: Scientific/Engineering'
 ]
 keywords = ['neuroscience', 'experiment', 'data analysis']
 dependencies = [
-    'SQLAlchemy>=2.0.30',
-    'h5py>=3.11.0',
-    'matplotlib>=3.7.2',
-    'numpy>=1.23.4',
-    'tifffile>=2024.5.22',
-    'pyyaml>=6.0',
-    'scipy>=1.9.2',
-    'tqdm>=4.66.4',
-    'setuptools>=65.5.0',
+    'SQLAlchemy',
+    'h5py',
+    'matplotlib',
+    'numpy',
+    'tifffile',
+    'pyyaml',
+    'scipy',
+    'tqdm',
+    'setuptools',
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.6"
 
 [tool.setuptools.packages.find]
 where = ['.']
