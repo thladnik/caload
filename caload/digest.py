@@ -65,24 +65,56 @@ def scan_folder(root_path: str, recording_list: List[str]) -> List[str]:
     return recording_list
 
 
+def create_animal(analysis: base.Analysis, current_path: str) -> base.Animal:
+
+    # Create animal
+    animal_id = _animal_id_from_path(current_path)
+    animal = analysis.add_animal(animal_id=animal_id)
+    animal['animal_id'] = animal_id
+
+    # Search for zstacks
+    zstack_names = []
+    animal_path = str(os.path.join(*current_path.split('/')[:-1]))
+    for fn in os.listdir(animal_path):
+        path = os.path.join(current_path, fn)
+        if os.path.isdir(path):
+            continue
+        if 'zstack' in fn:
+            if fn.lower().endswith(('.tif', '.tiff')):
+                zstack_names.append(fn)
+
+    if len(zstack_names) > 0:
+        if len(zstack_names) > 1:
+            print(f'WARNING: multiple zstacks detected, using {zstack_names[0]}')
+
+        print(f'Add zstack {zstack_names[0]}')
+
+        animal['zstack_fn'] = zstack_names[0]
+        animal['zstack'] = tifffile.imread(os.path.join(animal_path, zstack_names[0]))
+
+    # Commit animal
+    analysis.session.commit()
+
+    return animal
+
+
 def digest_folder(folder_list: List[str], analysis: base.Analysis):
 
     print(f'Process folders: {folder_list}')
     for current_path in folder_list:
+
+        current_path = Path(current_path).as_posix()
         print(f'Recording folder {current_path}')
 
-        # Get animal
+        # Check if animal exists
         animal_id = _animal_id_from_path(current_path)
         _animal_list = analysis.animals(animal_id=animal_id)
-        # Add new animal
+
         if len(_animal_list) == 0:
-            animal = analysis.add_animal(animal_id=animal_id)
-            animal['animal_id'] = animal_id
+            # Add new animal
+            animal = create_animal(analysis, current_path)
         else:
             animal = _animal_list[0]
-
-        # Commit animal
-        analysis.session.commit()
 
         # Create debug folder
         debug_folder_path = os.path.join(current_path, 'debug')
@@ -90,7 +122,7 @@ def digest_folder(folder_list: List[str], analysis: base.Analysis):
             os.mkdir(debug_folder_path)
 
         # Get recording
-        # Expected recording folder format "<rec_date('YYYY-mm-dd'>_<rec_id>"
+        # Expected recording folder format "<rec_date('YYYY-mm-dd')>_<rec_id>_*"
         rec_date, rec_id, *_ = _recording_id_from_path(current_path)
         rec_date = utils.parse_date(rec_date)
         _recording_list = analysis.recordings(animal_id=animal.id, rec_date=rec_date, rec_id=rec_id)
@@ -110,7 +142,7 @@ def digest_folder(folder_list: List[str], analysis: base.Analysis):
         # Load suite2p's analysis options
         print('Include suite2p ops')
         ops = np.load(os.path.join(s2p_path, 'ops.npy'), allow_pickle=True).item()
-        unravel_dict(ops, recording)
+        unravel_dict(ops, recording, 's2p')
 
         print('Calculate frame timing of signal')
         with h5py.File(os.path.join(current_path, 'Io.hdf5'), 'r') as io_file:
@@ -166,7 +198,7 @@ def digest_folder(folder_list: List[str], analysis: base.Analysis):
         analysis.session.commit()
 
         # Add suite2p's analysis ROI stats
-        print('Add ROI stats and calculate signals')
+        print('Add ROI stats and signals')
         for roi_id in tqdm(range(fluorescence.shape[0])):
             # Create ROI
             roi = recording.add_roi(roi_id=roi_id)
@@ -267,12 +299,12 @@ def load_metadata(folder_path: str) -> Dict[str, Any]:
     return meta_data
 
 
-def unravel_dict(dict_data: dict, entity: Union[base.Animal, base.Recording, base.Roi]):
+def unravel_dict(dict_data: dict, entity: Union[base.Animal, base.Recording, base.Roi], path: str):
     for key, item in dict_data.items():
         if isinstance(item, dict):
-            unravel_dict(item, entity)
+            unravel_dict(item, entity, f'{path}/{key}')
             continue
-        entity[key] = item
+        entity[f'{path}/{key}'] = item
 
 
 def calculate_ca_frame_times(mirror_position: np.ndarray, mirror_time: np.ndarray):

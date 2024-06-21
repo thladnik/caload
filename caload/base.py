@@ -152,9 +152,7 @@ class Analysis:
         if worker_num is None:
             worker_num = mp.cpu_count() - 1
         print(f'Start pool with {worker_num} workers')
-        # pool = mp.Pool(processes=worker_num, initializer=self.initialize_worker, initargs=(self,))
         pool = mp.Pool(processes=worker_num)
-        # pool.map(fun, enitites)
 
         if chunk_size is None:
             worker_args = [(fun, e) for e in entities]
@@ -290,7 +288,8 @@ class Entity:
             row.value = value
 
             # Commit changes
-            self.analysis.session.commit()
+            if self.analysis.mode != Mode.create:
+                self.analysis.session.commit()
 
         # Set arrays
         else:
@@ -392,11 +391,15 @@ class Animal(Entity):
 
     @staticmethod
     def create(animal_id: str, analysis: Analysis):
+        # Add row
         row = sql.Animal(id=animal_id)
         analysis.session.add(row)
         analysis.session.commit()
+
+        # Add entity
         entity = Animal(row=row, analysis=analysis)
         analysis.add_entity(entity)
+
         return entity
 
     @property
@@ -451,11 +454,15 @@ class Recording(Entity):
 
     @staticmethod
     def create(animal: Animal, rec_date: date, rec_id: str, analysis: Analysis):
+        # Add row
         row = sql.Recording(animal_pk=animal.row.pk, date=utils.parse_date(rec_date), id=rec_id)
         analysis.session.add(row)
         analysis.session.commit()
+
+        # Add entity
         entity = Recording(row=row, analysis=analysis)
         analysis.add_entity(entity)
+
         return entity
 
     def add_roi(self, *args, **kwargs) -> Roi:
@@ -536,11 +543,17 @@ class Phase(Entity):
 
     @staticmethod
     def create(recording: Recording, phase_id: int, analysis: Analysis):
+        # Add row
         row = sql.Phase(recording_pk=recording.row.pk, id=phase_id)
         analysis.session.add(row)
+        # Immediately commit if not in create mode
+        if analysis.mode != Mode.create:
+            analysis.session.commit()
+
+        # Add entity
         entity = Phase(row=row, analysis=analysis)
         analysis.add_entity(entity)
-        analysis.session.commit()
+
         return entity
 
     @property
@@ -617,11 +630,17 @@ class Roi(Entity):
 
     @staticmethod
     def create(recording: Recording, roi_id: int, analysis: Analysis):
+        # Add row
         row = sql.Roi(recording_pk=recording.row.pk, id=roi_id)
         analysis.session.add(row)
+        # Immediately commit if not in create mode
+        if analysis.mode != Mode.create:
+            analysis.session.commit()
+
+        # Add entity
         entity = Roi(row=row, analysis=analysis)
         analysis.add_entity(entity)
-        analysis.session.commit()
+
         return entity
 
     @property
