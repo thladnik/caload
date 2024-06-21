@@ -165,7 +165,11 @@ def digest_folder(folder_list: List[str], analysis: base.Analysis):
         fluorescence = np.load(os.path.join(s2p_path, 'F.npy'), allow_pickle=True)
         spikes_all = np.load(os.path.join(s2p_path, 'spks.npy'), allow_pickle=True)
         roi_stats_all = np.load(os.path.join(s2p_path, 'stat.npy'), allow_pickle=True)
-        iscell_all = np.load(os.path.join(s2p_path, 'iscell.npy'), allow_pickle=True)
+        # In some suite2p versions the iscell file may be missing?
+        try:
+            iscell_all = np.load(os.path.join(s2p_path, 'iscell.npy'), allow_pickle=True)
+        except:
+            iscell_all = None
 
         # Check if frame times and signal match
         if frame_times.shape[0] != fluorescence.shape[1]:
@@ -215,10 +219,12 @@ def digest_folder(folder_list: List[str], analysis: base.Analysis):
             # Write data
             fluores = fluorescence[roi_id]
             spikes = spikes_all[roi_id]
-            iscell = iscell_all[roi_id]
             roi['fluorescence'] = fluores
             roi['spikes'] = spikes
-            roi['iscell'] = iscell
+
+            if iscell_all is not None:
+                iscell = iscell_all[roi_id]
+                roi['iscell'] = iscell
 
         # Commit rois
         analysis.session.commit()
