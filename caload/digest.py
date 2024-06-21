@@ -65,18 +65,18 @@ def scan_folder(root_path: str, recording_list: List[str]) -> List[str]:
     return recording_list
 
 
-def create_animal(analysis: base.Analysis, current_path: str) -> base.Animal:
+def create_animal(analysis: base.Analysis, path: str) -> base.Animal:
 
     # Create animal
-    animal_id = _animal_id_from_path(current_path)
+    animal_id = _animal_id_from_path(path)
+    animal_path = str(os.path.join(*path.split('/')[:-1]))
     animal = analysis.add_animal(animal_id=animal_id)
     animal['animal_id'] = animal_id
 
     # Search for zstacks
     zstack_names = []
-    animal_path = str(os.path.join(*current_path.split('/')[:-1]))
     for fn in os.listdir(animal_path):
-        path = os.path.join(current_path, fn)
+        path = os.path.join(path, fn)
         if os.path.isdir(path):
             continue
         if 'zstack' in fn:
@@ -92,6 +92,9 @@ def create_animal(analysis: base.Analysis, current_path: str) -> base.Animal:
         animal['zstack_fn'] = zstack_names[0]
         animal['zstack'] = tifffile.imread(os.path.join(animal_path, zstack_names[0]))
 
+    # Add metadata
+    add_metadata(animal, animal_path)
+
     # Commit animal
     analysis.session.commit()
 
@@ -101,29 +104,29 @@ def create_animal(analysis: base.Analysis, current_path: str) -> base.Animal:
 def digest_folder(folder_list: List[str], analysis: base.Analysis):
 
     print(f'Process folders: {folder_list}')
-    for current_path in folder_list:
+    for recording_path in folder_list:
 
-        current_path = Path(current_path).as_posix()
-        print(f'Recording folder {current_path}')
+        recording_path = Path(recording_path).as_posix()
+        print(f'Recording folder {recording_path}')
 
         # Check if animal exists
-        animal_id = _animal_id_from_path(current_path)
+        animal_id = _animal_id_from_path(recording_path)
         _animal_list = analysis.animals(animal_id=animal_id)
 
         if len(_animal_list) == 0:
             # Add new animal
-            animal = create_animal(analysis, current_path)
+            animal = create_animal(analysis, recording_path)
         else:
             animal = _animal_list[0]
 
         # Create debug folder
-        debug_folder_path = os.path.join(current_path, 'debug')
+        debug_folder_path = os.path.join(recording_path, 'debug')
         if not os.path.exists(debug_folder_path):
             os.mkdir(debug_folder_path)
 
         # Get recording
         # Expected recording folder format "<rec_date('YYYY-mm-dd')>_<rec_id>_*"
-        rec_date, rec_id, *_ = _recording_id_from_path(current_path)
+        rec_date, rec_id, *_ = _recording_id_from_path(recording_path)
         rec_date = utils.parse_date(rec_date)
         _recording_list = analysis.recordings(animal_id=animal.id, rec_date=rec_date, rec_id=rec_id)
         # Add recording
@@ -136,8 +139,11 @@ def digest_folder(folder_list: List[str], analysis: base.Analysis):
         recording['rec_date'] = rec_date
         recording['rec_id'] = rec_id
 
+        # Add metadata
+        add_metadata(recording, recording_path)
+
         # Load s2p processed data
-        s2p_path = os.path.join(current_path, 'suite2p', 'plane0')
+        s2p_path = os.path.join(recording_path, 'suite2p', 'plane0')
 
         # Load suite2p's analysis options
         print('Include suite2p ops')
@@ -145,7 +151,7 @@ def digest_folder(folder_list: List[str], analysis: base.Analysis):
         unravel_dict(ops, recording, 's2p')
 
         print('Calculate frame timing of signal')
-        with h5py.File(os.path.join(current_path, 'Io.hdf5'), 'r') as io_file:
+        with h5py.File(os.path.join(recording_path, 'Io.hdf5'), 'r') as io_file:
 
             mirror_position = np.squeeze(io_file['ai_y_mirror_in'])[:]
             mirror_time = np.squeeze(io_file['ai_y_mirror_in_time'])[:]
@@ -159,7 +165,7 @@ def digest_folder(folder_list: List[str], analysis: base.Analysis):
             ca_rec_group_id_fun = scipy.interpolate.interp1d(record_group_ids_time, record_group_ids, kind='nearest')
 
         # Plot y mirror signal with detected frames
-        plot_y_mirror_debug_info(mirror_position, mirror_time, frame_idcs, current_path)
+        plot_y_mirror_debug_info(mirror_position, mirror_time, frame_idcs, recording_path)
 
         print('Load ROI data')
         fluorescence = np.load(os.path.join(s2p_path, 'F.npy'), allow_pickle=True)
@@ -230,7 +236,7 @@ def digest_folder(folder_list: List[str], analysis: base.Analysis):
         analysis.session.commit()
 
         print('Add display phase data')
-        with h5py.File(os.path.join(current_path, 'Display.hdf5'), 'r') as disp_file:
+        with h5py.File(os.path.join(recording_path, 'Display.hdf5'), 'r') as disp_file:
 
             # Get attributes
             recording.update({f'display_data/attrs/{k}': v for k, v in disp_file.attrs.items()})
@@ -283,29 +289,30 @@ def digest_folder(folder_list: List[str], analysis: base.Analysis):
         analysis.session.commit()
 
 
-def load_metadata(folder_path: str) -> Dict[str, Any]:
+def add_metadata(entity: base.Entity, folder_path: str):
     """Function searches for and returns metadata on a given folder path
 
     Function scans the `folder_path` for metadata yaml files (ending in `meta.yaml`)
     and returns a dictionary containing their contents
     """
 
-    meta_files = [f for f in os.listdir(folder_path) if f.endswith('meta.yaml')]
+    meta_files = [f for f in os.listdir(folder_path) if f.endswith('metadata.yaml')]
 
     log.info(f'Found {len(meta_files)} metadata files in {folder_path}.')
 
-    meta_data = {}
+    metadata = {}
     for f in meta_files:
         with open(os.path.join(folder_path, f), 'r') as stream:
             try:
-                meta_data.update(yaml.safe_load(stream))
+                metadata.update(yaml.safe_load(stream))
             except yaml.YAMLError as exc:
                 print(exc)
 
-    return meta_data
+    # Add metadata
+    unravel_dict(metadata, entity, 'metadata')
 
 
-def unravel_dict(dict_data: dict, entity: Union[base.Animal, base.Recording, base.Roi], path: str):
+def unravel_dict(dict_data: dict, entity: base.Entity, path: str):
     for key, item in dict_data.items():
         if isinstance(item, dict):
             unravel_dict(item, entity, f'{path}/{key}')
