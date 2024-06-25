@@ -13,7 +13,7 @@ from typing import Any, Callable, Dict, List, Tuple, Type, Union
 import h5py
 import numpy as np
 from sqlalchemy import create_engine, Engine
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, Query
 from tqdm import tqdm
 
 from caload import sqltables as sql
@@ -70,16 +70,16 @@ class Analysis:
     def add_animal(self, animal_id: str) -> Animal:
         return Animal.create(analysis=self, animal_id=animal_id)
 
-    def animals(self, *args, **kwargs) -> List[Animal]:
+    def animals(self, *args, **kwargs) -> EntityCollection:  # List[Animal]:
         return Animal.filter(self, *args, **kwargs)
 
-    def recordings(self, *args, **kwargs) -> List[Recording]:
+    def recordings(self, *args, **kwargs) -> EntityCollection:  # List[Recording]:
         return Recording.filter(self, *args, **kwargs)
 
-    def rois(self, *args, **kwargs) -> List[Roi]:
+    def rois(self, *args, **kwargs) -> EntityCollection:  # List[Roi]:
         return Roi.filter(self, *args, **kwargs)
 
-    def phases(self, *args, **kwargs) -> List[Phase]:
+    def phases(self, *args, **kwargs) -> EntityCollection:  # List[Phase]:
         return Phase.filter(self, *args, **kwargs)
 
     def add_entity(self, entity: Entity):
@@ -216,30 +216,39 @@ class Analysis:
         return time.perf_counter() - start_time
 
 
+class EntityCollection:
+    analysis: Analysis
+    _entity_type: Type[Entity]
+    _entities: List[Entity]
+    _query: Query
+
+    def __init__(self, analysis: Analysis, entity_type: Type[Entity], query: Query):
+        self.analysis = analysis
+        self._entity_type = entity_type
+        self._query = query
+        self._entities = []
+
+    def sortby(self, name: str, order: str = 'ASC'):
+        # TODO: implement sorting
+        self._query = self._query.order_by()
+
+    def __len__(self):
+        return self._query.count()
+
+    def __iter__(self):
+        for row in self._query.all():
+            yield self._entity_type(row=row, analysis=self.analysis)
+
+
 class Entity:
     _analysis: Analysis
-    _attribute_table = Union[Type[sql.Animal], Type[sql.Recording], Type[sql.Roi]]
+    attribute_table = Union[Type[sql.Animal], Type[sql.Recording], Type[sql.Roi]]
 
     def __init__(self, row: Union[sql.Animal, sql.Recording, sql.Roi], analysis: Analysis):
         self._analysis = analysis
         self._row: Union[sql.Animal, sql.Recording, sql.Roi] = row
         self._scalar_attributes: Dict[str, Union[sql.AnimalAttribute, sql.RecordingAttribute, sql.RoiAttribute]] = None
         self._parents: List[Entity] = []
-        #
-        # # In create mode there are no entity attributes yet
-        # if not self.analysis.mode == Mode.create:
-        #     self._update_scalar_attributes()
-
-    # def __new__(cls, row: sql.Animal, analysis: Analysis):
-    #     if not analysis.mode == Mode.create:
-    #         # Create new instance if none exists
-    #         if row not in analysis.entities:
-    #             instance = super(cls.__class__, cls).__new__(cls)
-    #             analysis.entities[row] = instance
-    #
-    #         # Return instance
-    #         return analysis.entities[row]
-    #     return super(cls.__class__, cls).__new__(cls)
 
     def __getitem__(self, item):
 
@@ -281,7 +290,7 @@ class Entity:
                 value_type_map = {str: 'str', float: 'float', int: 'int',
                                   bool: 'bool', date: 'date', datetime: 'datetime'}
                 value_type_str = value_type_map.get(type(value))
-                row = self._attribute_table(entity_pk=self.row.pk, name=key, value_column=f'value_{value_type_str}')
+                row = self.attribute_table(entity_pk=self.row.pk, name=key, value_column=f'value_{value_type_str}')
                 self.analysis.session.add(row)
 
             # Set value
@@ -295,26 +304,6 @@ class Entity:
         else:
             self.analysis.set_entity_attribute(self, key, value)
 
-    # def __contains__(self, item):
-    #     # TODO: redo this, doesn't work properly and replicates code from Analysis.get_entity_attribute
-    #     # Load scalars
-    #     if self._scalar_attributes is None:
-    #         self._update_scalar_attributes()
-    #
-    #     # If scalar value exists, return it
-    #     if item in self._scalar_attributes:
-    #         return True
-    #
-    #     # Check file system
-    #     entity_path = f'{self.analysis.analysis_path}/{self.path}'
-    #     with h5py.File(f'{entity_path}/data.hdf5', 'r') as f:
-    #         if item in f:
-    #             return True
-    #         if item in os.listdir(entity_path):
-    #             return True
-    #
-    #     return False
-
     def _update_scalar_attributes(self):
 
         # Initialize
@@ -322,8 +311,8 @@ class Entity:
             self._scalar_attributes = {}
 
         # Get all
-        query = (self.analysis.session.query(self._attribute_table)
-                 .filter(self._attribute_table.entity_pk == self.row.pk))
+        query = (self.analysis.session.query(self.attribute_table)
+                 .filter(self.attribute_table.entity_pk == self.row.pk))
 
         # Update
         for row in query.all():
@@ -357,9 +346,9 @@ class Entity:
         sql.AnimalAttribute, sql.RecordingAttribute, sql.RoiAttribute, None]:
 
         # Build Entity-specific query
-        query = (self.analysis.session.query(self._attribute_table)
-                 .filter(self._attribute_table.entity_pk == self.row.pk)
-                 .filter(self._attribute_table.name == key))
+        query = (self.analysis.session.query(self.attribute_table)
+                 .filter(self.attribute_table.entity_pk == self.row.pk)
+                 .filter(self.attribute_table.name == key))
 
         # Return None
         if query.count() == 0:
@@ -381,7 +370,7 @@ class Entity:
 
 
 class Animal(Entity):
-    _attribute_table = sql.AnimalAttribute
+    attribute_table = sql.AnimalAttribute
 
     def __init__(self, *args, **kwargs):
         Entity.__init__(self, *args, **kwargs)
@@ -413,32 +402,33 @@ class Animal(Entity):
     def add_recording(self, *args, **kwargs) -> Recording:
         return Recording.create(*args, animal=self, analysis=self.analysis, **kwargs)
 
-    def recordings(self, *args, **kwargs) -> List[Recording]:
+    def recordings(self, *args, **kwargs) -> EntityCollection:  # List[Recording]:
         return Recording.filter(self.analysis, animal_id=self.id, *args, **kwargs)
 
-    def rois(self, *args, **kwargs) -> List[Roi]:
+    def rois(self, *args, **kwargs) -> EntityCollection:  # List[Roi]:
         return Roi.filter(self.analysis, animal_id=self.id, *args, **kwargs)
 
-    def phases(self, *args, **kwargs) -> List[Phase]:
+    def phases(self, *args, **kwargs) -> EntityCollection:  # List[Phase]:
         return Phase.filter(self.analysis, animal_id=self.id, *args, **kwargs)
 
     @classmethod
     def filter(cls,
                analysis: Analysis,
                *attr_filters,
-               animal_id: str = None) -> List[Animal]:
-        result = _filter(analysis,
-                         sql.Animal,
-                         [],
-                         sql.AnimalAttribute,
-                         *attr_filters,
-                         animal_id=animal_id)
+               animal_id: str = None) -> EntityCollection:  # List[Animal]:
+        query = _filter(analysis,
+                        sql.Animal,
+                        [],
+                        sql.AnimalAttribute,
+                        *attr_filters,
+                        animal_id=animal_id)
 
-        return [Animal(row=row, analysis=analysis) for row in result]
+        return EntityCollection(analysis=analysis, entity_type=cls, query=query)
+        # return [Animal(row=row, analysis=analysis) for row in result]
 
 
 class Recording(Entity):
-    _attribute_table = sql.RecordingAttribute
+    attribute_table = sql.RecordingAttribute
 
     def __init__(self, *args, **kwargs):
         Entity.__init__(self, *args, **kwargs)
@@ -471,11 +461,11 @@ class Recording(Entity):
     def add_phase(self, *args, **kwargs) -> Phase:
         return Phase.create(*args, recording=self, analysis=self.analysis, **kwargs)
 
-    def rois(self, *args, **kwargs) -> List[Roi]:
+    def rois(self, *args, **kwargs) -> EntityCollection:  # List[Roi]:
         return Roi.filter(self.analysis, animal_id=self.animal_id, rec_id=self.id, rec_date=self.rec_date, *args,
                           **kwargs)
 
-    def phases(self, *args, **kwargs) -> List[Phase]:
+    def phases(self, *args, **kwargs) -> EntityCollection:  # List[Phase]:
         return Phase.filter(self.analysis, animal_id=self.animal_id, rec_id=self.id, rec_date=self.rec_date, *args,
                             **kwargs)
 
@@ -509,21 +499,22 @@ class Recording(Entity):
                *attr_filters,
                animal_id: str = None,
                rec_date: Union[str, date, datetime] = None,
-               rec_id: str = None) -> List[Recording]:
-        result = _filter(analysis,
-                         sql.Recording,
-                         [sql.Animal],
-                         sql.RecordingAttribute,
-                         *attr_filters,
-                         animal_id=animal_id,
-                         rec_date=rec_date,
-                         rec_id=rec_id)
+               rec_id: str = None) -> EntityCollection:
+        query = _filter(analysis,
+                        sql.Recording,
+                        [sql.Animal],
+                        sql.RecordingAttribute,
+                        *attr_filters,
+                        animal_id=animal_id,
+                        rec_date=rec_date,
+                        rec_id=rec_id)
 
-        return [Recording(row=row, analysis=analysis) for row in result]
+        return EntityCollection(analysis=analysis, entity_type=cls, query=query)
+        # return [Recording(row=row, analysis=analysis) for row in result]
 
 
 class Phase(Entity):
-    _attribute_table = sql.PhaseAttribute
+    attribute_table = sql.PhaseAttribute
 
     def __init__(self, *args, **kwargs):
         Entity.__init__(self, *args, **kwargs)
@@ -595,22 +586,23 @@ class Phase(Entity):
                animal_id: str = None,
                rec_date: Union[str, date, datetime] = None,
                rec_id: str = None,
-               phase_id: int = None, ) -> List[Phase]:
-        result = _filter(analysis,
-                         sql.Phase,
-                         [sql.Recording, sql.Animal],
-                         sql.PhaseAttribute,
-                         *attr_filters,
-                         animal_id=animal_id,
-                         rec_date=rec_date,
-                         rec_id=rec_id,
-                         phase_id=phase_id)
+               phase_id: int = None, ) -> EntityCollection:  # List[Phase]:
+        query = _filter(analysis,
+                        sql.Phase,
+                        [sql.Recording, sql.Animal],
+                        sql.PhaseAttribute,
+                        *attr_filters,
+                        animal_id=animal_id,
+                        rec_date=rec_date,
+                        rec_id=rec_id,
+                        phase_id=phase_id)
 
-        return [Phase(row=row, analysis=analysis) for row in result]
+        return EntityCollection(analysis=analysis, entity_type=cls, query=query)
+        # return [Phase(row=row, analysis=analysis) for row in result]
 
 
 class Roi(Entity):
-    _attribute_table = sql.RoiAttribute
+    attribute_table = sql.RoiAttribute
 
     def __init__(self, *args, **kwargs):
         Entity.__init__(self, *args, **kwargs)
@@ -682,30 +674,43 @@ class Roi(Entity):
                animal_id: str = None,
                rec_date: Union[str, date, datetime] = None,
                rec_id: str = None,
-               roi_id: int = None, ) -> List[Roi]:
-        result = _filter(analysis,
-                         sql.Roi,
-                         [sql.Recording, sql.Animal],
-                         sql.RoiAttribute,
-                         *attr_filters,
-                         animal_id=animal_id,
-                         rec_date=rec_date,
-                         rec_id=rec_id,
-                         roi_id=roi_id)
+               roi_id: int = None, ) -> EntityCollection:  # List[Roi]:
+        query = _filter(analysis,
+                        sql.Roi,
+                        [sql.Recording, sql.Animal],
+                        sql.RoiAttribute,
+                        *attr_filters,
+                        animal_id=animal_id,
+                        rec_date=rec_date,
+                        rec_id=rec_id,
+                        roi_id=roi_id)
 
-        return [Roi(row=row, analysis=analysis) for row in result]
+        return EntityCollection(analysis=analysis, entity_type=cls, query=query)
+        # return [Roi(row=row, analysis=analysis) for row in result]
 
 
 def _filter(analysis: Analysis,
-            base_table: Type[sql.SQLBase],
-            joined_tables: List[Type[sql.SQLBase]],
-            attribute_table: Type[sql.SQLBase],
+            base_table: Type[sql.Animal, sql.Recording, sql.Roi, sql.Phase],
+            joined_tables: List[Type[sql.Animal, sql.Recording, sql.Roi, sql.Phase]],
+            attribute_table: Type[sql.AnimalAttribute, sql.RecordingAttribute, sql.RoiAttribute, sql.PhaseAttribute],
             *attribute_filters: Tuple[(str, str, Any)],
             animal_id: str = None,
             rec_date: Union[str, date, datetime] = None,
             rec_id: str = None,
             roi_id: int = None,
-            phase_id: int = None) -> List[Union[sql.Animal, sql.Recording, sql.Roi]]:
+            phase_id: int = None) -> Query:  # List[Union[sql.Animal, sql.Recording, sql.Roi]]:
+
+    # TODO: currently filtering only works on a single attribute at a time
+    # Possible solution for future:
+    """
+    Apply multiple attribute filters:
+    SELECT * FROM rois
+        LEFT JOIN roi_attributes as attr ON rois.pk = attr.entity_pk
+        GROUP BY rois.pk
+        HAVING  SUM(CASE WHEN attr.name == 's2p/npix' AND attr.value_int < 50 THEN 1 ELSE 0 END) > 0 AND
+                SUM(CASE WHEN attr.name == 's2p/radius' AND attr.value_float > 5.0 THEN 1 ELSE 0 END) > 0
+    """
+
     # Convert date
     rec_date = utils.parse_date(rec_date)
 
@@ -761,7 +766,7 @@ def _filter(analysis: Analysis,
                 query = query.filter(attribute_table.name == name)
 
     # Return type should be List[sql.SQLBase], PyCharm seems to get confused here...
-    return query.all()  # type: ignore
+    return query  # .all()  # type: ignore
 
 
 if __name__ == '__main__':

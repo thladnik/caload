@@ -239,13 +239,13 @@ def digest_folder(folder_list: List[str], analysis: base.Analysis):
         with h5py.File(os.path.join(recording_path, 'Display.hdf5'), 'r') as disp_file:
 
             # Get attributes
-            recording.update({f'display_data/attrs/{k}': v for k, v in disp_file.attrs.items()})
+            recording.update({f'display/attrs/{k}': v for k, v in disp_file.attrs.items()})
 
             for key1, member1 in tqdm(disp_file.items()):
 
                 # If dataset, write to file
                 if isinstance(member1, h5py.Dataset):
-                    recording[f'display_data/{key1}'] = member1[:]
+                    recording[f'display/{key1}'] = member1[:]
                     continue
 
                 # Otherwise it's a group -> keep going
