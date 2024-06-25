@@ -8,7 +8,7 @@ from abc import abstractmethod
 from datetime import datetime, date, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Tuple, Type, Union
+from typing import Any, Callable, Dict, Iterator, List, Tuple, Type, Union
 
 import h5py
 import numpy as np
@@ -44,11 +44,13 @@ class Analysis:
 
         self.open_session()
 
+    def __repr__(self):
+        return f"Analysis('{self.analysis_path}')"
+
     def open_session(self):
         if hasattr(self, '_sql_session'):
             return
 
-        # print('Open SQL session')
         # Create engine
         engine = create_engine(f'sqlite:///{self.analysis_path}/metadata.db', echo=False)
 
@@ -143,10 +145,45 @@ class Analysis:
         for entity in entities:
             entity.export(path)
 
-    def distribute_work(self, fun: Callable, entities: List[entities],
-                        chunk_size: int = None, worker_num: int = None) -> Any:
+
+class EntityCollection:
+    analysis: Analysis
+    _entity_type: Type[Entity]
+    _query: Query
+
+    def __init__(self, analysis: Analysis, entity_type: Type[Entity], query: Query):
+        self.analysis = analysis
+        self._entity_type = entity_type
+        self._query = query
+
+    def sortby(self, name: str, order: str = 'ASC'):
+        # TODO: implement sorting
+        # self._query = self._query.order_by()
+        pass
+
+    def __len__(self):
+        return self._query.count()
+
+    def _get_entity(self, row: Union[sql.Animal, sql.Recording, sql.Roi, sql.Phase]) -> Entity:
+        entity = self._entity_type(row=row, analysis=self.analysis)
+        return entity
+
+    def __iter__(self) -> Iterator[Entity]:
+        for row in self._query.all():
+            yield self._get_entity(row)
+
+    def __getitem__(self, item) -> List[Entity]:
+        if isinstance(item, slice):
+            indices = item.indices(len(self))
+            if indices[2] != 1:
+                raise KeyError(f'Invalid key {item} with indices {indices}')
+            # Return slice
+            return [self._get_entity(row) for row in self._query.offset(indices[0]).limit(indices[1])]
+        raise KeyError(f'Invalid key {item}')
+
+    def map(self, fun: Callable, chunk_size: int = None, worker_num: int = None) -> Any:
         # Close session first
-        self.close_session()
+        self.analysis.close_session()
 
         import multiprocessing as mp
         if worker_num is None:
@@ -155,12 +192,13 @@ class Analysis:
         pool = mp.Pool(processes=worker_num)
 
         if chunk_size is None:
-            worker_args = [(fun, e) for e in entities]
+            worker_args = [(fun, e) for e in self[:]]
         else:
-            chunk_num = int(np.ceil(len(entities) / chunk_size))
-            worker_args = [(fun, entities[i * chunk_size:(i + 1) * chunk_size]) for i in range(chunk_num)]
+            chunk_num = int(np.ceil(len(self[:]) / chunk_size))
+            worker_args = [(fun, self[i * chunk_size:(i + 1) * chunk_size]) for i in range(chunk_num)]
         print(f'Entity chunksize {chunk_size}')
 
+        # Map entities to process pool
         execution_times = []
         start_time = time.perf_counter()
         iter_num = 0
@@ -171,13 +209,12 @@ class Analysis:
             execution_times.append(exec_time)
             mean_exec_time = np.mean(execution_times)
             time_per_entity = mean_exec_time / (worker_num * chunk_size)
-            iter_rest = len(worker_args) - iter_num
             time_elapsed = time.perf_counter() - start_time
-            time_rest = time_per_entity * (len(entities) - iter_num * chunk_size)
+            time_rest = time_per_entity * (len(self) - iter_num * chunk_size)
 
             # Print timing info
             sys.stdout.write('\r'
-                             f'[{iter_num * chunk_size}/{len(entities)}] '
+                             f'[{iter_num * chunk_size}/{len(self)}] '
                              f'{time_per_entity:.2f}s/iter '
                              f'- {timedelta(seconds=int(time_elapsed))}'
                              f'/{timedelta(seconds=int(time_elapsed + time_rest))} '
@@ -188,7 +225,7 @@ class Analysis:
                 execution_times = execution_times[len(execution_times) - 100:]
 
         # Re-open session
-        self.open_session()
+        self.analysis.open_session()
 
     @staticmethod
     def worker_wrapper(args):
@@ -216,35 +253,11 @@ class Analysis:
         return time.perf_counter() - start_time
 
 
-class EntityCollection:
-    analysis: Analysis
-    _entity_type: Type[Entity]
-    _entities: List[Entity]
-    _query: Query
-
-    def __init__(self, analysis: Analysis, entity_type: Type[Entity], query: Query):
-        self.analysis = analysis
-        self._entity_type = entity_type
-        self._query = query
-        self._entities = []
-
-    def sortby(self, name: str, order: str = 'ASC'):
-        # TODO: implement sorting
-        self._query = self._query.order_by()
-
-    def __len__(self):
-        return self._query.count()
-
-    def __iter__(self):
-        for row in self._query.all():
-            yield self._entity_type(row=row, analysis=self.analysis)
-
-
 class Entity:
     _analysis: Analysis
     attribute_table = Union[Type[sql.Animal], Type[sql.Recording], Type[sql.Roi]]
 
-    def __init__(self, row: Union[sql.Animal, sql.Recording, sql.Roi], analysis: Analysis):
+    def __init__(self, row: Union[sql.Animal, sql.Recording, sql.Roi, sql.Phase], analysis: Analysis):
         self._analysis = analysis
         self._row: Union[sql.Animal, sql.Recording, sql.Roi] = row
         self._scalar_attributes: Dict[str, Union[sql.AnimalAttribute, sql.RecordingAttribute, sql.RoiAttribute]] = None
@@ -342,8 +355,7 @@ class Entity:
     def analysis(self) -> Analysis:
         return self._analysis
 
-    def _query_attribute_row(self, key: str) -> Union[
-        sql.AnimalAttribute, sql.RecordingAttribute, sql.RoiAttribute, None]:
+    def _query_attribute_row(self, key: str) -> Union[sql.AnimalAttribute, sql.RecordingAttribute, sql.RoiAttribute, None]:
 
         # Build Entity-specific query
         query = (self.analysis.session.query(self.attribute_table)
@@ -355,7 +367,7 @@ class Entity:
             return
 
         # Return result
-        return query.one()
+        return query.one()  # type: ignore
 
     def export(self, path: str):
         with h5py.File(path, 'a') as f:
