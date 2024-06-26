@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import os.path
 import pickle
 import sys
@@ -76,10 +77,10 @@ class Analysis:
     def phases(self, *args, **kwargs) -> EntityCollection:
         return Phase.filter(self, *args, **kwargs)
 
-    def export(self, path: str, entities: List[Entity]):
-        # TODO: add some data export and stuff
-        for entity in entities:
-            entity.export(path)
+    # def export(self, path: str, entities: List[Entity]):
+    #     # TODO: add some data export and stuff
+    #     for entity in entities:
+    #         entity.export(path)
 
 
 class EntityCollection:
@@ -109,8 +110,7 @@ class EntityCollection:
         raise KeyError(f'Invalid key {item}')
 
     def _get_entity(self, row: Union[sql.Animal, sql.Recording, sql.Roi, sql.Phase]) -> Entity:
-        entity = self._entity_type(row=row, analysis=self.analysis)
-        return entity
+        return self._entity_type(row=row, analysis=self.analysis)
 
     def sortby(self, name: str, order: str = 'ASC'):
         # TODO: implement sorting
@@ -122,8 +122,6 @@ class EntityCollection:
             fun(entity, **kwargs)
 
     def map_async(self, fun: Callable, chunk_size: int = None, worker_num: int = None, **kwargs) -> Any:
-        # Close session first
-        self.analysis.close_session()
 
         # Prepare pool and entities
         import multiprocessing as mp
@@ -132,12 +130,19 @@ class EntityCollection:
         print(f'Start pool with {worker_num} workers')
         pool = mp.Pool(processes=worker_num)
 
+        entities = self[:]
+
+        kwargs = tuple([(k, v) for k, v in kwargs.items()])
         if chunk_size is None:
-            worker_args = [(fun, e, kwargs) for e in self[:]]
+            worker_args = [(fun, e, kwargs) for e in entities]
+            chunk_size = 1
         else:
-            chunk_num = int(np.ceil(len(self[:]) / chunk_size))
-            worker_args = [(fun, self[i * chunk_size:(i + 1) * chunk_size], kwargs) for i in range(chunk_num)]
-        print(f'Entity chunksize {chunk_size}')
+            chunk_num = int(np.ceil(len(entities) / chunk_size))
+            worker_args = [(fun, entities[i * chunk_size:(i + 1) * chunk_size], kwargs) for i in range(chunk_num)]
+            print(f'Entity chunksize {chunk_size}')
+
+        # Close session first
+        self.analysis.close_session()
 
         # Map entities to process pool
         execution_times = []
@@ -151,11 +156,11 @@ class EntityCollection:
             mean_exec_time = np.mean(execution_times)
             time_per_entity = mean_exec_time / (worker_num * chunk_size)
             time_elapsed = time.perf_counter() - start_time
-            time_rest = time_per_entity * (len(self) - iter_num * chunk_size)
+            time_rest = time_per_entity * (len(entities) - iter_num * chunk_size)
 
             # Print timing info
             sys.stdout.write('\r'
-                             f'[{iter_num * chunk_size}/{len(self)}] '
+                             f'[{iter_num * chunk_size}/{len(entities)}] '
                              f'{time_per_entity:.2f}s/iter '
                              f'- {timedelta(seconds=int(time_elapsed))}'
                              f'/{timedelta(seconds=int(time_elapsed + time_rest))} '
@@ -168,6 +173,7 @@ class EntityCollection:
         # Re-open session
         self.analysis.open_session()
 
+
     @staticmethod
     def worker_wrapper(args):
 
@@ -175,6 +181,7 @@ class EntityCollection:
         # Unpack args
         fun: Callable = args[0]
         entity: Union[Entity, List[Entity]] = args[1]
+        kwargs = {k: v for k, v in args[2]}
 
         # Re-open session in worker
         if isinstance(entity, list):
@@ -183,7 +190,7 @@ class EntityCollection:
             entity.analysis.open_session()
 
         # Run function on entity/entities
-        fun(entity)
+        fun(entity, **kwargs)
 
         # Close session again
         if isinstance(entity, list):
@@ -197,12 +204,14 @@ class EntityCollection:
 class Entity:
     _analysis: Analysis
     attribute_table = Union[Type[sql.Animal], Type[sql.Recording], Type[sql.Roi]]
+    _collection: EntityCollection
 
-    def __init__(self, row: Union[sql.Animal, sql.Recording, sql.Roi, sql.Phase], analysis: Analysis):
+    def __init__(self, row: Union[sql.Animal, sql.Recording, sql.Roi, sql.Phase], analysis: Analysis, collection: EntityCollection = None):
         self._analysis = analysis
         self._row: Union[sql.Animal, sql.Recording, sql.Roi] = row
-        self._scalar_attributes: Dict[str, Union[sql.AnimalAttribute, sql.RecordingAttribute, sql.RoiAttribute]] = None
-        self._parents: List[Entity] = []
+        self._scalar_attributes: Dict[str, Any] = None
+        self._collection = collection
+        # self._parents: List[Entity] = []
 
     def __getitem__(self, item):
 
@@ -359,16 +368,16 @@ class Entity:
         with h5py.File(path, 'w') as _:
             pass
 
-    def export(self, path: str):
-        with h5py.File(path, 'a') as f:
-            self.export_to(f.require_group(self.path))
-
-            for entity in self._parents:
-                entity.export_to(f.require_group(entity.path))
-
-    # @abstractmethod
-    def export_to(self, grp: h5py.Group):
-        pass
+    # def export(self, path: str):
+    #     with h5py.File(path, 'a') as f:
+    #         self.export_to(f.require_group(self.path))
+    #
+    #         for entity in self._parents:
+    #             entity.export_to(f.require_group(entity.path))
+    #
+    # # @abstractmethod
+    # def export_to(self, grp: h5py.Group):
+    #     pass
 
 
 class Animal(Entity):
@@ -435,7 +444,7 @@ class Recording(Entity):
         self._animal: sql.Animal = self.row.animal
 
         # Add parents
-        self._parents.append(self.animal)
+        # self._parents.append(self.animal)
 
     def __repr__(self):
         return f"Recording(id={self.id}, " \
@@ -522,8 +531,8 @@ class Phase(Entity):
         self._animal: sql.Animal = self._recording.animal
 
         # Add parents
-        self._parents.append(self.animal)
-        self._parents.append(self.recording)
+        # self._parents.append(self.animal)
+        # self._parents.append(self.recording)
 
     def __repr__(self):
         return f"Phase(id={self.id}, " \
@@ -609,8 +618,8 @@ class Roi(Entity):
         self._animal: sql.Animal = self._recording.animal
 
         # Add parents
-        self._parents.append(self.animal)
-        self._parents.append(self.recording)
+        # self._parents.append(self.animal)
+        # self._parents.append(self.recording)
 
     def __repr__(self):
         return f"Roi(id={self.id}, " \
