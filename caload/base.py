@@ -117,7 +117,11 @@ class EntityCollection:
         # self._query = self._query.order_by()
         pass
 
-    def map(self, fun: Callable, chunk_size: int = None, worker_num: int = None) -> Any:
+    def map(self, fun: Callable, **kwargs) -> Any:
+        for entity in tqdm(self):
+            fun(entity, **kwargs)
+
+    def map_async(self, fun: Callable, chunk_size: int = None, worker_num: int = None, **kwargs) -> Any:
         # Close session first
         self.analysis.close_session()
 
@@ -129,10 +133,10 @@ class EntityCollection:
         pool = mp.Pool(processes=worker_num)
 
         if chunk_size is None:
-            worker_args = [(fun, e) for e in self[:]]
+            worker_args = [(fun, e, kwargs) for e in self[:]]
         else:
             chunk_num = int(np.ceil(len(self[:]) / chunk_size))
-            worker_args = [(fun, self[i * chunk_size:(i + 1) * chunk_size]) for i in range(chunk_num)]
+            worker_args = [(fun, self[i * chunk_size:(i + 1) * chunk_size], kwargs) for i in range(chunk_num)]
         print(f'Entity chunksize {chunk_size}')
 
         # Map entities to process pool
