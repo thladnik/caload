@@ -4,7 +4,7 @@ import os
 from caload import base
 from caload import sqltables as sql
 
-__all__ = ['base', 'sql', 'digest', 'open_analysis', 'less', 'lessequal', 'equal', 'greaterequal', 'greater']
+__all__ = ['base', 'sql', 'digest', 'open_analysis', 'less', 'lessequal', 'equal', 'greaterequal', 'greater', 's2p_autorun']
 
 
 def open_analysis(analysis_path: str, mode=base.Mode.analyse) -> base.Analysis:

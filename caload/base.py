@@ -13,14 +13,17 @@ from typing import Any, Callable, Dict, Iterator, List, Tuple, Type, Union
 
 import h5py
 import numpy as np
-from sqlalchemy import create_engine, Engine
-from sqlalchemy.orm import Session, Query
+import pandas as pd
+from pandas._typing import IndexLabel, Scalar
+from sqlalchemy import create_engine, Engine, or_, and_
+from sqlalchemy.orm import Session, Query, aliased
 from tqdm import tqdm
 
 from caload import sqltables as sql
 from caload import utils
 
-__all__ = ['Analysis', 'EntityCollection', 'Entity', 'Animal', 'Recording', 'Roi', 'Phase', 'Mode']
+__all__ = ['Analysis', 'EntityCollection', 'Entity',
+           'Animal', 'Recording', 'Roi', 'Phase', 'Mode']
 
 
 class Mode(Enum):
@@ -47,8 +50,6 @@ class Analysis:
         return f"Analysis('{self.analysis_path}')"
 
     def open_session(self):
-        if hasattr(self, '_sql_session'):
-            return
 
         # Create engine
         engine = create_engine(f'sqlite:///{self.analysis_path}/metadata.db', echo=False)
@@ -60,6 +61,8 @@ class Analysis:
     def close_session(self):
         self.session.close()
 
+        # Session attribute *needs* to be deleted, to prevent serialization error
+        #  during multiprocess' pickling, because it contains weakrefs
         del self.session
 
     def add_animal(self, animal_id: str) -> Animal:
@@ -96,18 +99,24 @@ class EntityCollection:
     def __len__(self):
         return self._query.count()
 
-    def __iter__(self) -> Iterator[Entity]:
+    def __iter__(self):
         for row in self._query.all():
             yield self._get_entity(row)
 
-    def __getitem__(self, item) -> List[Entity]:
+    def __getitem__(self, item) -> Union[Entity, List[Entity]]:
         if isinstance(item, slice):
             indices = item.indices(len(self))
             if indices[2] != 1:
                 raise KeyError(f'Invalid key {item} with indices {indices}')
             # Return slice
             return [self._get_entity(row) for row in self._query.offset(indices[0]).limit(indices[1])]
+        if isinstance(item, int):
+            return self._get_entity(self._query.offset(item).limit(1)[0])
         raise KeyError(f'Invalid key {item}')
+
+    @property
+    def dataframe(self):
+        return pd.DataFrame([entity.scalar_attributes for entity in self])
 
     def _get_entity(self, row: Union[sql.Animal, sql.Recording, sql.Roi, sql.Phase]) -> Entity:
         return self._entity_type(row=row, analysis=self.analysis)
@@ -118,27 +127,31 @@ class EntityCollection:
         pass
 
     def map(self, fun: Callable, **kwargs) -> Any:
+        print(f'Run function {fun} on {self} with args '
+              f'{[f"{k}:{v}" for k, v in kwargs.items()]} on {len(self)} entities')
+
         for entity in tqdm(self):
             fun(entity, **kwargs)
 
     def map_async(self, fun: Callable, chunk_size: int = None, worker_num: int = None, **kwargs) -> Any:
+        print(f'Run function {fun} on {self} with args '
+              f'{[f"{k}:{v}" for k, v in kwargs.items()]} on {len(self)} entities')
 
         # Prepare pool and entities
         import multiprocessing as mp
         if worker_num is None:
             worker_num = mp.cpu_count() - 1
         print(f'Start pool with {worker_num} workers')
-        pool = mp.Pool(processes=worker_num)
 
-        entities = self[:]
+        # entities = self[:]
 
         kwargs = tuple([(k, v) for k, v in kwargs.items()])
         if chunk_size is None:
-            worker_args = [(fun, e, kwargs) for e in entities]
+            worker_args = [(fun, e, kwargs) for e in self]
             chunk_size = 1
         else:
-            chunk_num = int(np.ceil(len(entities) / chunk_size))
-            worker_args = [(fun, entities[i * chunk_size:(i + 1) * chunk_size], kwargs) for i in range(chunk_num)]
+            chunk_num = int(np.ceil(len(self) / chunk_size))
+            worker_args = [(fun, self[i * chunk_size:(i + 1) * chunk_size], kwargs) for i in range(chunk_num)]
             print(f'Entity chunksize {chunk_size}')
 
         # Close session first
@@ -147,32 +160,39 @@ class EntityCollection:
         # Map entities to process pool
         execution_times = []
         start_time = time.perf_counter()
-        iter_num = 0
-        for exec_time in pool.imap_unordered(self.worker_wrapper, worker_args):
-            iter_num += 1
+        with mp.Pool(processes=worker_num) as pool:
+            iterator = pool.imap_unordered(self.worker_wrapper, worker_args)
+            for iter_num in range(len(self)):
 
-            # Calcualate timing info
-            execution_times.append(exec_time)
-            mean_exec_time = np.mean(execution_times)
-            time_per_entity = mean_exec_time / (worker_num * chunk_size)
-            time_elapsed = time.perf_counter() - start_time
-            time_rest = time_per_entity * (len(entities) - iter_num * chunk_size)
+                # Iterate
+                try:
+                    exec_time = next(iterator)
+                except StopIteration:
+                     pass
+                except Exception as _exc:
+                    raise _exc
 
-            # Print timing info
-            sys.stdout.write('\r'
-                             f'[{iter_num * chunk_size}/{len(entities)}] '
-                             f'{time_per_entity:.2f}s/iter '
-                             f'- {timedelta(seconds=int(time_elapsed))}'
-                             f'/{timedelta(seconds=int(time_elapsed + time_rest))} '
-                             f'-> {timedelta(seconds=int(time_rest))} remaining ')
+                # Calcualate timing info
+                execution_times.append(exec_time)
+                mean_exec_time = np.mean(execution_times)
+                time_per_entity = mean_exec_time / (worker_num * chunk_size)
+                time_elapsed = time.perf_counter() - start_time
+                time_rest = time_per_entity * (len(self) - iter_num * chunk_size)
 
-            # Truncate
-            if len(execution_times) > 100:
-                execution_times = execution_times[len(execution_times) - 100:]
+                # Print timing info
+                sys.stdout.write('\r'
+                                 f'[{iter_num * chunk_size}/{len(self)}] '
+                                 f'{time_per_entity:.2f}s/iter '
+                                 f'- {timedelta(seconds=int(time_elapsed))}'
+                                 f'/{timedelta(seconds=int(time_elapsed + time_rest))} '
+                                 f'-> {timedelta(seconds=int(time_rest))} remaining ')
+
+                # Truncate
+                if len(execution_times) > 100:
+                    execution_times = execution_times[len(execution_times) - 100:]
 
         # Re-open session
         self.analysis.open_session()
-
 
     @staticmethod
     def worker_wrapper(args):
@@ -201,10 +221,25 @@ class EntityCollection:
         return time.perf_counter() - start_time
 
 
+# class ReferencedDataFrame(pd.DataFrame):
+#
+#     def _set_item(self, key, value) -> None:
+#         pass
+#
+#     def _set_value(self, index: IndexLabel, col, value: Scalar, takeable: bool = False) -> None:
+#         row = self[index]
+
+
 class Entity:
     _analysis: Analysis
     attribute_table = Union[Type[sql.Animal], Type[sql.Recording], Type[sql.Roi]]
     _collection: EntityCollection
+
+    # TODO: find better way to handle scalar attribute caching
+    #  current approach does not work for parallelized enviornments
+    #  if multiple processes modify the same entity (should this even happen?)
+
+    # TODO: add attribute buffering for blobs
 
     def __init__(self, row: Union[sql.Animal, sql.Recording, sql.Roi, sql.Phase], analysis: Analysis, collection: EntityCollection = None):
         self._analysis = analysis
@@ -289,34 +324,37 @@ class Entity:
             # TODO: alternative to pickle dumps? Writing arbitrary raw binary data to HDF5 seems difficult
             entity_path = f'{self.analysis.analysis_path}/{self.path}'
             pending = True
-            success = False
-            last_exception = None
             start = time.perf_counter()
             while pending:
                 try:
                     with h5py.File(f'{entity_path}/data.hdf5', 'a') as f:
                         # Save numpy arrays as datasets
-                        if isinstance(value, (list, tuple, np.ndarray)):
+                        if isinstance(value, np.ndarray):
                             if key not in f:
                                 f.create_dataset(key, data=value)
                             else:
-                                f[key][:] = value
+                                if value.shape != f[key].shape:
+                                    del f[key]
+                                    f.create_dataset(key, data=value)
+                                else:
+                                    f[key][:] = value
 
                         # Dump all other types as binary strings
                         else:
+                            if '/' in key:
+                                base_path = os.path.join(entity_path, *key.split('/')[:-1])
+                                if not os.path.exists(base_path):
+                                    os.makedirs(base_path)
                             with open(os.path.join(entity_path, key), 'wb') as f:
                                 pickle.dump(value, f)
                 except Exception as _exc:
                     import traceback
-                    last_exception = traceback.format_exc()
                     if (time.perf_counter() - start) > self.analysis.write_timeout:
-                        pending = False
+                        raise TimeoutError(f'Failed to write attribute {key} to {key} // Traceback: {traceback.format_exc()}')
+                    else:
+                        time.sleep(10**-6)
                 else:
                     pending = False
-                    success = True
-
-            if not success:
-                raise TimeoutError(f'Failed to write attribute {key} to {key} // Traceback: {last_exception}')
 
     def _update_scalar_attributes(self):
 
@@ -738,38 +776,59 @@ def _filter(analysis: Analysis,
         query = query.filter(sql.Phase.id == phase_id)
 
     # Apply attribute filters
+    _attr_filters = []
     if len(attribute_filters) > 0:
 
-        query = query.join(attribute_table)
-
         for name, comp, value in attribute_filters:
+
+            alias = aliased(attribute_table)
+            query = query.join(alias)
+
             attr_value_field = None
             if isinstance(value, float):
-                attr_value_field = attribute_table.value_float
+                attr_value_field = alias.value_float
             elif isinstance(value, int):
-                attr_value_field = attribute_table.value_int
+                attr_value_field = alias.value_int
             elif isinstance(value, str):
-                attr_value_field = attribute_table.value_str
+                attr_value_field = alias.value_str
             elif isinstance(value, bool):
-                attr_value_field = attribute_table.value_bool
+                attr_value_field = alias.value_bool
 
             if attr_value_field is None:
                 raise TypeError(f'Invalid type "{type(value)}" to filter for in attributes')
-
-            if valid := comp == 'l':
+            #
+            if comp == 'l':
                 query = query.filter(attr_value_field < value)
-            elif valid := comp == 'le':
+            elif comp == 'le':
                 query = query.filter(attr_value_field <= value)
-            elif valid := comp == 'e':
+            elif comp == 'e':
                 query = query.filter(attr_value_field == value)
-            elif valid := comp == 'ge':
+            elif comp == 'ge':
                 query = query.filter(attr_value_field >= value)
-            elif valid := comp == 'g':
+            elif comp == 'g':
                 query = query.filter(attr_value_field > value)
+            else:
+                raise ValueError('Invalid filter format')
 
-            # Filter for attribute name if any value filter was valid
-            if valid:
-                query = query.filter(attribute_table.name == name)
+            query = query.filter(alias.name == name)
+
+            # if valid := comp == 'l':
+            #     _filter_expr = attr_value_field < value
+            # elif valid := comp == 'le':
+            #     _filter_expr = attr_value_field <= value
+            # elif valid := comp == 'e':
+            #     _filter_expr = attr_value_field == value
+            # elif valid := comp == 'ge':
+            #     _filter_expr = attr_value_field >= value
+            # elif valid := comp == 'g':
+            #     _filter_expr = attr_value_field > value
+            # else:
+            #     raise ValueError('Invalid filter format')
+
+            # # Filter for attribute name and
+            # _attr_filters.append((_filter_expr, attribute_table.name == name))
+
+        # query = query.filter(or_(*[and_(e1, e2) for e1, e2 in _attr_filters]))
 
     return query
 
