@@ -127,14 +127,14 @@ class EntityCollection:
         pass
 
     def map(self, fun: Callable, **kwargs) -> Any:
-        print(f'Run function {fun} on {self} with args '
+        print(f'Run function {fun.__name__} on {self} with args '
               f'{[f"{k}:{v}" for k, v in kwargs.items()]} on {len(self)} entities')
 
         for entity in tqdm(self):
             fun(entity, **kwargs)
 
     def map_async(self, fun: Callable, chunk_size: int = None, worker_num: int = None, **kwargs) -> Any:
-        print(f'Run function {fun} on {self} with args '
+        print(f'Run function {fun.__name__} on {self} with args '
               f'{[f"{k}:{v}" for k, v in kwargs.items()]} on {len(self)} entities')
 
         # Prepare pool and entities
@@ -142,8 +142,6 @@ class EntityCollection:
         if worker_num is None:
             worker_num = mp.cpu_count() - 1
         print(f'Start pool with {worker_num} workers')
-
-        # entities = self[:]
 
         kwargs = tuple([(k, v) for k, v in kwargs.items()])
         if chunk_size is None:
@@ -164,7 +162,7 @@ class EntityCollection:
             iterator = pool.imap_unordered(self.worker_wrapper, worker_args)
             for iter_num in range(len(self)):
 
-                # Iterate
+                # Iterate while looking out for exceptions
                 try:
                     exec_time = next(iterator)
                 except StopIteration:
@@ -200,23 +198,22 @@ class EntityCollection:
         start_time = time.perf_counter()
         # Unpack args
         fun: Callable = args[0]
-        entity: Union[Entity, List[Entity]] = args[1]
+        entity: Union[Entity, EntityCollection, List[Entity]] = args[1]
         kwargs = {k: v for k, v in args[2]}
 
         # Re-open session in worker
         if isinstance(entity, list):
             entity[0].analysis.open_session()
+            close_session = entity[0].analysis.close_session
         else:
             entity.analysis.open_session()
+            close_session = entity.analysis.close_session
 
-        # Run function on entity/entities
+        # Run function on entity
         fun(entity, **kwargs)
 
         # Close session again
-        if isinstance(entity, list):
-            entity[0].analysis.close_session()
-        else:
-            entity.analysis.close_session()
+        close_session()
 
         return time.perf_counter() - start_time
 
