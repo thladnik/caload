@@ -15,7 +15,7 @@ import h5py
 import numpy as np
 import pandas as pd
 from pandas._typing import IndexLabel, Scalar
-from sqlalchemy import create_engine, Engine, or_, and_
+from sqlalchemy import create_engine, Engine, false, or_, and_, true
 from sqlalchemy.orm import Session, Query, aliased
 from tqdm import tqdm
 
@@ -160,7 +160,7 @@ class EntityCollection:
         start_time = time.perf_counter()
         with mp.Pool(processes=worker_num) as pool:
             iterator = pool.imap_unordered(self.worker_wrapper, worker_args)
-            for iter_num in range(len(self)):
+            for iter_num in range(1, len(self)+1):
 
                 # Iterate while looking out for exceptions
                 try:
@@ -188,6 +188,7 @@ class EntityCollection:
                 # Truncate
                 if len(execution_times) > 100:
                     execution_times = execution_times[len(execution_times) - 100:]
+        print('')
 
         # Re-open session
         self.analysis.open_session()
@@ -793,12 +794,19 @@ def _filter(analysis: Analysis,
 
             if attr_value_field is None:
                 raise TypeError(f'Invalid type "{type(value)}" to filter for in attributes')
-            #
+
             if comp == 'l':
                 query = query.filter(attr_value_field < value)
             elif comp == 'le':
                 query = query.filter(attr_value_field <= value)
             elif comp == 'e':
+                # if isinstance(value, bool):
+                #     print(value)
+                #     if value:
+                #         query = query.filter(attr_value_field.is_(true()))
+                #     else:
+                #         query = query.filter(attr_value_field.is_(false()))
+                # else:
                 query = query.filter(attr_value_field == value)
             elif comp == 'ge':
                 query = query.filter(attr_value_field >= value)
@@ -809,23 +817,6 @@ def _filter(analysis: Analysis,
 
             query = query.filter(alias.name == name)
 
-            # if valid := comp == 'l':
-            #     _filter_expr = attr_value_field < value
-            # elif valid := comp == 'le':
-            #     _filter_expr = attr_value_field <= value
-            # elif valid := comp == 'e':
-            #     _filter_expr = attr_value_field == value
-            # elif valid := comp == 'ge':
-            #     _filter_expr = attr_value_field >= value
-            # elif valid := comp == 'g':
-            #     _filter_expr = attr_value_field > value
-            # else:
-            #     raise ValueError('Invalid filter format')
-
-            # # Filter for attribute name and
-            # _attr_filters.append((_filter_expr, attribute_table.name == name))
-
-        # query = query.filter(or_(*[and_(e1, e2) for e1, e2 in _attr_filters]))
 
     return query
 

@@ -105,7 +105,7 @@ def digest_folder(folder_list: List[str], analysis: base.Analysis):
     print(f'Process folders: {folder_list}')
     for recording_path in folder_list:
 
-        recording_path = Path(recording_path).as_posix()
+        # recording_path = Path(recording_path).as_posix()
         print(f'Recording folder {recording_path}')
 
         # Check if animal exists
