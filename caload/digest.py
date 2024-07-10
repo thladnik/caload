@@ -68,7 +68,7 @@ def create_animal(analysis: base.Analysis, path: str) -> base.Animal:
 
     # Create animal
     animal_id = _animal_id_from_path(path)
-    animal_path = str(os.path.join(*path.split('/')[:-1]))
+    animal_path = '/'.join(Path(path).as_posix().split('/')[:-1])
     animal = analysis.add_animal(animal_id=animal_id)
     animal['animal_id'] = animal_id
 

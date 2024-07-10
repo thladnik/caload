@@ -80,10 +80,11 @@ class Analysis:
     def phases(self, *args, **kwargs) -> EntityCollection:
         return Phase.filter(self, *args, **kwargs)
 
-    # def export(self, path: str, entities: List[Entity]):
-    #     # TODO: add some data export and stuff
-    #     for entity in entities:
-    #         entity.export(path)
+    def export(self, path: str):
+        # TODO: add some data export and stuff
+        with h5py.File(path, 'w') as f:
+            for animal in self.animals():
+                animal.export_to(f)
 
 
 class EntityCollection:
@@ -411,9 +412,9 @@ class Entity:
     #         for entity in self._parents:
     #             entity.export_to(f.require_group(entity.path))
     #
-    # # @abstractmethod
-    # def export_to(self, grp: h5py.Group):
-    #     pass
+    @abstractmethod
+    def export_to(self, grp: h5py.Group):
+        pass
 
 
 class Animal(Entity):
@@ -470,6 +471,23 @@ class Animal(Entity):
                         animal_id=animal_id)
 
         return EntityCollection(analysis=analysis, entity_type=cls, query=query)
+
+    def export_to(self, f: h5py.File):
+
+        with h5py.File(f'{self.analysis.analysis_path}/{self.path}/data.hdf5', 'r') as f2:
+            f2.copy(source='/', dest=f, name=self.path)
+
+        try:
+            f[self.path].attrs.update(self.scalar_attributes)
+        except:
+            for k, v in self.scalar_attributes.items():
+                try:
+                    f[self.path].attrs[k] = v
+                except:
+                    print(f'Failed to export scalar attribute {k} in {self} (type: {type(v)})')
+
+        for rec in self.recordings():
+            rec.export_to(f)
 
 
 class Recording(Entity):
@@ -555,6 +573,26 @@ class Recording(Entity):
                         rec_id=rec_id)
 
         return EntityCollection(analysis=analysis, entity_type=cls, query=query)
+
+    def export_to(self, f: h5py.File):
+
+        with h5py.File(f'{self.analysis.analysis_path}/{self.path}/data.hdf5', 'r') as f2:
+            f2.copy(source='/', dest=f, name=self.path)
+
+        try:
+            f[self.path].attrs.update(self.scalar_attributes)
+        except:
+            for k, v in self.scalar_attributes.items():
+                try:
+                    f[self.path].attrs[k] = v
+                except:
+                    print(f'Failed to export scalar attribute {k} in {self} (type: {type(v)})')
+
+        for phase in self.phases():
+            phase.export_to(f)
+
+        for roi in self.rois():
+            roi.export_to(f)
 
 
 class Phase(Entity):
@@ -643,6 +681,20 @@ class Phase(Entity):
 
         return EntityCollection(analysis=analysis, entity_type=cls, query=query)
 
+    def export_to(self, f: h5py.File):
+
+        with h5py.File(f'{self.analysis.analysis_path}/{self.path}/data.hdf5', 'r') as f2:
+            f2.copy(source='/', dest=f, name=self.path)
+
+        try:
+            f[self.path].attrs.update(self.scalar_attributes)
+        except:
+            for k, v in self.scalar_attributes.items():
+                try:
+                    f[self.path].attrs[k] = v
+                except:
+                    print(f'Failed to export scalar attribute {k} in {self} (type: {type(v)})')
+
 
 class Roi(Entity):
     attribute_table = sql.RoiAttribute
@@ -730,6 +782,20 @@ class Roi(Entity):
 
         return EntityCollection(analysis=analysis, entity_type=cls, query=query)
 
+    def export_to(self, f: h5py.File):
+
+        with h5py.File(f'{self.analysis.analysis_path}/{self.path}/data.hdf5', 'r') as f2:
+            f2.copy(source='/', dest=f, name=self.path)
+
+        try:
+            f[self.path].attrs.update(self.scalar_attributes)
+        except:
+            for k, v in self.scalar_attributes.items():
+                try:
+                    f[self.path].attrs[k] = v
+                except:
+                    print(f'Failed to export scalar attribute {k} in {self} (type: {type(v)})')
+                
 
 def _filter(analysis: Analysis,
             base_table: Type[sql.Animal, sql.Recording, sql.Roi, sql.Phase],
