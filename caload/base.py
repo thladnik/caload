@@ -86,6 +86,14 @@ class Analysis:
             for animal in self.animals():
                 animal.export_to(f)
 
+    def get_temp_path(self, path: str):
+        temp_path = os.path.join(self.analysis_path, 'temp', path)
+        if not os.path.exists(temp_path):
+            # Avoid error if concurrent process already created it in meantime
+            os.makedirs(temp_path, exist_ok=True)
+
+        return temp_path
+
 
 class EntityCollection:
     analysis: Analysis
@@ -158,7 +166,9 @@ class EntityCollection:
 
         # Map entities to process pool
         execution_times = []
-        start_time = time.perf_counter()
+        start_time = time.time()
+        formatted_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time))
+        print(f'Start processing at {formatted_time}')
         with mp.Pool(processes=worker_num) as pool:
             iterator = pool.imap_unordered(self.worker_wrapper, worker_args)
             for iter_num in range(1, len(self)+1):
@@ -173,9 +183,9 @@ class EntityCollection:
 
                 # Calcualate timing info
                 execution_times.append(exec_time)
-                mean_exec_time = np.mean(execution_times)
+                mean_exec_time = np.mean(execution_times) if len(execution_times) > 0 else 0
                 time_per_entity = mean_exec_time / (worker_num * chunk_size)
-                time_elapsed = time.perf_counter() - start_time
+                time_elapsed = time.time() - start_time
                 time_rest = time_per_entity * (len(self) - iter_num * chunk_size)
 
                 # Print timing info
@@ -187,9 +197,10 @@ class EntityCollection:
                                  f'-> {timedelta(seconds=int(time_rest))} remaining ')
 
                 # Truncate
-                if len(execution_times) > 100:
-                    execution_times = execution_times[len(execution_times) - 100:]
-        print('')
+                if len(execution_times) > 1000:
+                    execution_times = execution_times[len(execution_times) - 1000:]
+        formatted_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
+        print(f'\nFinish processing at {formatted_time}')
 
         # Re-open session
         self.analysis.open_session()
@@ -212,12 +223,14 @@ class EntityCollection:
             close_session = entity.analysis.close_session
 
         # Run function on entity
-        fun(entity, **kwargs)
+        res = fun(entity, **kwargs)
 
         # Close session again
         close_session()
 
-        return time.perf_counter() - start_time
+        elapsed_time = time.perf_counter() - start_time
+
+        return elapsed_time
 
 
 # class ReferencedDataFrame(pd.DataFrame):
