@@ -99,6 +99,7 @@ class Attribute:
     value_bool: Mapped[bool] = mapped_column(nullable=True)
     value_date: Mapped[date] = mapped_column(nullable=True)
     value_datetime: Mapped[datetime] = mapped_column(nullable=True)
+    value_path: Mapped[str] = mapped_column(nullable=True)
     value_column: Mapped[str] = mapped_column(nullable=True)
 
     def __repr__(self):

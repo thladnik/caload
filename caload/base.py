@@ -260,27 +260,34 @@ class Entity:
         self._collection = collection
         # self._parents: List[Entity] = []
 
-    def __getitem__(self, item):
+    def __getitem__(self, item: str):
 
-        # If scalar values aren't loaded yet, do it
-        if self._scalar_attributes is None:
-            self._update_scalar_attributes()
+        query = (self.analysis.session.query(self.attribute_table)
+                 .filter(self.attribute_table.name == item)
+                 .filter(self.attribute_table.entity_pk == self.row.pk))
 
-        # If scalar value exists, return it
-        if item in self._scalar_attributes:
-            return self._scalar_attributes[item]
+        if query.count() == 0:
+            raise KeyError(f'Attribute {item} not found for entity {self}')
 
-        # Otherwise, try to get it from file
+        # Fetch first (only row)
+        attr_row = query.first()
 
-        # Is there an HDF5 dataset?
-        entity_path = f'{self.analysis.analysis_path}/{self.path}'
-        with h5py.File(f'{entity_path}/data.hdf5', 'r') as f:
-            if item in f:
-                return f[item][:]
+        value_column = attr_row.value_column
+        value = attr_row.value
 
-        # Is there a binary blob?
-        if item in os.listdir(entity_path):
-            with open(os.path.join(entity_path, item), 'rb') as f2:
+        if value_column != 'value_path':
+            return value
+
+        file_type, *file_info = value.split(':')
+
+        if file_type == 'hdf5':
+            file_path, key = file_info
+            with h5py.File(os.path.join(self.analysis.analysis_path, file_path), 'r') as f:
+                return f[key][:]
+
+        elif file_type == 'pkl':
+            file_path = file_info
+            with open(os.path.join(self.analysis.analysis_path, file_path), 'rb') as f2:
                 return pickle.load(f2)
 
         raise KeyError(f'No attribute with name {item} in {self}')
@@ -327,46 +334,57 @@ class Entity:
             # Set value
             row.value = value
 
-            # Commit changes (right away if not in create mode)
-            if self.analysis.mode != Mode.create:
-                self.analysis.session.commit()
-
-        # Set arrays
+        # Set non-scalar data
         else:
-            # TODO: alternative to pickle dumps? Writing arbitrary raw binary data to HDF5 seems difficult
-            entity_path = f'{self.analysis.analysis_path}/{self.path}'
-            pending = True
-            start = time.perf_counter()
-            while pending:
-                try:
-                    with h5py.File(f'{entity_path}/data.hdf5', 'a') as f:
-                        # Save numpy arrays as datasets
-                        if isinstance(value, np.ndarray):
-                            if key not in f:
-                                f.create_dataset(key, data=value)
-                            else:
-                                if value.shape != f[key].shape:
-                                    del f[key]
+            data_path = None
+
+            if isinstance(value, np.ndarray):
+                hdf5_path = f'{self.path}/data.hdf5'
+                data_path = f'hdf5:{hdf5_path}:{key}'
+                pending = True
+                start = time.perf_counter()
+                while pending:
+                    try:
+                        with h5py.File(os.path.join(self.analysis.analysis_path, hdf5_path), 'a') as f:
+                            # Save numpy arrays as datasets
+                            if isinstance(value, np.ndarray):
+                                if key not in f:
                                     f.create_dataset(key, data=value)
                                 else:
-                                    f[key][:] = value
+                                    if value.shape != f[key].shape:
+                                        del f[key]
+                                        f.create_dataset(key, data=value)
+                                    else:
+                                        f[key][:] = value
 
-                        # Dump all other types as binary strings
+                    except Exception as _exc:
+                        if (time.perf_counter() - start) > self.analysis.write_timeout:
+                            import traceback
+                            raise TimeoutError(f'Failed to write attribute {key} to {key} '
+                                               f'// Traceback: {traceback.format_exc()}')
                         else:
-                            if '/' in key:
-                                base_path = os.path.join(entity_path, *key.split('/')[:-1])
-                                if not os.path.exists(base_path):
-                                    os.makedirs(base_path)
-                            with open(os.path.join(entity_path, key), 'wb') as f:
-                                pickle.dump(value, f)
-                except Exception as _exc:
-                    import traceback
-                    if (time.perf_counter() - start) > self.analysis.write_timeout:
-                        raise TimeoutError(f'Failed to write attribute {key} to {key} // Traceback: {traceback.format_exc()}')
+                            time.sleep(10**-6)
                     else:
-                        time.sleep(10**-6)
-                else:
-                    pending = False
+                        pending = False
+
+            # TODO: alternative to pickle dumps? Writing arbitrary raw binary data to HDF5 seems difficult
+            # Dump all other types as binary strings
+            else:
+                pkl_path = f'{self.path}/{key.replace("/", "_")}'
+                data_path = f'pkl:{pkl_path}'
+
+                with open(os.path.join(self.analysis.analysis_path, pkl_path), 'wb') as f:
+                    pickle.dump(value, f)
+
+            # Add row for attribute to SQL
+            if data_path is not None:
+                row = self.attribute_table(entity_pk=self.row.pk, name=key, value_column='value_path')
+                row.value = data_path
+                self.analysis.session.add(row)
+
+        # Commit changes (right away if not in create mode)
+        if self.analysis.mode != Mode.create:
+            self.analysis.session.commit()
 
     def _update_scalar_attributes(self):
 
