@@ -302,13 +302,6 @@ class Entity:
         # Set scalars
         if type(value) in (str, float, int, bool, date, datetime):
 
-            # If scalar values aren't loaded yet, do it
-            if self._scalar_attributes is None:
-                self._load_scalar_attributes()
-
-            # Set local cache
-            self._scalar_attributes[key] = value
-
             # Query attribute row if not in create mode
             row = None
             if not self.analysis.mode == Mode.create:
@@ -336,8 +329,6 @@ class Entity:
 
         # Set non-scalar data
         else:
-            data_path = None
-
             if isinstance(value, np.ndarray):
                 hdf5_path = f'{self.path}/data.hdf5'
                 data_path = f'hdf5:{hdf5_path}:{key}'
@@ -377,10 +368,9 @@ class Entity:
                     pickle.dump(value, f)
 
             # Add row for attribute to SQL
-            if data_path is not None:
-                row = self.attribute_table(entity_pk=self.row.pk, name=key, value_column='value_path')
-                row.value = data_path
-                self.analysis.session.add(row)
+            row = self.attribute_table(entity_pk=self.row.pk, name=key, value_column='value_path')
+            row.value = data_path
+            self.analysis.session.add(row)
 
         # Commit changes (right away if not in create mode)
         if self.analysis.mode != Mode.create:
