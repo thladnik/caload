@@ -286,7 +286,7 @@ class Entity:
                 return f[key][:]
 
         elif file_type == 'pkl':
-            file_path = file_info
+            file_path, = file_info
             with open(os.path.join(self.analysis.analysis_path, file_path), 'rb') as f2:
                 return pickle.load(f2)
 
@@ -304,7 +304,7 @@ class Entity:
 
             # If scalar values aren't loaded yet, do it
             if self._scalar_attributes is None:
-                self._update_scalar_attributes()
+                self._load_scalar_attributes()
 
             # Set local cache
             self._scalar_attributes[key] = value
@@ -386,25 +386,31 @@ class Entity:
         if self.analysis.mode != Mode.create:
             self.analysis.session.commit()
 
-    def _update_scalar_attributes(self):
+    @property
+    def scalar_attributes(self):
+        # Get all
+        query = (self.analysis.session.query(self.attribute_table)
+                 .filter(self.attribute_table.entity_pk == self.row.pk)
+                 .filter(self.attribute_table.value_column != 'value_path'))
 
-        # Initialize
-        if self._scalar_attributes is None:
-            self._scalar_attributes = {}
+        # Update
+        return {row.name:  row.value for row in query.all()}
 
+    @property
+    def attributes(self):
         # Get all
         query = (self.analysis.session.query(self.attribute_table)
                  .filter(self.attribute_table.entity_pk == self.row.pk))
 
         # Update
+        attributes = {}
         for row in query.all():
-            self._scalar_attributes[row.name] = row.value
+            if row.value_column == 'value_path':
+                attributes[row.name] = self[row.name]
+            else:
+                attributes[row.name] = row.value
 
-    @property
-    def scalar_attributes(self):
-        if self._scalar_attributes is None:
-            self._update_scalar_attributes()
-        return self._scalar_attributes
+        return attributes
 
     def update(self, data: Dict[str, Any]):
         """Implement update method for usage like in dict.update"""
