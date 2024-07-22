@@ -41,9 +41,11 @@ class Analysis:
     index: h5py.File
     entities: Dict[Union[sql.Animal, sql.Recording, sql.Roi, sql.Phase], Entity] = {}
     write_timeout = 3.  # s
-    bulk_format: str
+    lazy_load: bool
+    echo: bool
 
-    def __init__(self, path: str, mode: Mode = Mode.analyse, bulk_format: str = None, lazy_load: bool = False):
+    def __init__(self, path: str, mode: Mode = Mode.analyse, bulk_format: str = None,
+                 lazy_load: bool = False, echo: bool = False):
 
         # Set mode
         self.mode = mode
@@ -66,6 +68,10 @@ class Analysis:
             with open(f'{self.analysis_path}/configuration.yaml', 'r') as f:
                 self.config = yaml.safe_load(f)
 
+        # Set optionals
+        self.lazy_load = lazy_load
+        self.echo = echo
+
         # Open SQL session by default
         if not lazy_load:
             self.open_session()
@@ -84,7 +90,7 @@ class Analysis:
     def open_session(self):
 
         # Create engine
-        engine = create_engine(f'sqlite:///{self.analysis_path}/metadata.db', echo=False)
+        engine = create_engine(f'sqlite:///{self.analysis_path}/metadata.db', echo=self.echo)
         sql.SQLBase.metadata.create_all(engine)
 
         # Create a session
@@ -293,12 +299,6 @@ class Entity:
     attribute_table: Union[Type[sql.AnimalAttribute], Type[sql.RecordingAttribute], Type[sql.RoiAttribute]]
     _collection: EntityCollection
 
-    # TODO: find better way to handle scalar attribute caching
-    #  current approach does not work for parallelized enviornments
-    #  if multiple processes modify the same entity (should this even happen?)
-
-    # TODO: add attribute buffering for blobs
-
     def __init__(self, row: Union[sql.Animal, sql.Recording, sql.Roi, sql.Phase],
                  analysis: Analysis, collection: EntityCollection = None):
         self._analysis = analysis
@@ -375,22 +375,41 @@ class Entity:
         # Set non-scalar data
         else:
             # Write any non-scalar data accoridng to specified bulk storage format
-            getattr(self, f'_write_{self.analysis.bulk_format}')(key, value)
+            data_path = getattr(self, f'_write_{self.analysis.bulk_format}')(key, value, row)
+
+            if row is None:
+                # Add new row
+                row = self.attribute_table(entity_pk=self.row.pk, name=key, value_column='value_path', value_path=data_path)
+                self.analysis.session.add(row)
 
         # Commit changes (right away if not in create mode)
         if self.analysis.mode != Mode.create:
             self.analysis.session.commit()
 
-    def _write_hdf5(self, key: str, value: Any, row: sql.Attribute = None):
+    def _write_hdf5(self, key: str, value: Any, row: sql.Attribute) -> str:
 
-        if isinstance(value, np.ndarray):
-            hdf5_path = f'{self.path}/data.hdf5'
-            data_path = f'hdf5:{hdf5_path}:{key}'
+        if row is not None:
+            data_path = row.value.split(':')
+        else:
+            if isinstance(value, np.ndarray):
+                data_path = f'hdf5:{self.path}/data.hdf5:{key}'
+            else:
+                data_path = f'pkl:{self.path}/{key.replace("/", "_")}'
+
+        # Decode data path
+        file_type, *file_info = data_path
+        if file_type == 'hdf5':
+            path, key = file_info
+        else:
+            path, = file_info
+
+        # Write data to file
+        if file_type == 'hdf5':
             pending = True
             start = time.perf_counter()
             while pending:
                 try:
-                    with h5py.File(os.path.join(self.analysis.analysis_path, hdf5_path), 'a') as f:
+                    with h5py.File(os.path.join(self.analysis.analysis_path, path), 'a') as f:
                         if key not in f:
                             f.create_dataset(key, data=value)
                         else:
@@ -413,19 +432,10 @@ class Entity:
         # TODO: alternative to pickle dumps? Writing arbitrary raw binary data to HDF5 seems difficult
         # Dump all other types as binary strings
         else:
-            pkl_path = f'{self.path}/{key.replace("/", "_")}'
-            data_path = f'pkl:{pkl_path}'
-
-            with open(os.path.join(self.analysis.analysis_path, pkl_path), 'wb') as f:
+            with open(os.path.join(self.analysis.analysis_path, path), 'wb') as f:
                 pickle.dump(value, f)
 
-        # Create new row
-        if row is None:
-            row = self.attribute_table(entity_pk=self.row.pk, name=key, value_column='value_path')
-            self.analysis.session.add(row)
-
-        # Set data path to row
-        row.value = data_path
+        return data_path
 
     def _write_asdf(self, key: str, value: Any, row: sql.Attribute = None):
         pass
