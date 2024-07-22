@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, Iterator, List, Tuple, Type, Union
 import h5py
 import numpy as np
 import pandas as pd
+import yaml
 from pandas._typing import IndexLabel, Scalar
 from sqlalchemy import create_engine, Engine, false, or_, and_, true
 from sqlalchemy.orm import Session, Query, aliased
@@ -32,6 +33,7 @@ class Mode(Enum):
 
 
 class Analysis:
+    _default_bulk_format = 'hdf5'
     mode: Mode
     analysis_path: str
     sql_engine: Engine
@@ -39,15 +41,45 @@ class Analysis:
     index: h5py.File
     entities: Dict[Union[sql.Animal, sql.Recording, sql.Roi, sql.Phase], Entity] = {}
     write_timeout = 3.  # s
+    bulk_format: str
 
-    def __init__(self, path: str, mode: Mode = Mode.analyse):
+    def __init__(self, path: str, mode: Mode = Mode.analyse, bulk_format: str = None, lazy_load: bool = False):
+
+        # Set mode
         self.mode = mode
-        self.analysis_path = Path(path).as_posix()
 
-        self.open_session()
+        # Set path as posix
+        self._analysis_path = Path(path).as_posix()
+
+        if self.mode == Mode.create:
+            if bulk_format is None:
+                bulk_format = self._default_bulk_format
+
+            with open(f'{self.analysis_path}/configuration.yaml', 'w') as f:
+                self.config = {'bulk_format': bulk_format}
+                yaml.safe_dump(self.config, f)
+
+        else:
+            if bulk_format is not None:
+                print('WARNING: Bulk format may only be set during creation')
+
+            with open(f'{self.analysis_path}/configuration.yaml', 'r') as f:
+                self.config = yaml.safe_load(f)
+
+        # Open SQL session by default
+        if not lazy_load:
+            self.open_session()
 
     def __repr__(self):
         return f"Analysis('{self.analysis_path}')"
+
+    @property
+    def analysis_path(self):
+        return self._analysis_path
+
+    @property
+    def bulk_format(self):
+        return self.config['bulk_format']
 
     def open_session(self):
 
@@ -104,12 +136,13 @@ class EntityCollection:
         self.analysis = analysis
         self._entity_type = entity_type
         self._query = query
+        self._query_custom_orderby = False
 
     def __len__(self):
-        return self._query.count()
+        return self.query.count()
 
-    def __iter__(self):
-        for row in self._query.all():
+    def __iter__(self) -> Union[Animal, Recording, Roi, Phase]:
+        for row in self.query.all():
             yield self._get_entity(row)
 
     def __getitem__(self, item) -> Union[Entity, List[Entity]]:
@@ -118,10 +151,22 @@ class EntityCollection:
             if indices[2] != 1:
                 raise KeyError(f'Invalid key {item} with indices {indices}')
             # Return slice
-            return [self._get_entity(row) for row in self._query.offset(indices[0]).limit(indices[1])]
+            return [self._get_entity(row) for row in self.query.offset(indices[0]).limit(indices[1])]
         if isinstance(item, int):
-            return self._get_entity(self._query.offset(item).limit(1)[0])
+            return self._get_entity(self.query.offset(item).limit(1)[0])
         raise KeyError(f'Invalid key {item}')
+
+    @property
+    def query(self):
+        """Property which should be used exclusively to access the Query object.
+        This is important, because there is no default order to SELECTs (unless specified).
+        This means that repeated iterations over the EntityCollection instance
+        may return differently ordered results.
+        """
+        if not self._query_custom_orderby:
+            self._query = self._query.order_by(None).order_by('pk')
+
+        return self._query
 
     @property
     def dataframe(self):
@@ -132,7 +177,6 @@ class EntityCollection:
 
     def sortby(self, name: str, order: str = 'ASC'):
         # TODO: implement sorting
-        # self._query = self._query.order_by()
         pass
 
     def map(self, fun: Callable, **kwargs) -> Any:
@@ -150,6 +194,8 @@ class EntityCollection:
         import multiprocessing as mp
         if worker_num is None:
             worker_num = mp.cpu_count() - 1
+            if len(self) < worker_num:
+                worker_num = len(self)
         print(f'Start pool with {worker_num} workers')
 
         kwargs = tuple([(k, v) for k, v in kwargs.items()])
@@ -244,7 +290,7 @@ class EntityCollection:
 
 class Entity:
     _analysis: Analysis
-    attribute_table = Union[Type[sql.Animal], Type[sql.Recording], Type[sql.Roi]]
+    attribute_table: Union[Type[sql.AnimalAttribute], Type[sql.RecordingAttribute], Type[sql.RoiAttribute]]
     _collection: EntityCollection
 
     # TODO: find better way to handle scalar attribute caching
@@ -253,12 +299,11 @@ class Entity:
 
     # TODO: add attribute buffering for blobs
 
-    def __init__(self, row: Union[sql.Animal, sql.Recording, sql.Roi, sql.Phase], analysis: Analysis, collection: EntityCollection = None):
+    def __init__(self, row: Union[sql.Animal, sql.Recording, sql.Roi, sql.Phase],
+                 analysis: Analysis, collection: EntityCollection = None):
         self._analysis = analysis
         self._row: Union[sql.Animal, sql.Recording, sql.Roi] = row
-        self._scalar_attributes: Dict[str, Any] = None
         self._collection = collection
-        # self._parents: List[Entity] = []
 
     def __getitem__(self, item: str):
 
@@ -299,22 +344,22 @@ class Entity:
             # Convert to the corresponding Python built-in type using the item() method
             value = value.item()
 
+        # Query attribute row if not in create mode
+        row = None
+        if not self.analysis.mode == Mode.create:
+            # Build query
+            query = (self.analysis.session.query(self.attribute_table)
+                     .filter(self.attribute_table.entity_pk == self.row.pk)
+                     .filter(self.attribute_table.name == key))
+
+            # Evaluate
+            if query.count() == 1:
+                row = query.one()
+            elif query.count() > 1:
+                raise ValueError('Wait a minute...')
+
         # Set scalars
         if type(value) in (str, float, int, bool, date, datetime):
-
-            # Query attribute row if not in create mode
-            row = None
-            if not self.analysis.mode == Mode.create:
-                # Build query
-                query = (self.analysis.session.query(self.attribute_table)
-                         .filter(self.attribute_table.entity_pk == self.row.pk)
-                         .filter(self.attribute_table.name == key))
-
-                # Evaluate
-                if query.count() == 1:
-                    row = query.one()
-                elif query.count() > 1:
-                    raise ValueError('Wait a minute...')
 
             # Create new row
             if row is None:
@@ -329,52 +374,61 @@ class Entity:
 
         # Set non-scalar data
         else:
-            if isinstance(value, np.ndarray):
-                hdf5_path = f'{self.path}/data.hdf5'
-                data_path = f'hdf5:{hdf5_path}:{key}'
-                pending = True
-                start = time.perf_counter()
-                while pending:
-                    try:
-                        with h5py.File(os.path.join(self.analysis.analysis_path, hdf5_path), 'a') as f:
-                            # Save numpy arrays as datasets
-                            if isinstance(value, np.ndarray):
-                                if key not in f:
-                                    f.create_dataset(key, data=value)
-                                else:
-                                    if value.shape != f[key].shape:
-                                        del f[key]
-                                        f.create_dataset(key, data=value)
-                                    else:
-                                        f[key][:] = value
-
-                    except Exception as _exc:
-                        if (time.perf_counter() - start) > self.analysis.write_timeout:
-                            import traceback
-                            raise TimeoutError(f'Failed to write attribute {key} to {key} '
-                                               f'// Traceback: {traceback.format_exc()}')
-                        else:
-                            time.sleep(10**-6)
-                    else:
-                        pending = False
-
-            # TODO: alternative to pickle dumps? Writing arbitrary raw binary data to HDF5 seems difficult
-            # Dump all other types as binary strings
-            else:
-                pkl_path = f'{self.path}/{key.replace("/", "_")}'
-                data_path = f'pkl:{pkl_path}'
-
-                with open(os.path.join(self.analysis.analysis_path, pkl_path), 'wb') as f:
-                    pickle.dump(value, f)
-
-            # Add row for attribute to SQL
-            row = self.attribute_table(entity_pk=self.row.pk, name=key, value_column='value_path')
-            row.value = data_path
-            self.analysis.session.add(row)
+            # Write any non-scalar data accoridng to specified bulk storage format
+            getattr(self, f'_write_{self.analysis.bulk_format}')(key, value)
 
         # Commit changes (right away if not in create mode)
         if self.analysis.mode != Mode.create:
             self.analysis.session.commit()
+
+    def _write_hdf5(self, key: str, value: Any, row: sql.Attribute = None):
+
+        if isinstance(value, np.ndarray):
+            hdf5_path = f'{self.path}/data.hdf5'
+            data_path = f'hdf5:{hdf5_path}:{key}'
+            pending = True
+            start = time.perf_counter()
+            while pending:
+                try:
+                    with h5py.File(os.path.join(self.analysis.analysis_path, hdf5_path), 'a') as f:
+                        if key not in f:
+                            f.create_dataset(key, data=value)
+                        else:
+                            if value.shape != f[key].shape:
+                                del f[key]
+                                f.create_dataset(key, data=value)
+                            else:
+                                f[key][:] = value
+
+                except Exception as _exc:
+                    if (time.perf_counter() - start) > self.analysis.write_timeout:
+                        import traceback
+                        raise TimeoutError(f'Failed to write attribute {key} to {key} '
+                                           f'// Traceback: {traceback.format_exc()}')
+                    else:
+                        time.sleep(10 ** -6)
+                else:
+                    pending = False
+
+        # TODO: alternative to pickle dumps? Writing arbitrary raw binary data to HDF5 seems difficult
+        # Dump all other types as binary strings
+        else:
+            pkl_path = f'{self.path}/{key.replace("/", "_")}'
+            data_path = f'pkl:{pkl_path}'
+
+            with open(os.path.join(self.analysis.analysis_path, pkl_path), 'wb') as f:
+                pickle.dump(value, f)
+
+        # Create new row
+        if row is None:
+            row = self.attribute_table(entity_pk=self.row.pk, name=key, value_column='value_path')
+            self.analysis.session.add(row)
+
+        # Set data path to row
+        row.value = data_path
+
+    def _write_asdf(self, key: str, value: Any, row: sql.Attribute = None):
+        pass
 
     @property
     def scalar_attributes(self):
@@ -876,14 +930,15 @@ def _filter(analysis: Analysis,
             query = query.join(alias)
 
             attr_value_field = None
-            if isinstance(value, float):
-                attr_value_field = alias.value_float
+            # Booleans need to be checked first, because they isinstance(True/False, int) evaluates to True
+            if isinstance(value, bool):
+                attr_value_field = alias.value_bool
             elif isinstance(value, int):
                 attr_value_field = alias.value_int
+            elif isinstance(value, float):
+                attr_value_field = alias.value_float
             elif isinstance(value, str):
                 attr_value_field = alias.value_str
-            elif isinstance(value, bool):
-                attr_value_field = alias.value_bool
 
             if attr_value_field is None:
                 raise TypeError(f'Invalid type "{type(value)}" to filter for in attributes')
@@ -893,13 +948,6 @@ def _filter(analysis: Analysis,
             elif comp == 'le':
                 query = query.filter(attr_value_field <= value)
             elif comp == 'e':
-                # if isinstance(value, bool):
-                #     print(value)
-                #     if value:
-                #         query = query.filter(attr_value_field.is_(true()))
-                #     else:
-                #         query = query.filter(attr_value_field.is_(false()))
-                # else:
                 query = query.filter(attr_value_field == value)
             elif comp == 'ge':
                 query = query.filter(attr_value_field >= value)

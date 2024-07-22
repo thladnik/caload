@@ -38,6 +38,14 @@ def greaterequal(name, value):
     return name, 'ge', value
 
 
+def is_true(name):
+    return name, 'e', True
+
+
+def is_false(name):
+    return name, 'e', False
+
+
 if __name__ == '__main__':
 
     # path = '../../../../TEMP_testdata/default_orientation/analysis01'
