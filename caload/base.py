@@ -389,7 +389,7 @@ class Entity:
     def _write_hdf5(self, key: str, value: Any, row: sql.Attribute) -> str:
 
         if row is not None:
-            data_path = row.value.split(':')
+            data_path = row.value
         else:
             if isinstance(value, np.ndarray):
                 data_path = f'hdf5:{self.path}/data.hdf5:{key}'
@@ -397,7 +397,7 @@ class Entity:
                 data_path = f'pkl:{self.path}/{key.replace("/", "_")}'
 
         # Decode data path
-        file_type, *file_info = data_path
+        file_type, *file_info = data_path.split(':')
         if file_type == 'hdf5':
             path, key = file_info
         else:
