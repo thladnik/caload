@@ -1,3 +1,4 @@
+import pickle
 from datetime import date, datetime
 from typing import Any, List, Union
 
@@ -99,19 +100,26 @@ class Attribute:
     value_bool: Mapped[bool] = mapped_column(nullable=True)
     value_date: Mapped[date] = mapped_column(nullable=True)
     value_datetime: Mapped[datetime] = mapped_column(nullable=True)
+    value_blob: Mapped[bytes] = mapped_column(nullable=True)
     value_path: Mapped[str] = mapped_column(nullable=True)
-    value_column: Mapped[str] = mapped_column(nullable=True)
+    column_str: Mapped[str] = mapped_column(nullable=True)
 
     def __repr__(self):
         return f"<{self.__class__.name}({self.entity}, {self.name}, {self.value})>"
 
     @property
     def value(self):
-        return getattr(self, self.value_column)
+        if self.column_str is not None:
+            if self.column_str == 'value_blob':
+                return pickle.loads(self.value_blob)
+            return getattr(self, self.column_str)
+        return None
 
     @value.setter
     def value(self, value):
-        setattr(self, self.value_column, value)
+        if self.column_str == 'value_blob':
+            value = pickle.dumps(value)
+        setattr(self, self.column_str, value)
 
 
 class AnimalAttribute(Attribute, SQLBase):
@@ -119,9 +127,6 @@ class AnimalAttribute(Attribute, SQLBase):
 
     entity_pk: Mapped[int] = mapped_column(ForeignKey('animals.pk'), primary_key=True)
     entity: Mapped['Animal'] = relationship('Animal', back_populates='attributes')
-
-    # def __repr__(self):
-    #     return f"<AnimalAttribute(animal={self.entity}, attribute={self.name}, value={self.value})>"
 
 
 class RecordingAttribute(Attribute, SQLBase):
@@ -137,18 +142,12 @@ class PhaseAttribute(Attribute, SQLBase):
     entity_pk: Mapped[int] = mapped_column(ForeignKey('phases.pk'), primary_key=True)
     entity: Mapped['Phase'] = relationship('Phase', back_populates='attributes')
 
-    # def __repr__(self):
-    #     return f"<PhaseAttribute(phase={self.entity}, attribute={self.name}, value={self.value})>"
-
 
 class RoiAttribute(Attribute, SQLBase):
     __tablename__ = 'roi_attributes'
 
     entity_pk: Mapped[int] = mapped_column(ForeignKey('rois.pk'), primary_key=True)
     entity: Mapped['Roi'] = relationship('Roi', back_populates='attributes')
-
-    # def __repr__(self):
-    #     return f"<RoiAttribute(roi={self.entity}, attribute={self.name}, value={self.value})>"
 
 
 if __name__ == '__main__':

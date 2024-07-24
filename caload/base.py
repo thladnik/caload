@@ -41,11 +41,12 @@ class Analysis:
     index: h5py.File
     entities: Dict[Union[sql.Animal, sql.Recording, sql.Roi, sql.Phase], Entity] = {}
     write_timeout = 3.  # s
-    lazy_load: bool
+    lazy_init: bool
     echo: bool
+    max_blob_size: int
 
     def __init__(self, path: str, mode: Mode = Mode.analyse, bulk_format: str = None,
-                 lazy_load: bool = False, echo: bool = False):
+                 lazy_init: bool = False, echo: bool = False, max_blob_size: int = 2 ** 9):
 
         # Set mode
         self.mode = mode
@@ -69,11 +70,12 @@ class Analysis:
                 self.config = yaml.safe_load(f)
 
         # Set optionals
-        self.lazy_load = lazy_load
+        self.lazy_init = lazy_init
         self.echo = echo
+        self.max_blob_size = max_blob_size
 
         # Open SQL session by default
-        if not lazy_load:
+        if not lazy_init:
             self.open_session()
 
     def __repr__(self):
@@ -317,12 +319,14 @@ class Entity:
         # Fetch first (only row)
         attr_row = query.first()
 
-        value_column = attr_row.value_column
+        column_str = attr_row.column_str
         value = attr_row.value
 
-        if value_column != 'value_path':
+        # Anything that isn't a referenced path gets returned immediately
+        if column_str != 'value_path':
             return value
 
+        # Load and return referenced dataset
         file_type, *file_info = value.split(':')
 
         if file_type == 'hdf5':
@@ -344,8 +348,8 @@ class Entity:
             # Convert to the corresponding Python built-in type using the item() method
             value = value.item()
 
-        # Query attribute row if not in create mode
         row = None
+        # Query attribute row if not in create mode
         if not self.analysis.mode == Mode.create:
             # Build query
             query = (self.analysis.session.query(self.attribute_table)
@@ -358,39 +362,50 @@ class Entity:
             elif query.count() > 1:
                 raise ValueError('Wait a minute...')
 
+        # Create row if it doesn't exist yet
+        if row is None:
+            row = self.attribute_table(entity_pk=self.row.pk, name=key)
+            self.analysis.session.add(row)
+
         # Set scalars
         if type(value) in (str, float, int, bool, date, datetime):
 
-            # Create new row
-            if row is None:
-                value_type_map = {str: 'str', float: 'float', int: 'int',
-                                  bool: 'bool', date: 'date', datetime: 'datetime'}
-                value_type_str = value_type_map.get(type(value))
-                row = self.attribute_table(entity_pk=self.row.pk, name=key, value_column=f'value_{value_type_str}')
-                self.analysis.session.add(row)
+            # Set value type
+            value_type_map = {str: 'str', float: 'float', int: 'int',
+                              bool: 'bool', date: 'date', datetime: 'datetime'}
+            column_str = f'value_{value_type_map.get(type(value))}'
 
-            # Set value
-            row.value = value
+        # Set small objects
+        elif value.__sizeof__() < self.analysis.max_blob_size:
 
-        # Set non-scalar data
+            # Set value type
+            column_str = 'value_blob'
+
+        # Set large objects
         else:
-            # Write any non-scalar data accoridng to specified bulk storage format
-            data_path = getattr(self, f'_write_{self.analysis.bulk_format}')(key, value, row)
 
-            if row is None:
-                # Add new row
-                row = self.attribute_table(entity_pk=self.row.pk, name=key, value_column='value_path', value_path=data_path)
-                self.analysis.session.add(row)
+            # Set value type
+            column_str = 'value_path'
+
+            # Write any non-scalar data that is too large according to specified bulk storage format
+            value = getattr(self, f'_write_{self.analysis.bulk_format}')(key, value, row.value)
+
+        # Reset old value in case it was set to different type before
+        if type(row.column_str) is str and row.column_str != column_str and row.value is not None:
+            row.value = None
+
+        # Set row type and value
+        row.column_str = column_str
+        row.value = value
 
         # Commit changes (right away if not in create mode)
         if self.analysis.mode != Mode.create:
             self.analysis.session.commit()
 
-    def _write_hdf5(self, key: str, value: Any, row: sql.Attribute) -> str:
+    def _write_hdf5(self, key: str, value: Any, data_path) -> str:
 
-        if row is not None:
-            data_path = row.value
-        else:
+        # If not data_path is provided, generate it
+        if data_path is None:
             if isinstance(value, np.ndarray):
                 data_path = f'hdf5:{self.path}/data.hdf5:{key}'
             else:
@@ -445,7 +460,7 @@ class Entity:
         # Get all
         query = (self.analysis.session.query(self.attribute_table)
                  .filter(self.attribute_table.entity_pk == self.row.pk)
-                 .filter(self.attribute_table.value_column != 'value_path'))
+                 .filter(self.attribute_table.column_str != 'value_path'))
 
         # Update
         return {row.name:  row.value for row in query.all()}
@@ -459,7 +474,7 @@ class Entity:
         # Update
         attributes = {}
         for row in query.all():
-            if row.value_column == 'value_path':
+            if row.column_str == 'value_path':
                 attributes[row.name] = self[row.name]
             else:
                 attributes[row.name] = row.value
