@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import pickle
+import pprint
 
 import sys
 import time
@@ -292,20 +293,20 @@ class Animal(Entity):
     def add_recording(self, *args, **kwargs) -> Recording:
         return Recording.create(*args, animal=self, analysis=self.analysis, **kwargs)
 
-    def recordings(self, *args, **kwargs) -> EntityCollection:
+    def recordings(self, *args, **kwargs) -> RecordingCollection:
         return Recording.filter(self.analysis, animal_id=self.id, *args, **kwargs)
 
-    def rois(self, *args, **kwargs) -> EntityCollection:
+    def rois(self, *args, **kwargs) -> RoiCollection:
         return Roi.filter(self.analysis, animal_id=self.id, *args, **kwargs)
 
-    def phases(self, *args, **kwargs) -> EntityCollection:
+    def phases(self, *args, **kwargs) -> PhaseCollection:
         return Phase.filter(self.analysis, animal_id=self.id, *args, **kwargs)
 
     @classmethod
     def filter(cls,
                analysis: Analysis,
                *attr_filters,
-               animal_id: str = None) -> EntityCollection:
+               animal_id: str = None) -> AnimalCollection:
         query = _filter(analysis,
                         AnimalTable,
                         [],
@@ -313,7 +314,7 @@ class Animal(Entity):
                         *attr_filters,
                         animal_id=animal_id)
 
-        return EntityCollection(analysis=analysis, entity_type=cls, query=query)
+        return AnimalCollection(analysis=analysis, query=query)
 
 
 class Recording(Entity):
@@ -347,11 +348,11 @@ class Recording(Entity):
     def add_phase(self, *args, **kwargs) -> Phase:
         return Phase.create(*args, recording=self, analysis=self.analysis, **kwargs)
 
-    def rois(self, *args, **kwargs) -> EntityCollection:
+    def rois(self, *args, **kwargs) -> RoiCollection:
         return Roi.filter(self.analysis, animal_id=self.animal_id, rec_id=self.id, rec_date=self.rec_date, *args,
                           **kwargs)
 
-    def phases(self, *args, **kwargs) -> EntityCollection:
+    def phases(self, *args, **kwargs) -> PhaseCollection:
         return Phase.filter(self.analysis, animal_id=self.animal_id, rec_id=self.id, rec_date=self.rec_date, *args,
                             **kwargs)
 
@@ -385,7 +386,7 @@ class Recording(Entity):
                *attr_filters,
                animal_id: str = None,
                rec_date: Union[str, date, datetime] = None,
-               rec_id: str = None) -> EntityCollection:
+               rec_id: str = None) -> RecordingCollection:
         query = _filter(analysis,
                         RecordingTable,
                         [AnimalTable],
@@ -395,7 +396,7 @@ class Recording(Entity):
                         rec_date=rec_date,
                         rec_id=rec_id)
 
-        return EntityCollection(analysis=analysis, entity_type=cls, query=query)
+        return RecordingCollection(analysis=analysis, query=query)
 
 
 class Phase(Entity):
@@ -469,7 +470,7 @@ class Phase(Entity):
                animal_id: str = None,
                rec_date: Union[str, date, datetime] = None,
                rec_id: str = None,
-               phase_id: int = None, ) -> EntityCollection:
+               phase_id: int = None, ) -> PhaseCollection:
         query = _filter(analysis,
                         PhaseTable,
                         [RecordingTable, AnimalTable],
@@ -480,7 +481,7 @@ class Phase(Entity):
                         rec_id=rec_id,
                         phase_id=phase_id)
 
-        return EntityCollection(analysis=analysis, entity_type=cls, query=query)
+        return PhaseCollection(analysis=analysis, query=query)
 
     def export_to(self, f: h5py.File):
 
@@ -568,7 +569,7 @@ class Roi(Entity):
                animal_id: str = None,
                rec_date: Union[str, date, datetime] = None,
                rec_id: str = None,
-               roi_id: int = None, ) -> EntityCollection:
+               roi_id: int = None, ) -> RoiCollection:
         query = _filter(analysis,
                         RoiTable,
                         [RecordingTable, AnimalTable],
@@ -579,7 +580,7 @@ class Roi(Entity):
                         rec_id=rec_id,
                         roi_id=roi_id)
 
-        return EntityCollection(analysis=analysis, entity_type=cls, query=query)
+        return RoiCollection(analysis=analysis, query=query)
 
     def export_to(self, f: h5py.File):
 
@@ -686,35 +687,109 @@ class EntityCollection:
     analysis: Analysis
     _entity_type: Type[Entity]
     _query: Query
+    _iteration_count: int = -1
+    _batch_offset: int = 0
+    _batch_size: int = 100
+    _batch_results: List[EntityTable]
 
-    def __init__(self, analysis: Analysis, entity_type: Type[Entity], query: Query):
+    def __init__(self, analysis: Analysis, query: Query):
         self.analysis = analysis
-        self._entity_type = entity_type
         self._query = query
         self._query_custom_orderby = False
 
     def __len__(self):
         return self.query.count()
 
-    def __iter__(self) -> Entity:
-        for row in self.query.all():
-            yield self._get_entity(row)
+    def __iter__(self):
+        return self
 
-    def __getitem__(self, item) -> Union[Entity, List[Entity]]:
-        if isinstance(item, slice):
-            indices = item.indices(len(self))
-            if indices[2] != 1:
-                raise KeyError(f'Invalid key {item} with indices {indices}')
-            # Return slice
-            return [self._get_entity(row) for row in self.query.offset(indices[0]).limit(indices[1])]
+    def __next__(self):
+
+        # Increment count
+        self._iteration_count += 1
+
+        # Fetch the next batch of results
+        if self._iteration_count == 0 or (self._iteration_count == self._batch_offset + self._batch_size):
+            self._batch_offset = self._iteration_count
+            self._batch_results = self.query.offset(self._batch_offset).limit(self._batch_size).all()
+
+        # No more results: reset iteration counter and offset and stop iteration
+        if len(self._batch_results) == 0 or self._iteration_count >= self._batch_offset+len(self._batch_results):
+            self._iteration_count = -1
+            self._batch_offset = 0
+
+            raise StopIteration
+
+        # Return single result
+        return self._get_entity(self._batch_results[self._iteration_count % self._batch_size])
+
+    def __getitem__(self, item) -> Union[Entity, List[Entity], pd.DataFrame]:
+
+        # Return single entity
         if isinstance(item, (int, np.integer)):
+            if item < 0:
+                item = len(self)+item
             return self._get_entity(self.query.offset(item).limit(1)[0])
-        print(type(item))
+
+        # Return slice
+        if isinstance(item, slice):
+            start, stop, step = item.indices(len(self))
+            if abs(step) == 1:
+                # Get data
+                result = [self._get_entity(row) for row in self.query.offset(start).limit(stop-start)]
+            else:
+                # TODO: there should be a way to directly query the n-th row using 'ROW_NUMBER() % n'
+                #  but it's not clear how is would work in SQLAlchemy ORM; figure out later
+                result = [self._get_entity(row) for row in self.query.offset(start).limit(stop-start)][::abs(step)]
+
+            # Return in order
+            if step > 0:
+                return result
+            return result[::-1]
+
+        # Return multiple attributes for all entities in collection
+        if isinstance(item, (str, list, tuple)):
+            if isinstance(item, str):
+                item = [item]
+
+            # Select all ROI pk's
+            rows = self.query.all()
+            pks_all = [row.pk for row in rows]
+
+            # Fetch attribute data for all given attributes name
+            results = []
+            attr_table = self._entity_type.attr_table
+            for name in item:
+                attributes = (self.analysis.session.query(attr_table)
+                              .where(attr_table.name == name, attr_table.entity_pk.in_(pks_all))
+                              .order_by(attr_table.entity_pk)
+                              .all())
+                results.append([[row.entity_pk, row.value, row.column_str] for row in attributes])
+
+            # Write output to DataFrame
+            data = []
+            for name, res in zip(item, results):
+                pks, vals, dtypes = [list(t) for t in zip(*res)]
+
+                # Replace value_path string representations with actual attribute data
+                if 'value_path' in dtypes:
+                    for idx, (pk, v, dt) in enumerate(zip(pks, vals, dtypes)):
+                        if dt == 'value_path':
+                            vals[idx] = self._get_entity(rows[pks_all.index(pk)])[name]
+
+                # Add series to list
+                data.append(pd.Series(name=name, index=pks, data=vals))
+
+            # Create DataFrame
+            df = pd.concat(data, axis=1, keys=[s.name for s in data])
+
+            return df
+
         raise KeyError(f'Invalid key {item}')
 
     @property
     def query(self):
-        """Property which should be used exclusively to access the Query object.
+        """Property which should be used *exclusively* to access the Query object.
         This is important, because there is no default order to SELECTs (unless specified).
         This means that repeated iterations over the EntityCollection instance
         may return differently ordered results.
@@ -728,11 +803,11 @@ class EntityCollection:
     def dataframe(self):
         return pd.DataFrame([entity.scalar_attributes for entity in self])
 
-    @property
-    def extended_dataframe(self):
-        df = self.dataframe
-        ext_df = pd.DataFrame([entity.parent.extended_dataframe for entity in self])
-        return pd.DataFrame([entity.df for entity in self])
+    # @property
+    # def extended_dataframe(self):
+    #     df = self.dataframe
+    #     ext_df = pd.DataFrame([entity.parent.extended_dataframe for entity in self])
+    #     return pd.DataFrame([entity.df for entity in self])
 
     def _get_entity(self, row: EntityTable) -> Entity:
         return self._entity_type(row=row, analysis=self.analysis)
@@ -839,3 +914,32 @@ class EntityCollection:
         elapsed_time = time.perf_counter() - start_time
 
         return elapsed_time
+
+
+class AnimalCollection(EntityCollection):
+
+    _entity_type = Animal
+
+    def _get_entity(self, row: AnimalTable) -> Animal:
+        return super()._get_entity(row)
+
+
+class RecordingCollection(EntityCollection):
+    _entity_type = Recording
+
+    def _get_entity(self, row: RecordingTable) -> Recording:
+        return super()._get_entity(row)
+
+
+class RoiCollection(EntityCollection):
+    _entity_type = Roi
+
+    def _get_entity(self, row: RoiTable) -> Roi:
+        return super()._get_entity(row)
+
+
+class PhaseCollection(EntityCollection):
+    _entity_type = Phase
+
+    def _get_entity(self, row: PhaseTable) -> Phase:
+        return super()._get_entity(row)

@@ -34,7 +34,7 @@ class Analysis:
     max_blob_size: int
 
     def __init__(self, path: str, mode: Mode = Mode.analyse, bulk_format: str = None,
-                 lazy_init: bool = False, echo: bool = False, max_blob_size: int = 2 ** 9):
+                 lazy_init: bool = False, echo: bool = False, max_blob_size: int = 2 ** 22):
 
         # Set mode
         self.mode = mode
