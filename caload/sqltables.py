@@ -1,9 +1,13 @@
 import pickle
 from datetime import date, datetime
-from typing import Any, List, Union
+from typing import List
 
 from sqlalchemy import Index, ForeignKey, event, Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+__all__ = ['SQLBase', 'EntityTable', 'AttributeTable',
+           'AnimalTable', 'RecordingTable', 'RoiTable', 'PhaseTable',
+           'AnimalAttributeTable', 'RecordingAttributeTable', 'RoiAttributeTable', 'PhaseAttributeTable']
 
 
 # Set WAL
@@ -20,78 +24,84 @@ class SQLBase(DeclarativeBase):
     pass
 
 
-# Define the Entity table for animals
-class Animal(SQLBase):
-    __tablename__ = 'animals'
+class EntityTable:
     pk: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+
+
+class AnimalTable(EntityTable, SQLBase):
+    __tablename__ = 'animals'
 
     id: Mapped[str] = mapped_column(unique=True)
 
-    recordings: Mapped[List['Recording']] = relationship('Recording', back_populates='animal')
-    attributes: Mapped[List['AnimalAttribute']] = relationship('AnimalAttribute', back_populates='entity')
+    recordings: Mapped[List['RecordingTable']] = relationship('RecordingTable', back_populates='parent')
+    attributes: Mapped[List['AnimalAttributeTable']] = relationship('AnimalAttributeTable', back_populates='entity')
 
     def __repr__(self):
         return f"<Animal(id={self.id}')>"
 
 
-# Define the Entity table for recordings
-class Recording(SQLBase):
+class RecordingTable(EntityTable, SQLBase):
     __tablename__ = 'recordings'
     pk: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    animal_pk: Mapped[int] = mapped_column(ForeignKey('animals.pk'))
+    parent_pk: Mapped[int] = mapped_column(ForeignKey('animals.pk'))
 
     id: Mapped[str]
     date: Mapped[date]
 
-    animal: Mapped['Animal'] = relationship('Animal', back_populates='recordings')
-    rois: Mapped[List['Roi']] = relationship('Roi', back_populates='recording')
-    phases: Mapped[List['Phase']] = relationship('Phase', back_populates='recording')
-    attributes: Mapped[List['RecordingAttribute']] = relationship('RecordingAttribute', back_populates='entity')
+    parent: Mapped['AnimalTable'] = relationship('AnimalTable', back_populates='recordings')
+    rois: Mapped[List['RoiTable']] = relationship('RoiTable', back_populates='parent')
+    phases: Mapped[List['PhaseTable']] = relationship('PhaseTable', back_populates='parent')
+    attributes: Mapped[List['RecordingAttributeTable']] = relationship('RecordingAttributeTable', back_populates='entity')
 
     # Define partial unique index
     __table_args__ = (
-        Index('ix_unique_rec_id_per_animal_date', 'animal_pk', 'date', 'id', unique=True),
+        Index('ix_unique_rec_id_per_animal_date', 'parent_pk', 'date', 'id', unique=True),
     )
 
     def __repr__(self):
-        return f"<Recording(id={self.id}, animal={self.animal}, date={self.date})>"
+        return f"<Recording(id={self.id}, animal={self.parent}, date={self.date})>"
 
 
-class Roi(SQLBase):
+class RoiTable(EntityTable, SQLBase):
     __tablename__ = 'rois'
     pk: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    recording_pk: Mapped[int] = mapped_column(ForeignKey('recordings.pk'))
+    parent_pk: Mapped[int] = mapped_column(ForeignKey('recordings.pk'))
 
     id: Mapped[int]
 
-    recording: Mapped['Recording'] = relationship('Recording', back_populates='rois')
-    attributes: Mapped[List['RoiAttribute']] = relationship('RoiAttribute', back_populates='entity')
+    parent: Mapped['RecordingTable'] = relationship('RecordingTable', back_populates='rois')
+    attributes: Mapped[List['RoiAttributeTable']] = relationship('RoiAttributeTable', back_populates='entity')
 
     __table_args__ = (
-        Index('ix_unique_roi_id_per_recording', 'recording_pk', 'id', unique=True),
+        Index('ix_unique_roi_id_per_recording', 'parent_pk', 'id', unique=True),
     )
 
     def __repr__(self):
-        return f"<Roi(id={self.id}, recording={self.recording})>"
+        return f"<Roi(id={self.id}, recording={self.parent})>"
 
 
-class Phase(SQLBase):
+class PhaseTable(EntityTable, SQLBase):
     __tablename__ = 'phases'
     pk: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    recording_pk: Mapped[int] = mapped_column(ForeignKey('recordings.pk'))
+    parent_pk: Mapped[int] = mapped_column(ForeignKey('recordings.pk'))
 
     id: Mapped[int]
 
-    recording: Mapped['Recording'] = relationship('Recording', back_populates='phases')
-    attributes: Mapped[List['PhaseAttribute']] = relationship('PhaseAttribute', back_populates='entity')
+    parent: Mapped['RecordingTable'] = relationship('RecordingTable', back_populates='phases')
+    attributes: Mapped[List['PhaseAttributeTable']] = relationship('PhaseAttributeTable', back_populates='entity')
 
     __table_args__ = (
-        Index('ix_unique_phase_id_per_recording', 'recording_pk', 'id', unique=True),
+        Index('ix_unique_phase_id_per_recording', 'parent_pk', 'id', unique=True),
     )
 
+    def __repr__(self):
+        return f"<Phase(id={self.id}, recording={self.parent})>"
 
-# Attribute tables
-class Attribute:
+
+class AttributeTable:
+    entity_pk: Mapped[int]
+    entity: Mapped
+
     name: Mapped[str] = mapped_column(primary_key=True)
 
     value_str: Mapped[str] = mapped_column(nullable=True)
@@ -103,6 +113,8 @@ class Attribute:
     value_blob: Mapped[bytes] = mapped_column(nullable=True)
     value_path: Mapped[str] = mapped_column(nullable=True)
     column_str: Mapped[str] = mapped_column(nullable=True)
+
+    is_persistent: Mapped[bool] = mapped_column(nullable=True)
 
     def __repr__(self):
         return f"<{self.__class__.name}({self.entity}, {self.name}, {self.value})>"
@@ -122,32 +134,32 @@ class Attribute:
         setattr(self, self.column_str, value)
 
 
-class AnimalAttribute(Attribute, SQLBase):
+class AnimalAttributeTable(AttributeTable, SQLBase):
     __tablename__ = 'animal_attributes'
 
     entity_pk: Mapped[int] = mapped_column(ForeignKey('animals.pk'), primary_key=True)
-    entity: Mapped['Animal'] = relationship('Animal', back_populates='attributes')
+    entity: Mapped['AnimalTable'] = relationship('AnimalTable', back_populates='attributes')
 
 
-class RecordingAttribute(Attribute, SQLBase):
+class RecordingAttributeTable(AttributeTable, SQLBase):
     __tablename__ = 'recording_attributes'
 
     entity_pk: Mapped[int] = mapped_column(ForeignKey('recordings.pk'), primary_key=True)
-    entity: Mapped['Recording'] = relationship('Recording', back_populates='attributes')
+    entity: Mapped['RecordingTable'] = relationship('RecordingTable', back_populates='attributes')
 
 
-class PhaseAttribute(Attribute, SQLBase):
+class PhaseAttributeTable(AttributeTable, SQLBase):
     __tablename__ = 'phase_attributes'
 
     entity_pk: Mapped[int] = mapped_column(ForeignKey('phases.pk'), primary_key=True)
-    entity: Mapped['Phase'] = relationship('Phase', back_populates='attributes')
+    entity: Mapped['PhaseTable'] = relationship('PhaseTable', back_populates='attributes')
 
 
-class RoiAttribute(Attribute, SQLBase):
+class RoiAttributeTable(AttributeTable, SQLBase):
     __tablename__ = 'roi_attributes'
 
     entity_pk: Mapped[int] = mapped_column(ForeignKey('rois.pk'), primary_key=True)
-    entity: Mapped['Roi'] = relationship('Roi', back_populates='attributes')
+    entity: Mapped['RoiTable'] = relationship('RoiTable', back_populates='attributes')
 
 
 if __name__ == '__main__':
@@ -155,7 +167,7 @@ if __name__ == '__main__':
     from sqlalchemy.orm import Session
 
     # Create engine
-    engine = create_engine('sqlite:///../test.db')
+    engine = create_engine('sqlite:///test.db')
     SQLBase.metadata.create_all(engine)
 
     # Create a session

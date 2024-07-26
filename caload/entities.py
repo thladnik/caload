@@ -1,138 +1,685 @@
 from __future__ import annotations
 
-import copy
-import os.path
+import os
 import pickle
+
 import sys
 import time
 from abc import abstractmethod
+
 from datetime import datetime, date, timedelta
-from enum import Enum
-from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Tuple, Type, Union
+from typing import Any, Callable, Dict, List, TYPE_CHECKING, Tuple, Type, Union
 
 import h5py
 import numpy as np
 import pandas as pd
-import yaml
-from pandas._typing import IndexLabel, Scalar
-from sqlalchemy import create_engine, Engine, false, or_, and_, true
-from sqlalchemy.orm import Session, Query, aliased
+from sqlalchemy.orm import Query, aliased
 from tqdm import tqdm
 
-from caload import sqltables as sql
+from caload.sqltables import EntityTable, AnimalTable, RecordingTable, RoiTable, PhaseTable, \
+    AttributeTable, AnimalAttributeTable, RecordingAttributeTable, RoiAttributeTable, PhaseAttributeTable
 from caload import utils
 
-__all__ = ['Analysis', 'EntityCollection', 'Entity',
-           'Animal', 'Recording', 'Roi', 'Phase', 'Mode']
+if TYPE_CHECKING:
+    from caload.analysis import Analysis
+
+__all__ = ['EntityCollection', 'Animal', 'Recording', 'Roi', 'Phase']
 
 
-class Mode(Enum):
-    create = 1
-    analyse = 2
+class Entity:
+    _analysis: Analysis
+    _collection: EntityCollection
+    _row:  Union[AnimalTable, RecordingTable, RoiTable, PhaseTable]
 
+    attr_table: Union[Type[AnimalAttributeTable, RecordingAttributeTable, RoiAttributeTable, PhaseAttributeTable]]
+    # Keep references to parent table instances,
+    # to avoid cold references during multiprocessing,
+    # caused by lazy loading
+    parents: List[EntityTable]
 
-class Analysis:
-    _default_bulk_format = 'hdf5'
-    mode: Mode
-    analysis_path: str
-    sql_engine: Engine
-    session: Session
-    index: h5py.File
-    entities: Dict[Union[sql.Animal, sql.Recording, sql.Roi, sql.Phase], Entity] = {}
-    write_timeout = 3.  # s
-    lazy_init: bool
-    echo: bool
-    max_blob_size: int
+    def __init__(self,
+                 row,
+                 analysis,
+                 collection = None):
+        self._analysis = analysis
+        self._row = row
+        self._collection = collection
 
-    def __init__(self, path: str, mode: Mode = Mode.analyse, bulk_format: str = None,
-                 lazy_init: bool = False, echo: bool = False, max_blob_size: int = 2 ** 9):
+        self.parents = []
 
-        # Set mode
-        self.mode = mode
+    def __getitem__(self, item: str):
 
-        # Set path as posix
-        self._analysis_path = Path(path).as_posix()
+        query = (self.analysis.session.query(self.attr_table)
+                 .filter(self.attr_table.name == item)
+                 .filter(self.attr_table.entity_pk == self.row.pk))
 
-        if self.mode == Mode.create:
-            if bulk_format is None:
-                bulk_format = self._default_bulk_format
+        if query.count() == 0:
+            raise KeyError(f'Attribute {item} not found for entity {self}')
 
-            with open(f'{self.analysis_path}/configuration.yaml', 'w') as f:
-                self.config = {'bulk_format': bulk_format}
-                yaml.safe_dump(self.config, f)
+        # Fetch first (only row)
+        attr_row = query.first()
 
+        column_str = attr_row.column_str
+        value = attr_row.value
+
+        # Anything that isn't a referenced path gets returned immediately
+        if column_str != 'value_path':
+            return value
+
+        # Load and return referenced dataset
+        file_type, *file_info = value.split(':')
+
+        if file_type == 'hdf5':
+            file_path, key = file_info
+            with h5py.File(os.path.join(self.analysis.analysis_path, file_path), 'r') as f:
+                return f[key][:]
+
+        elif file_type == 'pkl':
+            file_path, = file_info
+            with open(os.path.join(self.analysis.analysis_path, file_path), 'rb') as f2:
+                return pickle.load(f2)
+
+        raise KeyError(f'No attribute with name {item} in {self}')
+
+    def __setitem__(self, key: str, value: Any):
+
+        # Find corresponding builtin python scalar type for numpy scalars and shape () arrays
+        if isinstance(value, np.generic) or (isinstance(value, np.ndarray) and np.squeeze(value).shape == ()):
+            # Convert to the corresponding Python built-in type using the item() method
+            value = value.item()
+
+        row = None
+        # Query attribute row if not in create mode
+        if not self.analysis.is_create_mode:
+            # Build query
+            query = (self.analysis.session.query(self.attr_table)
+                     .filter(self.attr_table.entity_pk == self.row.pk)
+                     .filter(self.attr_table.name == key))
+
+            # Evaluate
+            if query.count() == 1:
+                row = query.one()
+            elif query.count() > 1:
+                raise ValueError('Wait a minute...')
+
+        # Create row if it doesn't exist yet
+        if row is None:
+            row = self.attr_table(entity_pk=self.row.pk, name=key, is_persistent=self.analysis.is_create_mode)
+            self.analysis.session.add(row)
+
+        # Set scalars
+        if type(value) in (str, float, int, bool, date, datetime):
+
+            # Set value type
+            value_type_map = {str: 'str', float: 'float', int: 'int',
+                              bool: 'bool', date: 'date', datetime: 'datetime'}
+            column_str = f'value_{value_type_map.get(type(value))}'
+
+        # Set small objects
+        elif value.__sizeof__() < self.analysis.max_blob_size:
+
+            # Set value type
+            column_str = 'value_blob'
+
+        # Set large objects
         else:
-            if bulk_format is not None:
-                print('WARNING: Bulk format may only be set during creation')
 
-            with open(f'{self.analysis_path}/configuration.yaml', 'r') as f:
-                self.config = yaml.safe_load(f)
+            # Set value type
+            column_str = 'value_path'
 
-        # Set optionals
-        self.lazy_init = lazy_init
-        self.echo = echo
-        self.max_blob_size = max_blob_size
+            # Write any non-scalar data that is too large according to specified bulk storage format
+            value = getattr(self, f'_write_{self.analysis.bulk_format}')(key, value, row.value)
 
-        # Open SQL session by default
-        if not lazy_init:
-            self.open_session()
+        # Reset old value in case it was set to different type before
+        if type(row.column_str) is str and row.column_str != column_str and row.value is not None:
+            row.value = None
+
+        # Set row type and value
+        row.column_str = column_str
+        row.value = value
+
+        # Commit changes (right away if not in create mode)
+        if not self.analysis.is_create_mode:
+            self.analysis.session.commit()
+
+    def _write_hdf5(self, key: str, value: Any, data_path) -> str:
+
+        # If not data_path is provided, generate it
+        if data_path is None:
+            if isinstance(value, np.ndarray):
+                data_path = f'hdf5:{self.path}/data.hdf5:{key}'
+            else:
+                data_path = f'pkl:{self.path}/{key.replace("/", "_")}'
+
+        # Decode data path
+        file_type, *file_info = data_path.split(':')
+        if file_type == 'hdf5':
+            path, key = file_info
+        else:
+            path, = file_info
+
+        # Write data to file
+        if file_type == 'hdf5':
+            pending = True
+            start = time.perf_counter()
+            while pending:
+                try:
+                    with h5py.File(os.path.join(self.analysis.analysis_path, path), 'a') as f:
+                        if key not in f:
+                            f.create_dataset(key, data=value)
+                        else:
+                            if value.shape != f[key].shape:
+                                del f[key]
+                                f.create_dataset(key, data=value)
+                            else:
+                                f[key][:] = value
+
+                except Exception as _exc:
+                    if (time.perf_counter() - start) > self.analysis.write_timeout:
+                        import traceback
+                        raise TimeoutError(f'Failed to write attribute {key} to {key} '
+                                           f'// Traceback: {traceback.format_exc()}')
+                    else:
+                        time.sleep(10 ** -6)
+                else:
+                    pending = False
+
+        # TODO: alternative to pickle dumps? Writing arbitrary raw binary data to HDF5 seems difficult
+        # Dump all other types as binary strings
+        else:
+            with open(os.path.join(self.analysis.analysis_path, path), 'wb') as f:
+                pickle.dump(value, f)
+
+        return data_path
+
+    def _write_asdf(self, key: str, value: Any, row: AttributeTable = None):
+        pass
+
+    @property
+    def scalar_attributes(self):
+        # Get all
+        query = (self.analysis.session.query(self.attr_table)
+                 .filter(self.attr_table.entity_pk == self.row.pk)
+                 .filter(self.attr_table.column_str != 'value_path'))
+
+        # Update
+        return {row.name:  row.value for row in query.all()}
+
+    @property
+    def attributes(self):
+        # Get all
+        query = (self.analysis.session.query(self.attr_table).filter(self.attr_table.entity_pk == self.row.pk))
+
+        # Update
+        attributes = {}
+        for row in query.all():
+            if row.column_str == 'value_path':
+                attributes[row.name] = self[row.name]
+            else:
+                attributes[row.name] = row.value
+
+        return attributes
+
+    def update(self, data: Dict[str, Any]):
+        """Implement update method for usage like in dict.update"""
+        for key, value in data.items():
+            self[key] = value
+
+    @property
+    @abstractmethod
+    def parent(self):
+        pass
+
+    @property
+    @abstractmethod
+    def path(self) -> str:
+        pass
+
+    @property
+    def row(self):
+        return self._row
+
+    @property
+    def analysis(self) -> Analysis:
+        return self._analysis
+
+    def _create_file(self):
+        entity_path = f'{self.analysis.analysis_path}/{self.path}'
+
+        # Create directoty of necessary
+        if not os.path.exists(entity_path):
+            os.makedirs(entity_path)
+
+        # Create data file
+        path = f'{entity_path}/data.hdf5'
+        with h5py.File(path, 'w') as _:
+            pass
+
+
+class Animal(Entity):
+    attr_table = AnimalAttributeTable
+
+    def __init__(self, *args, **kwargs):
+        Entity.__init__(self, *args, **kwargs)
 
     def __repr__(self):
-        return f"Analysis('{self.analysis_path}')"
+        return f"Animal(id='{self.id}')"
+
+    @staticmethod
+    def create(animal_id: str, analysis: Analysis):
+        # Add row
+        row = AnimalTable(id=animal_id)
+        analysis.session.add(row)
+        analysis.session.commit()
+
+        # Add entity
+        entity = Animal(row=row, analysis=analysis)
+        entity._create_file()
+        return entity
 
     @property
-    def analysis_path(self):
-        return self._analysis_path
+    def parent(self):
+        return None
 
     @property
-    def bulk_format(self):
-        return self.config['bulk_format']
+    def path(self) -> str:
+        return f'animals/{self.id}'
 
-    def open_session(self):
+    @property
+    def id(self) -> str:
+        return self._row.id
 
-        # Create engine
-        engine = create_engine(f'sqlite:///{self.analysis_path}/metadata.db', echo=self.echo)
-        sql.SQLBase.metadata.create_all(engine)
-
-        # Create a session
-        self.session = Session(engine)
-
-    def close_session(self):
-        self.session.close()
-
-        # Session attribute *needs* to be deleted, to prevent serialization error
-        #  during multiprocess' pickling, because it contains weakrefs
-        del self.session
-
-    def add_animal(self, animal_id: str) -> Animal:
-        return Animal.create(analysis=self, animal_id=animal_id)
-
-    def animals(self, *args, **kwargs) -> EntityCollection:
-        return Animal.filter(self, *args, **kwargs)
+    def add_recording(self, *args, **kwargs) -> Recording:
+        return Recording.create(*args, animal=self, analysis=self.analysis, **kwargs)
 
     def recordings(self, *args, **kwargs) -> EntityCollection:
-        return Recording.filter(self, *args, **kwargs)
+        return Recording.filter(self.analysis, animal_id=self.id, *args, **kwargs)
 
     def rois(self, *args, **kwargs) -> EntityCollection:
-        return Roi.filter(self, *args, **kwargs)
+        return Roi.filter(self.analysis, animal_id=self.id, *args, **kwargs)
 
     def phases(self, *args, **kwargs) -> EntityCollection:
-        return Phase.filter(self, *args, **kwargs)
+        return Phase.filter(self.analysis, animal_id=self.id, *args, **kwargs)
 
-    def export(self, path: str):
-        # TODO: add some data export and stuff
-        with h5py.File(path, 'w') as f:
-            for animal in self.animals():
-                animal.export_to(f)
+    @classmethod
+    def filter(cls,
+               analysis: Analysis,
+               *attr_filters,
+               animal_id: str = None) -> EntityCollection:
+        query = _filter(analysis,
+                        AnimalTable,
+                        [],
+                        AnimalAttributeTable,
+                        *attr_filters,
+                        animal_id=animal_id)
 
-    def get_temp_path(self, path: str):
-        temp_path = os.path.join(self.analysis_path, 'temp', path)
-        if not os.path.exists(temp_path):
-            # Avoid error if concurrent process already created it in meantime
-            os.makedirs(temp_path, exist_ok=True)
+        return EntityCollection(analysis=analysis, entity_type=cls, query=query)
 
-        return temp_path
+
+class Recording(Entity):
+    attr_table = RecordingAttributeTable
+
+    def __init__(self, *args, **kwargs):
+        Entity.__init__(self, *args, **kwargs)
+        self.parents.append(self.row.parent)
+
+    def __repr__(self):
+        return f"Recording(id={self.id}, " \
+               f"rec_date='{self.rec_date}', " \
+               f"animal_id='{self.animal_id}')"
+
+    @staticmethod
+    def create(animal: Animal, rec_date: date, rec_id: str, analysis: Analysis):
+        # Add row
+        row = RecordingTable(parent_pk=animal.row.pk, date=utils.parse_date(rec_date), id=rec_id)
+        analysis.session.add(row)
+        analysis.session.commit()
+
+        # Add entity
+        entity = Recording(row=row, analysis=analysis)
+        entity._create_file()
+
+        return entity
+
+    def add_roi(self, *args, **kwargs) -> Roi:
+        return Roi.create(*args, recording=self, analysis=self.analysis, **kwargs)
+
+    def add_phase(self, *args, **kwargs) -> Phase:
+        return Phase.create(*args, recording=self, analysis=self.analysis, **kwargs)
+
+    def rois(self, *args, **kwargs) -> EntityCollection:
+        return Roi.filter(self.analysis, animal_id=self.animal_id, rec_id=self.id, rec_date=self.rec_date, *args,
+                          **kwargs)
+
+    def phases(self, *args, **kwargs) -> EntityCollection:
+        return Phase.filter(self.analysis, animal_id=self.animal_id, rec_id=self.id, rec_date=self.rec_date, *args,
+                            **kwargs)
+
+    @property
+    def parent(self):
+        return self.animal
+
+    @property
+    def path(self) -> str:
+        return f'{self.parent.path}/recordings/{self.rec_date}_{self.id}'
+
+    @property
+    def id(self) -> str:
+        return self._row.id
+
+    @property
+    def rec_date(self) -> date:
+        return self._row.date
+
+    @property
+    def animal_id(self) -> str:
+        return self._row.parent.id
+
+    @property
+    def animal(self) -> Animal:
+        return Animal(analysis=self.analysis, row=self._row.parent)
+
+    @classmethod
+    def filter(cls,
+               analysis: Analysis,
+               *attr_filters,
+               animal_id: str = None,
+               rec_date: Union[str, date, datetime] = None,
+               rec_id: str = None) -> EntityCollection:
+        query = _filter(analysis,
+                        RecordingTable,
+                        [AnimalTable],
+                        RecordingAttributeTable,
+                        *attr_filters,
+                        animal_id=animal_id,
+                        rec_date=rec_date,
+                        rec_id=rec_id)
+
+        return EntityCollection(analysis=analysis, entity_type=cls, query=query)
+
+
+class Phase(Entity):
+    attr_table = PhaseAttributeTable
+
+    def __init__(self, *args, **kwargs):
+        Entity.__init__(self, *args, **kwargs)
+
+        self.parents.append(self.row.parent)
+        self.parents.append(self.row.parent.parent)
+
+        self.analysis.session.flush()
+
+    def __repr__(self):
+        return f"Phase(id={self.id}, " \
+               f"rec_date='{self.rec_date}', " \
+               f"rec_id='{self.rec_id}', " \
+               f"animal_id='{self.animal_id}')"
+
+    @staticmethod
+    def create(recording: Recording, phase_id: int, analysis: Analysis):
+        # Add row
+        row = PhaseTable(parent_pk=recording.row.pk, id=phase_id)
+        analysis.session.add(row)
+        # Immediately commit if not in create mode
+        if not analysis.is_create_mode:
+            analysis.session.commit()
+
+        # Add entity
+        entity = Phase(row=row, analysis=analysis)
+        entity._create_file()
+
+        return entity
+
+    @property
+    def parent(self):
+        return self.recording
+
+    @property
+    def path(self) -> str:
+        return f'{self.parent.path}/phases/{self.id}'
+
+    @property
+    def id(self) -> int:
+        return self._row.id
+
+    @property
+    def animal_id(self) -> str:
+        return self.parent.parent.id
+
+    @property
+    def rec_date(self) -> date:
+        return self.recording.rec_date
+
+    @property
+    def rec_id(self) -> str:
+        return self.recording.id
+
+    @property
+    def animal(self) -> Animal:
+        return Animal(analysis=self.analysis, row=self.row.parent.parent)
+
+    @property
+    def recording(self) -> Recording:
+        return Recording(analysis=self.analysis, row=self.row.parent)
+
+    @classmethod
+    def filter(cls,
+               analysis: Analysis,
+               *attr_filters,
+               animal_id: str = None,
+               rec_date: Union[str, date, datetime] = None,
+               rec_id: str = None,
+               phase_id: int = None, ) -> EntityCollection:
+        query = _filter(analysis,
+                        PhaseTable,
+                        [RecordingTable, AnimalTable],
+                        PhaseAttributeTable,
+                        *attr_filters,
+                        animal_id=animal_id,
+                        rec_date=rec_date,
+                        rec_id=rec_id,
+                        phase_id=phase_id)
+
+        return EntityCollection(analysis=analysis, entity_type=cls, query=query)
+
+    def export_to(self, f: h5py.File):
+
+        with h5py.File(f'{self.analysis.analysis_path}/{self.path}/data.hdf5', 'r') as f2:
+            f2.copy(source='/', dest=f, name=self.path)
+
+        try:
+            f[self.path].attrs.update(self.scalar_attributes)
+        except:
+            for k, v in self.scalar_attributes.items():
+                try:
+                    f[self.path].attrs[k] = v
+                except:
+                    print(f'Failed to export scalar attribute {k} in {self} (type: {type(v)})')
+
+
+class Roi(Entity):
+    attr_table = RoiAttributeTable
+
+    def __init__(self, *args, **kwargs):
+        Entity.__init__(self, *args, **kwargs)
+
+        self.parents.append(self.row.parent)
+        self.parents.append(self.row.parent.parent)
+
+        self.analysis.session.flush()
+
+    def __repr__(self):
+        return f"Roi(id={self.id}, " \
+               f"rec_date='{self.rec_date}', " \
+               f"rec_id='{self.rec_id}', " \
+               f"animal_id='{self.animal_id}')"
+
+    @staticmethod
+    def create(recording: Recording, roi_id: int, analysis: Analysis):
+        # Add row
+        row = RoiTable(parent_pk=recording.row.pk, id=roi_id)
+        analysis.session.add(row)
+        # Immediately commit if not in create mode
+        if not analysis.is_create_mode:
+            analysis.session.commit()
+
+        # Add entity
+        entity = Roi(row=row, analysis=analysis)
+        entity._create_file()
+
+        return entity
+
+    @property
+    def path(self) -> str:
+        return f'{self.parent.path}/rois/{self.id}'
+
+    @property
+    def parent(self):
+        return self.recording
+
+    @property
+    def id(self) -> int:
+        return self._row.id
+
+    @property
+    def animal_id(self) -> str:
+        return self.animal.id
+
+    @property
+    def rec_date(self) -> date:
+        return self.recording.rec_date
+
+    @property
+    def rec_id(self) -> str:
+        return self.recording.id
+
+    @property
+    def animal(self) -> Animal:
+        return Animal(analysis=self.analysis, row=self.row.parent.parent)
+
+    @property
+    def recording(self) -> Recording:
+        return Recording(analysis=self.analysis, row=self.row.parent)
+
+    @classmethod
+    def filter(cls,
+               analysis: Analysis,
+               *attr_filters,
+               animal_id: str = None,
+               rec_date: Union[str, date, datetime] = None,
+               rec_id: str = None,
+               roi_id: int = None, ) -> EntityCollection:
+        query = _filter(analysis,
+                        RoiTable,
+                        [RecordingTable, AnimalTable],
+                        RoiAttributeTable,
+                        *attr_filters,
+                        animal_id=animal_id,
+                        rec_date=rec_date,
+                        rec_id=rec_id,
+                        roi_id=roi_id)
+
+        return EntityCollection(analysis=analysis, entity_type=cls, query=query)
+
+    def export_to(self, f: h5py.File):
+
+        with h5py.File(f'{self.analysis.analysis_path}/{self.path}/data.hdf5', 'r') as f2:
+            f2.copy(source='/', dest=f, name=self.path)
+
+        try:
+            f[self.path].attrs.update(self.scalar_attributes)
+        except:
+            for k, v in self.scalar_attributes.items():
+                try:
+                    f[self.path].attrs[k] = v
+                except:
+                    print(f'Failed to export scalar attribute {k} in {self} (type: {type(v)})')
+                
+
+def _filter(analysis: Analysis,
+            base_table: Type[AnimalTable, RecordingTable, RoiTable, PhaseTable],
+            joined_tables: List[Type[AnimalTable, RecordingTable, RoiTable, PhaseTable]],
+            attribute_table: Type[AnimalAttributeTable, RecordingAttributeTable, RoiAttributeTable, PhaseAttributeTable],
+            *attribute_filters: Tuple[(str, str, Any)],
+            animal_id: str = None,
+            rec_date: Union[str, date, datetime] = None,
+            rec_id: str = None,
+            roi_id: int = None,
+            phase_id: int = None) -> Query:
+
+    # Possible solution for future:
+    """
+    Apply multiple attribute filters:
+    SELECT * FROM rois
+        LEFT JOIN roi_attributes as attr ON rois.pk = attr.entity_pk
+        GROUP BY rois.pk
+        HAVING  SUM(CASE WHEN attr.name == 's2p/npix' AND attr.value_int < 50 THEN 1 ELSE 0 END) > 0 AND
+                SUM(CASE WHEN attr.name == 's2p/radius' AND attr.value_float > 5.0 THEN 1 ELSE 0 END) > 0
+    """
+
+    # Convert date
+    rec_date = utils.parse_date(rec_date)
+
+    # Join parent tables
+    query = analysis.session.query(base_table)
+    for t in joined_tables:
+        query = query.join(t)
+
+    # Filter
+    if animal_id is not None:
+        query = query.filter(AnimalTable.id == animal_id)
+    if rec_date is not None:
+        query = query.filter(RecordingTable.date == rec_date)
+    if rec_id is not None:
+        query = query.filter(RecordingTable.id == rec_id)
+    if roi_id is not None:
+        query = query.filter(RoiTable.id == roi_id)
+    if phase_id is not None:
+        query = query.filter(PhaseTable.id == phase_id)
+
+    # Apply attribute filters
+    _attr_filters = []
+    if len(attribute_filters) > 0:
+
+        for name, comp, value in attribute_filters:
+
+            alias = aliased(attribute_table)
+            query = query.join(alias)
+
+            attr_value_field = None
+            # Booleans need to be checked first, because they isinstance(True/False, int) evaluates to True
+            if isinstance(value, bool):
+                attr_value_field = alias.value_bool
+            elif isinstance(value, int):
+                attr_value_field = alias.value_int
+            elif isinstance(value, float):
+                attr_value_field = alias.value_float
+            elif isinstance(value, str):
+                attr_value_field = alias.value_str
+
+            if attr_value_field is None:
+                raise TypeError(f'Invalid type "{type(value)}" to filter for in attributes')
+
+            if comp == 'l':
+                query = query.filter(attr_value_field < value)
+            elif comp == 'le':
+                query = query.filter(attr_value_field <= value)
+            elif comp == 'e':
+                query = query.filter(attr_value_field == value)
+            elif comp == 'ge':
+                query = query.filter(attr_value_field >= value)
+            elif comp == 'g':
+                query = query.filter(attr_value_field > value)
+            else:
+                raise ValueError('Invalid filter format')
+
+            query = query.filter(alias.name == name)
+
+    return query
+
+
+if __name__ == '__main__':
+    pass
 
 
 class EntityCollection:
@@ -149,7 +696,7 @@ class EntityCollection:
     def __len__(self):
         return self.query.count()
 
-    def __iter__(self) -> Union[Animal, Recording, Roi, Phase]:
+    def __iter__(self) -> Entity:
         for row in self.query.all():
             yield self._get_entity(row)
 
@@ -160,8 +707,9 @@ class EntityCollection:
                 raise KeyError(f'Invalid key {item} with indices {indices}')
             # Return slice
             return [self._get_entity(row) for row in self.query.offset(indices[0]).limit(indices[1])]
-        if isinstance(item, int):
+        if isinstance(item, (int, np.integer)):
             return self._get_entity(self.query.offset(item).limit(1)[0])
+        print(type(item))
         raise KeyError(f'Invalid key {item}')
 
     @property
@@ -180,7 +728,13 @@ class EntityCollection:
     def dataframe(self):
         return pd.DataFrame([entity.scalar_attributes for entity in self])
 
-    def _get_entity(self, row: Union[sql.Animal, sql.Recording, sql.Roi, sql.Phase]) -> Entity:
+    @property
+    def extended_dataframe(self):
+        df = self.dataframe
+        ext_df = pd.DataFrame([entity.parent.extended_dataframe for entity in self])
+        return pd.DataFrame([entity.df for entity in self])
+
+    def _get_entity(self, row: EntityTable) -> Entity:
         return self._entity_type(row=row, analysis=self.analysis)
 
     def sortby(self, name: str, order: str = 'ASC'):
@@ -250,9 +804,9 @@ class EntityCollection:
                                  f'/{timedelta(seconds=int(time_elapsed + time_rest))} '
                                  f'-> {timedelta(seconds=int(time_rest))} remaining ')
 
-                # Truncate
-                if len(execution_times) > 1000:
-                    execution_times = execution_times[len(execution_times) - 1000:]
+                # # Truncate
+                # if len(execution_times) > 1000:
+                #     execution_times = execution_times[len(execution_times) - 1000:]
         formatted_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
         print(f'\nFinish processing at {formatted_time}')
 
@@ -285,707 +839,3 @@ class EntityCollection:
         elapsed_time = time.perf_counter() - start_time
 
         return elapsed_time
-
-
-# class ReferencedDataFrame(pd.DataFrame):
-#
-#     def _set_item(self, key, value) -> None:
-#         pass
-#
-#     def _set_value(self, index: IndexLabel, col, value: Scalar, takeable: bool = False) -> None:
-#         row = self[index]
-
-
-class Entity:
-    _analysis: Analysis
-    attribute_table: Union[Type[sql.AnimalAttribute], Type[sql.RecordingAttribute], Type[sql.RoiAttribute]]
-    _collection: EntityCollection
-
-    def __init__(self, row: Union[sql.Animal, sql.Recording, sql.Roi, sql.Phase],
-                 analysis: Analysis, collection: EntityCollection = None):
-        self._analysis = analysis
-        self._row: Union[sql.Animal, sql.Recording, sql.Roi] = row
-        self._collection = collection
-
-    def __getitem__(self, item: str):
-
-        query = (self.analysis.session.query(self.attribute_table)
-                 .filter(self.attribute_table.name == item)
-                 .filter(self.attribute_table.entity_pk == self.row.pk))
-
-        if query.count() == 0:
-            raise KeyError(f'Attribute {item} not found for entity {self}')
-
-        # Fetch first (only row)
-        attr_row = query.first()
-
-        column_str = attr_row.column_str
-        value = attr_row.value
-
-        # Anything that isn't a referenced path gets returned immediately
-        if column_str != 'value_path':
-            return value
-
-        # Load and return referenced dataset
-        file_type, *file_info = value.split(':')
-
-        if file_type == 'hdf5':
-            file_path, key = file_info
-            with h5py.File(os.path.join(self.analysis.analysis_path, file_path), 'r') as f:
-                return f[key][:]
-
-        elif file_type == 'pkl':
-            file_path, = file_info
-            with open(os.path.join(self.analysis.analysis_path, file_path), 'rb') as f2:
-                return pickle.load(f2)
-
-        raise KeyError(f'No attribute with name {item} in {self}')
-
-    def __setitem__(self, key: str, value: Any):
-
-        # Find corresponding builtin python scalar type for numpy scalars and shape () arrays
-        if isinstance(value, np.generic) or (isinstance(value, np.ndarray) and np.squeeze(value).shape == ()):
-            # Convert to the corresponding Python built-in type using the item() method
-            value = value.item()
-
-        row = None
-        # Query attribute row if not in create mode
-        if not self.analysis.mode == Mode.create:
-            # Build query
-            query = (self.analysis.session.query(self.attribute_table)
-                     .filter(self.attribute_table.entity_pk == self.row.pk)
-                     .filter(self.attribute_table.name == key))
-
-            # Evaluate
-            if query.count() == 1:
-                row = query.one()
-            elif query.count() > 1:
-                raise ValueError('Wait a minute...')
-
-        # Create row if it doesn't exist yet
-        if row is None:
-            row = self.attribute_table(entity_pk=self.row.pk, name=key)
-            self.analysis.session.add(row)
-
-        # Set scalars
-        if type(value) in (str, float, int, bool, date, datetime):
-
-            # Set value type
-            value_type_map = {str: 'str', float: 'float', int: 'int',
-                              bool: 'bool', date: 'date', datetime: 'datetime'}
-            column_str = f'value_{value_type_map.get(type(value))}'
-
-        # Set small objects
-        elif value.__sizeof__() < self.analysis.max_blob_size:
-
-            # Set value type
-            column_str = 'value_blob'
-
-        # Set large objects
-        else:
-
-            # Set value type
-            column_str = 'value_path'
-
-            # Write any non-scalar data that is too large according to specified bulk storage format
-            value = getattr(self, f'_write_{self.analysis.bulk_format}')(key, value, row.value)
-
-        # Reset old value in case it was set to different type before
-        if type(row.column_str) is str and row.column_str != column_str and row.value is not None:
-            row.value = None
-
-        # Set row type and value
-        row.column_str = column_str
-        row.value = value
-
-        # Commit changes (right away if not in create mode)
-        if self.analysis.mode != Mode.create:
-            self.analysis.session.commit()
-
-    def _write_hdf5(self, key: str, value: Any, data_path) -> str:
-
-        # If not data_path is provided, generate it
-        if data_path is None:
-            if isinstance(value, np.ndarray):
-                data_path = f'hdf5:{self.path}/data.hdf5:{key}'
-            else:
-                data_path = f'pkl:{self.path}/{key.replace("/", "_")}'
-
-        # Decode data path
-        file_type, *file_info = data_path.split(':')
-        if file_type == 'hdf5':
-            path, key = file_info
-        else:
-            path, = file_info
-
-        # Write data to file
-        if file_type == 'hdf5':
-            pending = True
-            start = time.perf_counter()
-            while pending:
-                try:
-                    with h5py.File(os.path.join(self.analysis.analysis_path, path), 'a') as f:
-                        if key not in f:
-                            f.create_dataset(key, data=value)
-                        else:
-                            if value.shape != f[key].shape:
-                                del f[key]
-                                f.create_dataset(key, data=value)
-                            else:
-                                f[key][:] = value
-
-                except Exception as _exc:
-                    if (time.perf_counter() - start) > self.analysis.write_timeout:
-                        import traceback
-                        raise TimeoutError(f'Failed to write attribute {key} to {key} '
-                                           f'// Traceback: {traceback.format_exc()}')
-                    else:
-                        time.sleep(10 ** -6)
-                else:
-                    pending = False
-
-        # TODO: alternative to pickle dumps? Writing arbitrary raw binary data to HDF5 seems difficult
-        # Dump all other types as binary strings
-        else:
-            with open(os.path.join(self.analysis.analysis_path, path), 'wb') as f:
-                pickle.dump(value, f)
-
-        return data_path
-
-    def _write_asdf(self, key: str, value: Any, row: sql.Attribute = None):
-        pass
-
-    @property
-    def scalar_attributes(self):
-        # Get all
-        query = (self.analysis.session.query(self.attribute_table)
-                 .filter(self.attribute_table.entity_pk == self.row.pk)
-                 .filter(self.attribute_table.column_str != 'value_path'))
-
-        # Update
-        return {row.name:  row.value for row in query.all()}
-
-    @property
-    def attributes(self):
-        # Get all
-        query = (self.analysis.session.query(self.attribute_table)
-                 .filter(self.attribute_table.entity_pk == self.row.pk))
-
-        # Update
-        attributes = {}
-        for row in query.all():
-            if row.column_str == 'value_path':
-                attributes[row.name] = self[row.name]
-            else:
-                attributes[row.name] = row.value
-
-        return attributes
-
-    def update(self, data: Dict[str, Any]):
-        """Implement update method for usage like in dict.update"""
-        for key, value in data.items():
-            self[key] = value
-
-    @property
-    @abstractmethod
-    def path(self) -> str:
-        pass
-
-    @property
-    def row(self) -> sql.Animal:
-        return self._row
-
-    @property
-    def analysis(self) -> Analysis:
-        return self._analysis
-
-    def _create_file(self):
-        entity_path = f'{self.analysis.analysis_path}/{self.path}'
-
-        # Create directoty of necessary
-        if not os.path.exists(entity_path):
-            os.makedirs(entity_path)
-
-        # Create data file
-        path = f'{entity_path}/data.hdf5'
-        with h5py.File(path, 'w') as _:
-            pass
-
-    # def export(self, path: str):
-    #     with h5py.File(path, 'a') as f:
-    #         self.export_to(f.require_group(self.path))
-    #
-    #         for entity in self._parents:
-    #             entity.export_to(f.require_group(entity.path))
-    #
-    @abstractmethod
-    def export_to(self, grp: h5py.Group):
-        pass
-
-
-class Animal(Entity):
-    attribute_table = sql.AnimalAttribute
-
-    def __init__(self, *args, **kwargs):
-        Entity.__init__(self, *args, **kwargs)
-
-    def __repr__(self):
-        return f"Animal(id='{self.id}')"
-
-    @staticmethod
-    def create(animal_id: str, analysis: Analysis):
-        # Add row
-        row = sql.Animal(id=animal_id)
-        analysis.session.add(row)
-        analysis.session.commit()
-
-        # Add entity
-        entity = Animal(row=row, analysis=analysis)
-        entity._create_file()
-        return entity
-
-    @property
-    def path(self) -> str:
-        return f'animals/{self.id}'
-
-    @property
-    def id(self) -> str:
-        return self._row.id
-
-    def add_recording(self, *args, **kwargs) -> Recording:
-        return Recording.create(*args, animal=self, analysis=self.analysis, **kwargs)
-
-    def recordings(self, *args, **kwargs) -> EntityCollection:
-        return Recording.filter(self.analysis, animal_id=self.id, *args, **kwargs)
-
-    def rois(self, *args, **kwargs) -> EntityCollection:
-        return Roi.filter(self.analysis, animal_id=self.id, *args, **kwargs)
-
-    def phases(self, *args, **kwargs) -> EntityCollection:
-        return Phase.filter(self.analysis, animal_id=self.id, *args, **kwargs)
-
-    @classmethod
-    def filter(cls,
-               analysis: Analysis,
-               *attr_filters,
-               animal_id: str = None) -> EntityCollection:
-        query = _filter(analysis,
-                        sql.Animal,
-                        [],
-                        sql.AnimalAttribute,
-                        *attr_filters,
-                        animal_id=animal_id)
-
-        return EntityCollection(analysis=analysis, entity_type=cls, query=query)
-
-    def export_to(self, f: h5py.File):
-
-        with h5py.File(f'{self.analysis.analysis_path}/{self.path}/data.hdf5', 'r') as f2:
-            f2.copy(source='/', dest=f, name=self.path)
-
-        try:
-            f[self.path].attrs.update(self.scalar_attributes)
-        except:
-            for k, v in self.scalar_attributes.items():
-                try:
-                    f[self.path].attrs[k] = v
-                except:
-                    print(f'Failed to export scalar attribute {k} in {self} (type: {type(v)})')
-
-        for rec in self.recordings():
-            rec.export_to(f)
-
-
-class Recording(Entity):
-    attribute_table = sql.RecordingAttribute
-
-    def __init__(self, *args, **kwargs):
-        Entity.__init__(self, *args, **kwargs)
-        self._animal: sql.Animal = self.row.animal
-
-        # Add parents
-        # self._parents.append(self.animal)
-
-    def __repr__(self):
-        return f"Recording(id={self.id}, " \
-               f"rec_date='{self.rec_date}', " \
-               f"animal_id='{self.animal_id}')"
-
-    @staticmethod
-    def create(animal: Animal, rec_date: date, rec_id: str, analysis: Analysis):
-        # Add row
-        row = sql.Recording(animal_pk=animal.row.pk, date=utils.parse_date(rec_date), id=rec_id)
-        analysis.session.add(row)
-        analysis.session.commit()
-
-        # Add entity
-        entity = Recording(row=row, analysis=analysis)
-        entity._create_file()
-
-        return entity
-
-    def add_roi(self, *args, **kwargs) -> Roi:
-        return Roi.create(*args, recording=self, analysis=self.analysis, **kwargs)
-
-    def add_phase(self, *args, **kwargs) -> Phase:
-        return Phase.create(*args, recording=self, analysis=self.analysis, **kwargs)
-
-    def rois(self, *args, **kwargs) -> EntityCollection:
-        return Roi.filter(self.analysis, animal_id=self.animal_id, rec_id=self.id, rec_date=self.rec_date, *args,
-                          **kwargs)
-
-    def phases(self, *args, **kwargs) -> EntityCollection:
-        return Phase.filter(self.analysis, animal_id=self.animal_id, rec_id=self.id, rec_date=self.rec_date, *args,
-                            **kwargs)
-
-    @property
-    def path(self) -> str:
-        return f'{self.animal.path}/recordings/{self.rec_date}_{self.id}'
-
-    @property
-    def row(self) -> sql.Recording:
-        return self._row
-
-    @property
-    def id(self) -> str:
-        return self._row.id
-
-    @property
-    def rec_date(self) -> date:
-        return self._row.date
-
-    @property
-    def animal_id(self) -> str:
-        return self._animal.id
-
-    @property
-    def animal(self) -> Animal:
-        return Animal(analysis=self.analysis, row=self._animal)
-
-    @classmethod
-    def filter(cls,
-               analysis: Analysis,
-               *attr_filters,
-               animal_id: str = None,
-               rec_date: Union[str, date, datetime] = None,
-               rec_id: str = None) -> EntityCollection:
-        query = _filter(analysis,
-                        sql.Recording,
-                        [sql.Animal],
-                        sql.RecordingAttribute,
-                        *attr_filters,
-                        animal_id=animal_id,
-                        rec_date=rec_date,
-                        rec_id=rec_id)
-
-        return EntityCollection(analysis=analysis, entity_type=cls, query=query)
-
-    def export_to(self, f: h5py.File):
-
-        with h5py.File(f'{self.analysis.analysis_path}/{self.path}/data.hdf5', 'r') as f2:
-            f2.copy(source='/', dest=f, name=self.path)
-
-        try:
-            f[self.path].attrs.update(self.scalar_attributes)
-        except:
-            for k, v in self.scalar_attributes.items():
-                try:
-                    f[self.path].attrs[k] = v
-                except:
-                    print(f'Failed to export scalar attribute {k} in {self} (type: {type(v)})')
-
-        for phase in self.phases():
-            phase.export_to(f)
-
-        for roi in self.rois():
-            roi.export_to(f)
-
-
-class Phase(Entity):
-    attribute_table = sql.PhaseAttribute
-
-    def __init__(self, *args, **kwargs):
-        Entity.__init__(self, *args, **kwargs)
-        self.analysis.session.flush()
-        self._recording: sql.Recording = self.row.recording
-        self._animal: sql.Animal = self._recording.animal
-
-        # Add parents
-        # self._parents.append(self.animal)
-        # self._parents.append(self.recording)
-
-    def __repr__(self):
-        return f"Phase(id={self.id}, " \
-               f"rec_date='{self.rec_date}', " \
-               f"rec_id='{self.rec_id}', " \
-               f"animal_id='{self.animal_id}')"
-
-    @staticmethod
-    def create(recording: Recording, phase_id: int, analysis: Analysis):
-        # Add row
-        row = sql.Phase(recording_pk=recording.row.pk, id=phase_id)
-        analysis.session.add(row)
-        # Immediately commit if not in create mode
-        if analysis.mode != Mode.create:
-            analysis.session.commit()
-
-        # Add entity
-        entity = Phase(row=row, analysis=analysis)
-        entity._create_file()
-
-        return entity
-
-    @property
-    def path(self) -> str:
-        return f'{self.recording.path}/phases/{self.id}'
-
-    @property
-    def id(self) -> int:
-        return self._row.id
-
-    @property
-    def animal_id(self) -> str:
-        return self._animal.id
-
-    @property
-    def rec_date(self) -> date:
-        return self._recording.date
-
-    @property
-    def rec_id(self) -> str:
-        return self._recording.id
-
-    @property
-    def row(self) -> sql.Roi:
-        return self._row
-
-    @property
-    def animal(self) -> Animal:
-        return Animal(analysis=self.analysis, row=self._animal)
-
-    @property
-    def recording(self) -> Recording:
-        return Recording(analysis=self.analysis, row=self._recording)
-
-    @classmethod
-    def filter(cls,
-               analysis: Analysis,
-               *attr_filters,
-               animal_id: str = None,
-               rec_date: Union[str, date, datetime] = None,
-               rec_id: str = None,
-               phase_id: int = None, ) -> EntityCollection:
-        query = _filter(analysis,
-                        sql.Phase,
-                        [sql.Recording, sql.Animal],
-                        sql.PhaseAttribute,
-                        *attr_filters,
-                        animal_id=animal_id,
-                        rec_date=rec_date,
-                        rec_id=rec_id,
-                        phase_id=phase_id)
-
-        return EntityCollection(analysis=analysis, entity_type=cls, query=query)
-
-    def export_to(self, f: h5py.File):
-
-        with h5py.File(f'{self.analysis.analysis_path}/{self.path}/data.hdf5', 'r') as f2:
-            f2.copy(source='/', dest=f, name=self.path)
-
-        try:
-            f[self.path].attrs.update(self.scalar_attributes)
-        except:
-            for k, v in self.scalar_attributes.items():
-                try:
-                    f[self.path].attrs[k] = v
-                except:
-                    print(f'Failed to export scalar attribute {k} in {self} (type: {type(v)})')
-
-
-class Roi(Entity):
-    attribute_table = sql.RoiAttribute
-
-    def __init__(self, *args, **kwargs):
-        Entity.__init__(self, *args, **kwargs)
-        self.analysis.session.flush()
-        self._recording: sql.Recording = self.row.recording
-        self._animal: sql.Animal = self._recording.animal
-
-        # Add parents
-        # self._parents.append(self.animal)
-        # self._parents.append(self.recording)
-
-    def __repr__(self):
-        return f"Roi(id={self.id}, " \
-               f"rec_date='{self.rec_date}', " \
-               f"rec_id='{self.rec_id}', " \
-               f"animal_id='{self.animal_id}')"
-
-    @staticmethod
-    def create(recording: Recording, roi_id: int, analysis: Analysis):
-        # Add row
-        row = sql.Roi(recording_pk=recording.row.pk, id=roi_id)
-        analysis.session.add(row)
-        # Immediately commit if not in create mode
-        if analysis.mode != Mode.create:
-            analysis.session.commit()
-
-        # Add entity
-        entity = Roi(row=row, analysis=analysis)
-        entity._create_file()
-
-        return entity
-
-    @property
-    def path(self) -> str:
-        return f'{self.recording.path}/rois/{self.id}'
-
-    @property
-    def id(self) -> int:
-        return self._row.id
-
-    @property
-    def animal_id(self) -> str:
-        return self._animal.id
-
-    @property
-    def rec_date(self) -> date:
-        return self._recording.date
-
-    @property
-    def rec_id(self) -> str:
-        return self._recording.id
-
-    @property
-    def row(self) -> sql.Roi:
-        return self._row
-
-    @property
-    def animal(self) -> Animal:
-        return Animal(analysis=self.analysis, row=self._animal)
-
-    @property
-    def recording(self) -> Recording:
-        return Recording(analysis=self.analysis, row=self._recording)
-
-    @classmethod
-    def filter(cls,
-               analysis: Analysis,
-               *attr_filters,
-               animal_id: str = None,
-               rec_date: Union[str, date, datetime] = None,
-               rec_id: str = None,
-               roi_id: int = None, ) -> EntityCollection:
-        query = _filter(analysis,
-                        sql.Roi,
-                        [sql.Recording, sql.Animal],
-                        sql.RoiAttribute,
-                        *attr_filters,
-                        animal_id=animal_id,
-                        rec_date=rec_date,
-                        rec_id=rec_id,
-                        roi_id=roi_id)
-
-        return EntityCollection(analysis=analysis, entity_type=cls, query=query)
-
-    def export_to(self, f: h5py.File):
-
-        with h5py.File(f'{self.analysis.analysis_path}/{self.path}/data.hdf5', 'r') as f2:
-            f2.copy(source='/', dest=f, name=self.path)
-
-        try:
-            f[self.path].attrs.update(self.scalar_attributes)
-        except:
-            for k, v in self.scalar_attributes.items():
-                try:
-                    f[self.path].attrs[k] = v
-                except:
-                    print(f'Failed to export scalar attribute {k} in {self} (type: {type(v)})')
-                
-
-def _filter(analysis: Analysis,
-            base_table: Type[sql.Animal, sql.Recording, sql.Roi, sql.Phase],
-            joined_tables: List[Type[sql.Animal, sql.Recording, sql.Roi, sql.Phase]],
-            attribute_table: Type[sql.AnimalAttribute, sql.RecordingAttribute, sql.RoiAttribute, sql.PhaseAttribute],
-            *attribute_filters: Tuple[(str, str, Any)],
-            animal_id: str = None,
-            rec_date: Union[str, date, datetime] = None,
-            rec_id: str = None,
-            roi_id: int = None,
-            phase_id: int = None) -> Query:
-
-    # TODO: currently filtering only works on a single attribute at a time
-    # Possible solution for future:
-    """
-    Apply multiple attribute filters:
-    SELECT * FROM rois
-        LEFT JOIN roi_attributes as attr ON rois.pk = attr.entity_pk
-        GROUP BY rois.pk
-        HAVING  SUM(CASE WHEN attr.name == 's2p/npix' AND attr.value_int < 50 THEN 1 ELSE 0 END) > 0 AND
-                SUM(CASE WHEN attr.name == 's2p/radius' AND attr.value_float > 5.0 THEN 1 ELSE 0 END) > 0
-    """
-
-    # Convert date
-    rec_date = utils.parse_date(rec_date)
-
-    # Join parent tables
-    query = analysis.session.query(base_table)
-    for t in joined_tables:
-        query = query.join(t)
-
-    # Filter
-    if animal_id is not None:
-        query = query.filter(sql.Animal.id == animal_id)
-    if rec_date is not None:
-        query = query.filter(sql.Recording.date == rec_date)
-    if rec_id is not None:
-        query = query.filter(sql.Recording.id == rec_id)
-    if roi_id is not None:
-        query = query.filter(sql.Roi.id == roi_id)
-    if phase_id is not None:
-        query = query.filter(sql.Phase.id == phase_id)
-
-    # Apply attribute filters
-    _attr_filters = []
-    if len(attribute_filters) > 0:
-
-        for name, comp, value in attribute_filters:
-
-            alias = aliased(attribute_table)
-            query = query.join(alias)
-
-            attr_value_field = None
-            # Booleans need to be checked first, because they isinstance(True/False, int) evaluates to True
-            if isinstance(value, bool):
-                attr_value_field = alias.value_bool
-            elif isinstance(value, int):
-                attr_value_field = alias.value_int
-            elif isinstance(value, float):
-                attr_value_field = alias.value_float
-            elif isinstance(value, str):
-                attr_value_field = alias.value_str
-
-            if attr_value_field is None:
-                raise TypeError(f'Invalid type "{type(value)}" to filter for in attributes')
-
-            if comp == 'l':
-                query = query.filter(attr_value_field < value)
-            elif comp == 'le':
-                query = query.filter(attr_value_field <= value)
-            elif comp == 'e':
-                query = query.filter(attr_value_field == value)
-            elif comp == 'ge':
-                query = query.filter(attr_value_field >= value)
-            elif comp == 'g':
-                query = query.filter(attr_value_field > value)
-            else:
-                raise ValueError('Invalid filter format')
-
-            query = query.filter(alias.name == name)
-
-
-    return query
-
-
-if __name__ == '__main__':
-    pass

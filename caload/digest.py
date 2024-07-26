@@ -10,12 +10,12 @@ import tifffile
 import yaml
 from tqdm import tqdm
 
-from caload import base, utils
+import caload
 
 log = logging.getLogger(__name__)
 
 
-def create_analysis(analysis_path: str, data_root: str) -> base.Analysis:
+def create_analysis(analysis_path: str, data_root: str) -> caload.analysis.Analysis:
 
     # Create analysis data folder
     if not os.path.exists(analysis_path):
@@ -23,7 +23,7 @@ def create_analysis(analysis_path: str, data_root: str) -> base.Analysis:
 
     # Create analysis
     print(f'Create analysis at {analysis_path}')
-    analysis = base.Analysis(analysis_path, mode=base.Mode.create)
+    analysis = caload.analysis.Analysis(analysis_path, mode=caload.analysis.Mode.create)
 
     # Scan for data folders
     recording_folders = scan_folder(data_root, [])
@@ -64,7 +64,7 @@ def scan_folder(root_path: str, recording_list: List[str]) -> List[str]:
     return recording_list
 
 
-def create_animal(analysis: base.Analysis, path: str) -> base.Animal:
+def create_animal(analysis: caload.analysis.Analysis, path: str) -> caload.entities.Animal:
 
     # Create animal
     animal_id = _animal_id_from_path(path)
@@ -100,7 +100,7 @@ def create_animal(analysis: base.Analysis, path: str) -> base.Animal:
     return animal
 
 
-def digest_folder(folder_list: List[str], analysis: base.Analysis):
+def digest_folder(folder_list: List[str], analysis: caload.analysis.Analysis):
 
     print(f'Process folders: {folder_list}')
     for recording_path in folder_list:
@@ -126,7 +126,7 @@ def digest_folder(folder_list: List[str], analysis: base.Analysis):
         # Get recording
         # Expected recording folder format "<rec_date('YYYY-mm-dd')>_<rec_id>_*"
         rec_date, rec_id, *_ = _recording_id_from_path(recording_path)
-        rec_date = utils.parse_date(rec_date)
+        rec_date = caload.utils.parse_date(rec_date)
         _recording_list = analysis.recordings(animal_id=animal.id, rec_date=rec_date, rec_id=rec_id)
         # Add recording
         if len(_recording_list) > 0:
@@ -285,7 +285,7 @@ def digest_folder(folder_list: List[str], analysis: base.Analysis):
         analysis.session.commit()
 
 
-def add_metadata(entity: base.Entity, folder_path: str):
+def add_metadata(entity: caload.entities.Entity, folder_path: str):
     """Function searches for and returns metadata on a given folder path
 
     Function scans the `folder_path` for metadata yaml files (ending in `meta.yaml`)
@@ -308,7 +308,7 @@ def add_metadata(entity: base.Entity, folder_path: str):
     unravel_dict(metadata, entity, 'metadata')
 
 
-def unravel_dict(dict_data: dict, entity: base.Entity, path: str):
+def unravel_dict(dict_data: dict, entity: caload.entities.Entity, path: str):
     for key, item in dict_data.items():
         if isinstance(item, dict):
             unravel_dict(item, entity, f'{path}/{key}')
