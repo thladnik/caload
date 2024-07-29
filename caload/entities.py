@@ -17,8 +17,7 @@ import pandas as pd
 from sqlalchemy.orm import Query, aliased
 from tqdm import tqdm
 
-from caload.sqltables import EntityTable, AnimalTable, RecordingTable, RoiTable, PhaseTable, \
-    AttributeTable, AnimalAttributeTable, RecordingAttributeTable, RoiAttributeTable, PhaseAttributeTable
+from caload.sqltables import *
 from caload import utils
 
 if TYPE_CHECKING:
@@ -30,38 +29,61 @@ __all__ = ['EntityCollection', 'Animal', 'Recording', 'Roi', 'Phase']
 class Entity:
     _analysis: Analysis
     _collection: EntityCollection
-    _row:  Union[AnimalTable, RecordingTable, RoiTable, PhaseTable]
+    _row: Union[AnimalTable, RecordingTable, RoiTable, PhaseTable]
+    _attribute_name_pk_map: Dict[str, int] = {}
 
-    attr_table: Union[Type[AnimalAttributeTable, RecordingAttributeTable, RoiAttributeTable, PhaseAttributeTable]]
+    attr_value_table: Union[Type[AnimalValueTable, RecordingValueTable, RoiValueTable, PhaseValueTable]]
     # Keep references to parent table instances,
     # to avoid cold references during multiprocessing,
     # caused by lazy loading
     parents: List[EntityTable]
 
+    # def __new__(cls, *args, **kwargs):
+    #
+    #     row = kwargs.get('row')
+    #     entities = getattr(kwargs.get('analysis'), 'entities')
+    #
+    #     # Check if instance of entity already exists in this analysis
+    #     if cls.unique_identifier(row) in entities:
+    #         return entities[cls.unique_identifier(row)]
+    #
+    #     # If entity does not exist yet, create new one
+    #     new_entity = super(Entity, cls).__new__(cls)
+    #     entities[new_entity.unique_identifier(row)] = new_entity
+    #
+    #     return new_entity
+
     def __init__(self,
                  row,
                  analysis,
-                 collection = None):
+                 collection=None):
         self._analysis = analysis
         self._row = row
         self._collection = collection
 
         self.parents = []
 
+    def __contains__(self, item):
+        value_query = (self.analysis.session.query(self.attr_value_table)
+                       .filter(self.attr_value_table.attribute.name == item)
+                       .filter(self.attr_value_table.entity_pk == self.row.pk))
+        return value_query.count() > 0
+
     def __getitem__(self, item: str):
 
-        query = (self.analysis.session.query(self.attr_table)
-                 .filter(self.attr_table.name == item)
-                 .filter(self.attr_table.entity_pk == self.row.pk))
+        value_query = (self.analysis.session.query(self.attr_value_table)
+                       .join(AttributeTable)
+                       .filter(self.attr_value_table.entity_pk == self.row.pk)
+                       .filter(AttributeTable.name == item))
 
-        if query.count() == 0:
+        if value_query.count() == 0:
             raise KeyError(f'Attribute {item} not found for entity {self}')
 
         # Fetch first (only row)
-        attr_row = query.first()
+        value_row = value_query.first()
 
-        column_str = attr_row.column_str
-        value = attr_row.value
+        column_str = value_row.column_str
+        value = value_row.value
 
         # Anything that isn't a referenced path gets returned immediately
         if column_str != 'value_path':
@@ -89,24 +111,49 @@ class Entity:
             # Convert to the corresponding Python built-in type using the item() method
             value = value.item()
 
-        row = None
+        # Get attribute name entry
+        if key not in self._attribute_name_pk_map:
+            query_name = self.analysis.session.query(AttributeTable).filter(AttributeTable.name == key)
+            if query_name.count() > 0:
+                attribute_row = query_name.first()
+            else:
+                try:
+                    attribute_row = AttributeTable(name=key)
+                    self.analysis.session.add(attribute_row)
+                    self.analysis.session.commit()
+                except Exception as _exc:
+                    # If insert fails, assume it was already added by concurrent process and re-query
+                    self.analysis.session.rollback()
+                    if query_name.count() == 0:
+                        print(f'Failed to add non-existent attribute name {key}, Traceback:')
+                        raise _exc
+                    attribute_row = query_name.first()
+
+            # Add PK to map
+            self._attribute_name_pk_map[key] = attribute_row.pk
+
+        attribute_row_pk = self._attribute_name_pk_map[key]
+
+        value_row = None
         # Query attribute row if not in create mode
         if not self.analysis.is_create_mode:
             # Build query
-            query = (self.analysis.session.query(self.attr_table)
-                     .filter(self.attr_table.entity_pk == self.row.pk)
-                     .filter(self.attr_table.name == key))
+            value_query = (self.analysis.session.query(self.attr_value_table)
+                           .join(AttributeTable)
+                           .filter(self.attr_value_table.entity_pk == self.row.pk)
+                           .filter(AttributeTable.name == key))
 
             # Evaluate
-            if query.count() == 1:
-                row = query.one()
-            elif query.count() > 1:
+            if value_query.count() == 1:
+                value_row = value_query.one()
+            elif value_query.count() > 1:
                 raise ValueError('Wait a minute...')
 
         # Create row if it doesn't exist yet
-        if row is None:
-            row = self.attr_table(entity_pk=self.row.pk, name=key, is_persistent=self.analysis.is_create_mode)
-            self.analysis.session.add(row)
+        if value_row is None:
+            value_row = self.attr_value_table(entity_pk=self.row.pk, attribute_pk=attribute_row_pk,
+                                              is_persistent=self.analysis.is_create_mode)
+            self.analysis.session.add(value_row)
 
         # Set scalars
         if type(value) in (str, float, int, bool, date, datetime):
@@ -129,19 +176,24 @@ class Entity:
             column_str = 'value_path'
 
             # Write any non-scalar data that is too large according to specified bulk storage format
-            value = getattr(self, f'_write_{self.analysis.bulk_format}')(key, value, row.value)
+            value = getattr(self, f'_write_{self.analysis.bulk_format}')(key, value, value_row.value)
 
         # Reset old value in case it was set to different type before
-        if type(row.column_str) is str and row.column_str != column_str and row.value is not None:
-            row.value = None
+        if type(value_row.column_str) is str and value_row.column_str != column_str and value_row.value is not None:
+            value_row.value = None
 
         # Set row type and value
-        row.column_str = column_str
-        row.value = value
+        value_row.column_str = column_str
+        value_row.value = value
 
         # Commit changes (right away if not in create mode)
         if not self.analysis.is_create_mode:
             self.analysis.session.commit()
+
+    @classmethod
+    @abstractmethod
+    def unique_identifier(cls, row: Union[AnimalTable, RecordingTable, RoiTable, PhaseTable]) -> tuple:
+        pass
 
     def _write_hdf5(self, key: str, value: Any, data_path) -> str:
 
@@ -193,31 +245,32 @@ class Entity:
 
         return data_path
 
-    def _write_asdf(self, key: str, value: Any, row: AttributeTable = None):
+    def _write_asdf(self, key: str, value: Any, row: AttributeValueTable = None):
         pass
 
     @property
     def scalar_attributes(self):
         # Get all
-        query = (self.analysis.session.query(self.attr_table)
-                 .filter(self.attr_table.entity_pk == self.row.pk)
-                 .filter(self.attr_table.column_str != 'value_path'))
+        query = (self.analysis.session.query(self.attr_value_table)
+                 .filter(self.attr_value_table.entity_pk == self.row.pk)
+                 .filter(self.attr_value_table.column_str != 'value_path'))
 
         # Update
-        return {row.name:  row.value for row in query.all()}
+        return {value_row.attribute.name: value_row.value for value_row in query.all()}
 
     @property
     def attributes(self):
         # Get all
-        query = (self.analysis.session.query(self.attr_table).filter(self.attr_table.entity_pk == self.row.pk))
+        query = (
+            self.analysis.session.query(self.attr_value_table).filter(self.attr_value_table.entity_pk == self.row.pk))
 
         # Update
         attributes = {}
-        for row in query.all():
-            if row.column_str == 'value_path':
-                attributes[row.name] = self[row.name]
+        for value_row in query.all():
+            if value_row.column_str == 'value_path':
+                attributes[value_row.attribute.name] = self[value_row.attribute.name]
             else:
-                attributes[row.name] = row.value
+                attributes[value_row.attribute.name] = value_row.value
 
         return attributes
 
@@ -258,13 +311,17 @@ class Entity:
 
 
 class Animal(Entity):
-    attr_table = AnimalAttributeTable
+    attr_value_table = AnimalValueTable
 
     def __init__(self, *args, **kwargs):
         Entity.__init__(self, *args, **kwargs)
 
     def __repr__(self):
         return f"Animal(id='{self.id}')"
+
+    @classmethod
+    def unique_identifier(cls, row: AnimalTable) -> tuple:
+        return Animal.__name__, row.id
 
     @staticmethod
     def create(animal_id: str, analysis: Analysis):
@@ -310,7 +367,7 @@ class Animal(Entity):
         query = _filter(analysis,
                         AnimalTable,
                         [],
-                        AnimalAttributeTable,
+                        AnimalValueTable,
                         *attr_filters,
                         animal_id=animal_id)
 
@@ -318,7 +375,7 @@ class Animal(Entity):
 
 
 class Recording(Entity):
-    attr_table = RecordingAttributeTable
+    attr_value_table = RecordingValueTable
 
     def __init__(self, *args, **kwargs):
         Entity.__init__(self, *args, **kwargs)
@@ -329,10 +386,14 @@ class Recording(Entity):
                f"rec_date='{self.rec_date}', " \
                f"animal_id='{self.animal_id}')"
 
+    @classmethod
+    def unique_identifier(cls, row: RecordingTable) -> tuple:
+        return Recording.__name__, row.parent.id, row.date, row.id
+
     @staticmethod
     def create(animal: Animal, rec_date: date, rec_id: str, analysis: Analysis):
         # Add row
-        row = RecordingTable(parent_pk=animal.row.pk, date=utils.parse_date(rec_date), id=rec_id)
+        row = RecordingTable(parent=animal.row, date=utils.parse_date(rec_date), id=rec_id)
         analysis.session.add(row)
         analysis.session.commit()
 
@@ -390,7 +451,7 @@ class Recording(Entity):
         query = _filter(analysis,
                         RecordingTable,
                         [AnimalTable],
-                        RecordingAttributeTable,
+                        RecordingValueTable,
                         *attr_filters,
                         animal_id=animal_id,
                         rec_date=rec_date,
@@ -400,7 +461,7 @@ class Recording(Entity):
 
 
 class Phase(Entity):
-    attr_table = PhaseAttributeTable
+    attr_value_table = PhaseValueTable
 
     def __init__(self, *args, **kwargs):
         Entity.__init__(self, *args, **kwargs)
@@ -416,10 +477,14 @@ class Phase(Entity):
                f"rec_id='{self.rec_id}', " \
                f"animal_id='{self.animal_id}')"
 
+    @classmethod
+    def unique_identifier(cls, row: PhaseTable) -> tuple:
+        return Phase.__name__, row.parent.parent.id, row.parent.id, row.parent.date, row.id
+
     @staticmethod
     def create(recording: Recording, phase_id: int, analysis: Analysis):
         # Add row
-        row = PhaseTable(parent_pk=recording.row.pk, id=phase_id)
+        row = PhaseTable(parent=recording.row, id=phase_id)
         analysis.session.add(row)
         # Immediately commit if not in create mode
         if not analysis.is_create_mode:
@@ -474,7 +539,7 @@ class Phase(Entity):
         query = _filter(analysis,
                         PhaseTable,
                         [RecordingTable, AnimalTable],
-                        PhaseAttributeTable,
+                        PhaseValueTable,
                         *attr_filters,
                         animal_id=animal_id,
                         rec_date=rec_date,
@@ -499,7 +564,7 @@ class Phase(Entity):
 
 
 class Roi(Entity):
-    attr_table = RoiAttributeTable
+    attr_value_table = RoiValueTable
 
     def __init__(self, *args, **kwargs):
         Entity.__init__(self, *args, **kwargs)
@@ -515,10 +580,14 @@ class Roi(Entity):
                f"rec_id='{self.rec_id}', " \
                f"animal_id='{self.animal_id}')"
 
+    @classmethod
+    def unique_identifier(cls, row: RoiTable) -> tuple:
+        return Roi.__name__, row.parent.parent.id, row.parent.id, row.parent.date, row.id
+
     @staticmethod
     def create(recording: Recording, roi_id: int, analysis: Analysis):
         # Add row
-        row = RoiTable(parent_pk=recording.row.pk, id=roi_id)
+        row = RoiTable(parent=recording.row, id=roi_id)
         analysis.session.add(row)
         # Immediately commit if not in create mode
         if not analysis.is_create_mode:
@@ -573,7 +642,7 @@ class Roi(Entity):
         query = _filter(analysis,
                         RoiTable,
                         [RecordingTable, AnimalTable],
-                        RoiAttributeTable,
+                        RoiValueTable,
                         *attr_filters,
                         animal_id=animal_id,
                         rec_date=rec_date,
@@ -595,19 +664,75 @@ class Roi(Entity):
                     f[self.path].attrs[k] = v
                 except:
                     print(f'Failed to export scalar attribute {k} in {self} (type: {type(v)})')
-                
+
 
 def _filter(analysis: Analysis,
             base_table: Type[AnimalTable, RecordingTable, RoiTable, PhaseTable],
             joined_tables: List[Type[AnimalTable, RecordingTable, RoiTable, PhaseTable]],
-            attribute_table: Type[AnimalAttributeTable, RecordingAttributeTable, RoiAttributeTable, PhaseAttributeTable],
+            attr_value_table: Type[AnimalValueTable, RecordingValueTable, RoiValueTable, PhaseValueTable],
+            *attribute_filters: List[Tuple[str, str, Any]],
+            **kwargs):
+
+    from sqlalchemy import or_, and_
+    from sqlalchemy.orm import aliased
+
+    _query = analysis.session.query(base_table)
+
+    for filt in attribute_filters:
+        if isinstance(filt, tuple):
+            name, comp, value = filt
+
+            # Create alias
+            _alias = aliased(attr_value_table)
+
+            if comp == 'contains':
+                # Build subquery to filter attribute name
+                subquery = analysis.session.query(AttributeTable).filter(AttributeTable.name == name).subquery()
+                # Build WHERE clause based on attribute name subquery
+                _query = _query.filter(subquery.c.pk == _alias.attribute_pk)
+                continue
+
+            # Determine value type
+            if isinstance(value, (bool, int, float, str, date, datetime)):
+                _aliased_value_field = getattr(_alias, f'value_{str(type(value).__name__)}')
+            else:
+                raise TypeError(f'Invalid type "{type(value)}" to filter for in attributes')
+
+            # Apply value filter
+            if comp == '<':
+                w1 = _aliased_value_field < value
+            elif comp == '<=':
+                w1 = _aliased_value_field <= value
+            elif comp == '==':
+                w1 = _aliased_value_field == value
+            elif comp == '>=':
+                w1 = _aliased_value_field >= value
+            elif comp == '>':
+                w1 = _aliased_value_field > value
+            else:
+                raise ValueError('Invalid filter format')
+
+            # Build subquery to filter attribute name
+            subquery = analysis.session.query(AttributeTable).filter(AttributeTable.name == name).subquery()
+            # Build WHERE clause based on attribute name subquery
+            w = and_(w1, subquery.c.pk == _alias.attribute_pk)
+
+            # Add to main query
+            _query = _query.join(_alias).filter(w)
+
+    return _query
+
+
+def _filter_old(analysis: Analysis,
+            base_table: Type[AnimalTable, RecordingTable, RoiTable, PhaseTable],
+            joined_tables: List[Type[AnimalTable, RecordingTable, RoiTable, PhaseTable]],
+            attr_value_table: Type[AnimalValueTable, RecordingValueTable, RoiValueTable, PhaseValueTable],
             *attribute_filters: Tuple[(str, str, Any)],
             animal_id: str = None,
             rec_date: Union[str, date, datetime] = None,
             rec_id: str = None,
             roi_id: int = None,
             phase_id: int = None) -> Query:
-
     # Possible solution for future:
     """
     Apply multiple attribute filters:
@@ -644,19 +769,29 @@ def _filter(analysis: Analysis,
 
         for name, comp, value in attribute_filters:
 
-            alias = aliased(attribute_table)
-            query = query.join(alias)
+            if query.join(attr_value_table).filter(attr_value_table.attribute.name == name).count() == 0:
+                raise KeyError(f'Unkown filter for {attr_value_table} with name {name}')
+
+            attr_value_alias = aliased(attr_value_table)
+            query = query.join(attr_value_alias)
+
+            # Filter attribute name
+            query = query.filter(attr_value_alias.attribute.name == name)
+
+            # Only check if entity has an attribute of "name"
+            if comp == 'contains':
+                continue
 
             attr_value_field = None
             # Booleans need to be checked first, because they isinstance(True/False, int) evaluates to True
             if isinstance(value, bool):
-                attr_value_field = alias.value_bool
+                attr_value_field = attr_value_alias.value_bool
             elif isinstance(value, int):
-                attr_value_field = alias.value_int
+                attr_value_field = attr_value_alias.value_int
             elif isinstance(value, float):
-                attr_value_field = alias.value_float
+                attr_value_field = attr_value_alias.value_float
             elif isinstance(value, str):
-                attr_value_field = alias.value_str
+                attr_value_field = attr_value_alias.value_str
 
             if attr_value_field is None:
                 raise TypeError(f'Invalid type "{type(value)}" to filter for in attributes')
@@ -673,8 +808,6 @@ def _filter(analysis: Analysis,
                 query = query.filter(attr_value_field > value)
             else:
                 raise ValueError('Invalid filter format')
-
-            query = query.filter(alias.name == name)
 
     return query
 
@@ -714,7 +847,7 @@ class EntityCollection:
             self._batch_results = self.query.offset(self._batch_offset).limit(self._batch_size).all()
 
         # No more results: reset iteration counter and offset and stop iteration
-        if len(self._batch_results) == 0 or self._iteration_count >= self._batch_offset+len(self._batch_results):
+        if len(self._batch_results) == 0 or self._iteration_count >= self._batch_offset + len(self._batch_results):
             self._iteration_count = -1
             self._batch_offset = 0
 
@@ -728,62 +861,62 @@ class EntityCollection:
         # Return single entity
         if isinstance(item, (int, np.integer)):
             if item < 0:
-                item = len(self)+item
+                item = len(self) + item
             return self._get_entity(self.query.offset(item).limit(1)[0])
 
         # Return slice
         if isinstance(item, slice):
             start, stop, step = item.indices(len(self))
-            if abs(step) == 1:
-                # Get data
-                result = [self._get_entity(row) for row in self.query.offset(start).limit(stop-start)]
-            else:
-                # TODO: there should be a way to directly query the n-th row using 'ROW_NUMBER() % n'
-                #  but it's not clear how is would work in SQLAlchemy ORM; figure out later
-                result = [self._get_entity(row) for row in self.query.offset(start).limit(stop-start)][::abs(step)]
+            if step == 0:
+                raise KeyError('Invalid step size 0')
+
+            # Get data
+            result = [self._get_entity(row) for row in self.query.offset(start).limit(stop - start)]
+
+            # TODO: there should be a way to directly query the n-th row using 'ROW_NUMBER() % n'
+            #  but it's not clear how is would work in SQLAlchemy ORM; figure out later
+            # result = [self._get_entity(row) for row in self.query.offset(start).limit(stop-start)][::abs(step)]
 
             # Return in order
-            if step > 0:
-                return result
-            return result[::-1]
+            return result[::step]
 
-        # Return multiple attributes for all entities in collection
-        if isinstance(item, (str, list, tuple)):
-            if isinstance(item, str):
-                item = [item]
-
-            # Select all ROI pk's
-            rows = self.query.all()
-            pks_all = [row.pk for row in rows]
-
-            # Fetch attribute data for all given attributes name
-            results = []
-            attr_table = self._entity_type.attr_table
-            for name in item:
-                attributes = (self.analysis.session.query(attr_table)
-                              .where(attr_table.name == name, attr_table.entity_pk.in_(pks_all))
-                              .order_by(attr_table.entity_pk)
-                              .all())
-                results.append([[row.entity_pk, row.value, row.column_str] for row in attributes])
-
-            # Write output to DataFrame
-            data = []
-            for name, res in zip(item, results):
-                pks, vals, dtypes = [list(t) for t in zip(*res)]
-
-                # Replace value_path string representations with actual attribute data
-                if 'value_path' in dtypes:
-                    for idx, (pk, v, dt) in enumerate(zip(pks, vals, dtypes)):
-                        if dt == 'value_path':
-                            vals[idx] = self._get_entity(rows[pks_all.index(pk)])[name]
-
-                # Add series to list
-                data.append(pd.Series(name=name, index=pks, data=vals))
-
-            # Create DataFrame
-            df = pd.concat(data, axis=1, keys=[s.name for s in data])
-
-            return df
+        # # Return multiple attributes for all entities in collection
+        # if isinstance(item, (str, list, tuple)):
+        #     if isinstance(item, str):
+        #         item = [item]
+        #
+        #     # Select all ROI pk's
+        #     rows = self.query.all()
+        #     pks_all = [row.pk for row in rows]
+        #
+        #     # Fetch attribute data for all given attributes name
+        #     results = []
+        #     attr_table = self._entity_type.attr_table
+        #     for name in item:
+        #         attributes = (self.analysis.session.query(attr_table)
+        #                       .where(attr_table.name == name, attr_table.entity_pk.in_(pks_all))
+        #                       .order_by(attr_table.entity_pk)
+        #                       .all())
+        #         results.append([[row.entity_pk, row.value, row.column_str] for row in attributes])
+        #
+        #     # Write output to DataFrame
+        #     data = []
+        #     for name, res in zip(item, results):
+        #         pks, vals, dtypes = [list(t) for t in zip(*res)]
+        #
+        #         # Replace value_path string representations with actual attribute data
+        #         if 'value_path' in dtypes:
+        #             for idx, (pk, v, dt) in enumerate(zip(pks, vals, dtypes)):
+        #                 if dt == 'value_path':
+        #                     vals[idx] = self._get_entity(rows[pks_all.index(pk)])[name]
+        #
+        #         # Add series to list
+        #         data.append(pd.Series(name=name, index=pks, data=vals))
+        #
+        #     # Create DataFrame
+        #     df = pd.concat(data, axis=1, keys=[s.name for s in data])
+        #
+        #     return df
 
         raise KeyError(f'Invalid key {item}')
 
@@ -854,13 +987,13 @@ class EntityCollection:
         print(f'Start processing at {formatted_time}')
         with mp.Pool(processes=worker_num) as pool:
             iterator = pool.imap_unordered(self.worker_wrapper, worker_args)
-            for iter_num in range(1, len(self)+1):
+            for iter_num in range(1, len(self) + 1):
 
                 # Iterate while looking out for exceptions
                 try:
                     exec_time = next(iterator)
                 except StopIteration:
-                     pass
+                    pass
                 except Exception as _exc:
                     raise _exc
 
@@ -917,7 +1050,6 @@ class EntityCollection:
 
 
 class AnimalCollection(EntityCollection):
-
     _entity_type = Animal
 
     def _get_entity(self, row: AnimalTable) -> Animal:

@@ -7,31 +7,35 @@ __all__ = ['sqltables', 'entities', 'digest', 'analysis', 'open_analysis', 'util
 
 
 def less(name, value):
-    return name, 'l', value
+    return name, '<', value
 
 
 def lessequal(name, value):
-    return name, 'le', value
+    return name, '<=', value
 
 
 def equal(name, value):
-    return name, 'e', value
-
-
-def greater(name, value):
-    return name, 'g', value
+    return name, '==', value
 
 
 def greaterequal(name, value):
-    return name, 'ge', value
+    return name, '>=', value
+
+
+def greater(name, value):
+    return name, '>', value
 
 
 def is_true(name):
-    return name, 'e', True
+    return name, '==', True
 
 
 def is_false(name):
-    return name, 'e', False
+    return name, '==', False
+
+
+def has(name):
+    return name, 'has', None
 
 
 if __name__ == '__main__':

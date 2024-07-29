@@ -10,8 +10,8 @@ import yaml
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import Session
 
-from caload.sqltables import SQLBase
 from caload.entities import Animal, EntityCollection, Recording, Roi, Phase
+from caload.sqltables import SQLBase, AnimalTable, RecordingTable, RoiTable, PhaseTable
 
 __all__ = ['Analysis', 'Mode', 'open_analysis']
 
@@ -32,6 +32,7 @@ class Analysis:
     lazy_init: bool
     echo: bool
     max_blob_size: int
+    entities: Dict[tuple, Union[Animal, Recording, Roi, Phase]]
 
     def __init__(self, path: str, mode: Mode = Mode.analyse, bulk_format: str = None,
                  lazy_init: bool = False, echo: bool = False, max_blob_size: int = 2 ** 22):
@@ -42,6 +43,9 @@ class Analysis:
 
         # Set path as posix
         self._analysis_path = Path(path).as_posix()
+
+        # Set up entity dictionary
+        self.entities = {}
 
         if self.is_create_mode:
             if bulk_format is None:
@@ -66,6 +70,23 @@ class Analysis:
         # Open SQL session by default
         if not lazy_init:
             self.open_session()
+        # else:
+        #     if self.is_create_mode:
+        #         raise Exception('Cannot lazily initialize in create mode')
+        #
+        # # Preload all entities for fast lookup of existing entities during creation
+        # if self.is_create_mode:
+        #     for row in self.session.query(AnimalTable).all():
+        #         Animal(row=row, analysis=self)
+        #
+        #     for row in self.session.query(RecordingTable).all():
+        #         Recording(row=row, analysis=self)
+        #
+        #     for row in self.session.query(RoiTable).all():
+        #         Roi(row=row, analysis=self)
+        #
+        #     for row in self.session.query(PhaseTable).all():
+        #         Phase(row=row, analysis=self)
 
     def __repr__(self):
         return f"Analysis('{self.analysis_path}')"
@@ -124,12 +145,11 @@ class Analysis:
         return temp_path
 
 
-def open_analysis(analysis_path: str, mode=Mode.analyse) -> Analysis:
-
+def open_analysis(analysis_path: str, mode=Mode.analyse, **kwargs) -> Analysis:
     meta_path = f'{analysis_path}/metadata.db'
     if not os.path.exists(meta_path):
         raise ValueError(f'Path {meta_path} not found')
 
-    summary = Analysis(analysis_path, mode=mode)
+    summary = Analysis(analysis_path, mode=mode, **kwargs)
 
     return summary
