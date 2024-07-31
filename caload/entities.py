@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, List, TYPE_CHECKING, Tuple, Type, Union
 import h5py
 import numpy as np
 import pandas as pd
-from sqlalchemy.orm import Query, aliased
+from sqlalchemy.orm import Query, aliased, joinedload
 from tqdm import tqdm
 
 import caload
@@ -268,7 +268,6 @@ class Entity:
                  .filter(self.attr_value_table.entity_pk == self.row.pk)
                  .filter(self.attr_value_table.column_str.not_in(['value_path', 'value_blob'])))
         return {value_row.attribute.name: value_row.value for value_row in query.all()}
-
 
     @property
     def attributes(self):
@@ -904,30 +903,33 @@ class EntityCollection:
 
         return self._query
 
-    def _column(self, attribute: Union[str, int]):
+    def _column(self, attribute: Union[str, int], include_blobs: bool = False):
 
         # If attribute is string, fetch corresponding primary key
         if isinstance(attribute, str):
-            query = self.analysis.session.query(AttributeTable.pk).filter(AttributeTable.name == attribute)
+            pk_query = self.analysis.session.query(AttributeTable.pk).filter(AttributeTable.name == attribute)
 
-            if query.count() == 0:
+            if pk_query.count() == 0:
                 raise KeyError(f'No attribute with name {attribute} found for {self}')
-            attribute_pk = query.first().pk
+            attribute_pk = pk_query.first().pk
         else:
             attribute_pk = attribute
 
         # Subquery on entity primary keys
-        subquery = self.query.subquery().primary_key
+        entity_query = self.query.subquery().primary_key
 
         # Query attribute values
-        values = (self.analysis.session.query(self._entity_type.attr_value_table)
-                  .filter(self._entity_type.attr_value_table.entity_pk.in_(subquery))
-                  .filter(self._entity_type.attr_value_table.attribute_pk == attribute_pk)).all()
+        value_query = (self.analysis.session.query(self._entity_type.attr_value_table)
+                       .filter(self._entity_type.attr_value_table.entity_pk.in_(entity_query))
+                       .filter(self._entity_type.attr_value_table.attribute_pk == attribute_pk))
 
-        return values
+        if include_blobs:
+            value_query = value_query.options(joinedload(self._entity_type.attr_value_table.value_blob))
+
+        return value_query.all()
 
     def _dataframe_of(self, attribute_names: List[str] = None, attribute_pks: List[int] = None,
-                      include_blobs: bool = False, include_bulk: bool =False) -> pd.DataFrame:
+                      include_blobs: bool = False, include_bulk: bool = False) -> pd.DataFrame:
 
         # Add to excluded list
         excluded = []
@@ -950,7 +952,7 @@ class EntityCollection:
         for attr_pk, attr_name in zip(attribute_pks, attribute_names):
 
             # Fetch rows
-            rows = self._column(attr_name if attr_pk is None else attr_pk)
+            rows = self._column(attr_name if attr_pk is None else attr_pk, include_blobs)
 
             # If no attribute name was give, fetch it
             if attr_name is None:
@@ -976,8 +978,8 @@ class EntityCollection:
         unique_value_rows = self.analysis.session.query(RoiValueTable).group_by(RoiValueTable.attribute_pk).all()
 
         # Return dataframe of all attributes
-        return self._dataframe_of(attribute_names = [row.attribute.name for row in unique_value_rows],
-                                  attribute_pks = [row.attribute.pk for row in unique_value_rows],
+        return self._dataframe_of(attribute_names=[row.attribute.name for row in unique_value_rows],
+                                  attribute_pks=[row.attribute.pk for row in unique_value_rows],
                                   include_blobs=False, include_bulk=False)
 
     @property
@@ -986,9 +988,10 @@ class EntityCollection:
         unique_value_rows = self.analysis.session.query(RoiValueTable).group_by(RoiValueTable.attribute_pk).all()
 
         # Return dataframe of all attributes
-        return self._dataframe_of(attribute_names = [row.attribute.name for row in unique_value_rows],
-                                  attribute_pks = [row.attribute.pk for row in unique_value_rows],
+        return self._dataframe_of(attribute_names=[row.attribute.name for row in unique_value_rows],
+                                  attribute_pks=[row.attribute.pk for row in unique_value_rows],
                                   include_blobs=True, include_bulk=False)
+
     def _get_entity(self, row: EntityTable) -> Entity:
         return self._entity_type(row=row, analysis=self.analysis)
 
