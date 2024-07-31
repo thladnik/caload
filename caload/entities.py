@@ -677,44 +677,68 @@ def _filter(analysis: Analysis,
     for filt in attribute_filters:
         if isinstance(filt, tuple):
             name, comp, value = filt
+        elif isinstance(filt, str):
+            name, comp, value = filt.split(' ')
 
-            # Create alias
-            _alias = aliased(attr_value_table)
+            cast_value = {'true': True, 'false': False}.get(value.lower(), None)
+            if cast_value is None:
+                for _type in (int, float):
+                    try:
+                        cast_value = _type(value)
+                    except:
+                        pass
+                    else:
+                        break
 
-            if comp == 'has':
-                # Build subquery to filter attribute name
-                subquery = analysis.session.query(AttributeTable).filter(AttributeTable.name == name).subquery()
-                # Build WHERE clause based on attribute name subquery
-                _query = _query.filter(subquery.c.pk == _alias.attribute_pk)
-                continue
+            if cast_value is not None:
+                value = cast_value
+            # If no valid conversion, assume string is correct one
 
-            # Determine value type
-            if isinstance(value, (bool, int, float, str, date, datetime)):
-                _aliased_value_field = getattr(_alias, f'value_{str(type(value).__name__)}')
-            else:
-                raise TypeError(f'Invalid type "{type(value)}" to filter for in attributes')
+        else:
+            raise Exception(f'Invalid filter argument {filt}')
 
-            # Apply value filter
-            if comp == '<':
-                w1 = _aliased_value_field < value
-            elif comp == '<=':
-                w1 = _aliased_value_field <= value
-            elif comp == '==':
-                w1 = _aliased_value_field == value
-            elif comp == '>=':
-                w1 = _aliased_value_field >= value
-            elif comp == '>':
-                w1 = _aliased_value_field > value
-            else:
-                raise ValueError('Invalid filter format')
+        # Create alias
+        _alias = aliased(attr_value_table)
 
+        if comp in ('has', 'hasnot'):
             # Build subquery to filter attribute name
             subquery = analysis.session.query(AttributeTable).filter(AttributeTable.name == name).subquery()
             # Build WHERE clause based on attribute name subquery
-            w = and_(w1, subquery.c.pk == _alias.attribute_pk)
+            if comp == 'has':
+                _query = _query.filter(subquery.c.pk == _alias.attribute_pk)
+            else:
+                _query = _query.filter(subquery.c.pk != _alias.attribute_pk)
 
-            # Add to main query
-            _query = _query.join(_alias).filter(w)
+            # Skip rest
+            continue
+
+        # Determine value type
+        if isinstance(value, (bool, int, float, str, date, datetime)):
+            _aliased_value_field = getattr(_alias, f'value_{str(type(value).__name__)}')
+        else:
+            raise TypeError(f'Invalid type "{type(value)}" to filter for in attributes')
+
+        # Apply value filter
+        if comp == '<':
+            w1 = _aliased_value_field < value
+        elif comp == '<=':
+            w1 = _aliased_value_field <= value
+        elif comp == '==':
+            w1 = _aliased_value_field == value
+        elif comp == '>=':
+            w1 = _aliased_value_field >= value
+        elif comp == '>':
+            w1 = _aliased_value_field > value
+        else:
+            raise ValueError('Invalid filter format')
+
+        # Build subquery to filter attribute name
+        subquery = analysis.session.query(AttributeTable).filter(AttributeTable.name == name).subquery()
+        # Build WHERE clause based on attribute name subquery
+        w = and_(w1, subquery.c.pk == _alias.attribute_pk)
+
+        # Add to main query
+        _query = _query.join(_alias).filter(w)
 
     return _query
 

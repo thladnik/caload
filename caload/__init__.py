@@ -38,5 +38,9 @@ def has(name):
     return name, 'has', None
 
 
+def has_not(name):
+    return name, 'hasnot', None
+
+
 if __name__ == '__main__':
     pass
