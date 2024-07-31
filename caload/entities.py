@@ -17,6 +17,7 @@ import pandas as pd
 from sqlalchemy.orm import Query, aliased
 from tqdm import tqdm
 
+import caload
 from caload.sqltables import *
 from caload import utils
 
@@ -150,10 +151,12 @@ class Entity:
                 raise ValueError('Wait a minute...')
 
         # Create row if it doesn't exist yet
+        value_row_is_new = False
         if value_row is None:
             value_row = self.attr_value_table(entity_pk=self.row.pk, attribute_pk=attribute_row_pk,
                                               is_persistent=self.analysis.is_create_mode)
             self.analysis.session.add(value_row)
+            value_row_is_new = True
 
         # Set scalars
         if type(value) in (str, float, int, bool, date, datetime):
@@ -163,11 +166,21 @@ class Entity:
                               bool: 'bool', date: 'date', datetime: 'datetime'}
             column_str = f'value_{value_type_map.get(type(value))}'
 
+        # NOTE: there is no universal way to get the byte number of objects
+        # Builtin object have __sizeof__(), but this only returns the overhead for numpy.ndarrays
+        # For numpy arrays it's numpy.ndarray.nbytes
         # Set small objects
-        elif value.__sizeof__() < self.analysis.max_blob_size:
+        elif (not isinstance(value, np.ndarray) and value.__sizeof__() < self.analysis.max_blob_size) \
+                or (isinstance(value, np.ndarray) and value.nbytes < self.analysis.max_blob_size):
 
             # Set value type
             column_str = 'value_blob'
+
+            # Create new blob row
+            if value_row_is_new:
+                blob_row = AttributeBlobTable()
+                self.analysis.session.add(blob_row)
+                value_row.value_blob = blob_row
 
         # Set large objects
         else:
@@ -253,16 +266,15 @@ class Entity:
         # Get all
         query = (self.analysis.session.query(self.attr_value_table)
                  .filter(self.attr_value_table.entity_pk == self.row.pk)
-                 .filter(self.attr_value_table.column_str != 'value_path'))
-
-        # Update
+                 .filter(self.attr_value_table.column_str.not_in(['value_path', 'value_blob'])))
         return {value_row.attribute.name: value_row.value for value_row in query.all()}
+
 
     @property
     def attributes(self):
         # Get all
-        query = (
-            self.analysis.session.query(self.attr_value_table).filter(self.attr_value_table.entity_pk == self.row.pk))
+        query = (self.analysis.session.query(self.attr_value_table)
+                 .filter(self.attr_value_table.entity_pk == self.row.pk))
 
         # Update
         attributes = {}
@@ -363,13 +375,15 @@ class Animal(Entity):
     def filter(cls,
                analysis: Analysis,
                *attr_filters,
-               animal_id: str = None) -> AnimalCollection:
+               **key_filters) -> AnimalCollection:
         query = _filter(analysis,
                         AnimalTable,
                         [],
                         AnimalValueTable,
                         *attr_filters,
-                        animal_id=animal_id)
+                        *[caload.equal(k, v) for k, v in key_filters.items()])
+
+        # TODO: Maybe add separate method to filter exclusively by indexed entity columns ('key_filters') for faster filtering?
 
         return AnimalCollection(analysis=analysis, query=query)
 
@@ -445,17 +459,13 @@ class Recording(Entity):
     def filter(cls,
                analysis: Analysis,
                *attr_filters,
-               animal_id: str = None,
-               rec_date: Union[str, date, datetime] = None,
-               rec_id: str = None) -> RecordingCollection:
+               **key_filters) -> RecordingCollection:
         query = _filter(analysis,
                         RecordingTable,
                         [AnimalTable],
                         RecordingValueTable,
                         *attr_filters,
-                        animal_id=animal_id,
-                        rec_date=rec_date,
-                        rec_id=rec_id)
+                        *[caload.equal(k, v) for k, v in key_filters.items()])
 
         return RecordingCollection(analysis=analysis, query=query)
 
@@ -532,19 +542,13 @@ class Phase(Entity):
     def filter(cls,
                analysis: Analysis,
                *attr_filters,
-               animal_id: str = None,
-               rec_date: Union[str, date, datetime] = None,
-               rec_id: str = None,
-               phase_id: int = None, ) -> PhaseCollection:
+               **key_filters) -> PhaseCollection:
         query = _filter(analysis,
                         PhaseTable,
                         [RecordingTable, AnimalTable],
                         PhaseValueTable,
                         *attr_filters,
-                        animal_id=animal_id,
-                        rec_date=rec_date,
-                        rec_id=rec_id,
-                        phase_id=phase_id)
+                        *[caload.equal(k, v) for k, v in key_filters.items()])
 
         return PhaseCollection(analysis=analysis, query=query)
 
@@ -635,19 +639,13 @@ class Roi(Entity):
     def filter(cls,
                analysis: Analysis,
                *attr_filters,
-               animal_id: str = None,
-               rec_date: Union[str, date, datetime] = None,
-               rec_id: str = None,
-               roi_id: int = None, ) -> RoiCollection:
+               **key_filters) -> RoiCollection:
         query = _filter(analysis,
                         RoiTable,
                         [RecordingTable, AnimalTable],
                         RoiValueTable,
                         *attr_filters,
-                        animal_id=animal_id,
-                        rec_date=rec_date,
-                        rec_id=rec_id,
-                        roi_id=roi_id)
+                        *[caload.equal(k, v) for k, v in key_filters.items()])
 
         return RoiCollection(analysis=analysis, query=query)
 
@@ -672,7 +670,6 @@ def _filter(analysis: Analysis,
             attr_value_table: Type[AnimalValueTable, RecordingValueTable, RoiValueTable, PhaseValueTable],
             *attribute_filters: List[Tuple[str, str, Any]],
             **kwargs):
-
     from sqlalchemy import or_, and_
     from sqlalchemy.orm import aliased
 
@@ -685,7 +682,7 @@ def _filter(analysis: Analysis,
             # Create alias
             _alias = aliased(attr_value_table)
 
-            if comp == 'contains':
+            if comp == 'has':
                 # Build subquery to filter attribute name
                 subquery = analysis.session.query(AttributeTable).filter(AttributeTable.name == name).subquery()
                 # Build WHERE clause based on attribute name subquery
@@ -724,15 +721,15 @@ def _filter(analysis: Analysis,
 
 
 def _filter_old(analysis: Analysis,
-            base_table: Type[AnimalTable, RecordingTable, RoiTable, PhaseTable],
-            joined_tables: List[Type[AnimalTable, RecordingTable, RoiTable, PhaseTable]],
-            attr_value_table: Type[AnimalValueTable, RecordingValueTable, RoiValueTable, PhaseValueTable],
-            *attribute_filters: Tuple[(str, str, Any)],
-            animal_id: str = None,
-            rec_date: Union[str, date, datetime] = None,
-            rec_id: str = None,
-            roi_id: int = None,
-            phase_id: int = None) -> Query:
+                base_table: Type[AnimalTable, RecordingTable, RoiTable, PhaseTable],
+                joined_tables: List[Type[AnimalTable, RecordingTable, RoiTable, PhaseTable]],
+                attr_value_table: Type[AnimalValueTable, RecordingValueTable, RoiValueTable, PhaseValueTable],
+                *attribute_filters: Tuple[(str, str, Any)],
+                animal_id: str = None,
+                rec_date: Union[str, date, datetime] = None,
+                rec_id: str = None,
+                roi_id: int = None,
+                phase_id: int = None) -> Query:
     # Possible solution for future:
     """
     Apply multiple attribute filters:
@@ -880,43 +877,18 @@ class EntityCollection:
             # Return in order
             return result[::step]
 
-        # # Return multiple attributes for all entities in collection
-        # if isinstance(item, (str, list, tuple)):
-        #     if isinstance(item, str):
-        #         item = [item]
-        #
-        #     # Select all ROI pk's
-        #     rows = self.query.all()
-        #     pks_all = [row.pk for row in rows]
-        #
-        #     # Fetch attribute data for all given attributes name
-        #     results = []
-        #     attr_table = self._entity_type.attr_table
-        #     for name in item:
-        #         attributes = (self.analysis.session.query(attr_table)
-        #                       .where(attr_table.name == name, attr_table.entity_pk.in_(pks_all))
-        #                       .order_by(attr_table.entity_pk)
-        #                       .all())
-        #         results.append([[row.entity_pk, row.value, row.column_str] for row in attributes])
-        #
-        #     # Write output to DataFrame
-        #     data = []
-        #     for name, res in zip(item, results):
-        #         pks, vals, dtypes = [list(t) for t in zip(*res)]
-        #
-        #         # Replace value_path string representations with actual attribute data
-        #         if 'value_path' in dtypes:
-        #             for idx, (pk, v, dt) in enumerate(zip(pks, vals, dtypes)):
-        #                 if dt == 'value_path':
-        #                     vals[idx] = self._get_entity(rows[pks_all.index(pk)])[name]
-        #
-        #         # Add series to list
-        #         data.append(pd.Series(name=name, index=pks, data=vals))
-        #
-        #     # Create DataFrame
-        #     df = pd.concat(data, axis=1, keys=[s.name for s in data])
-        #
-        #     return df
+        # Return multiple attributes for all entities in collection
+        if isinstance(item, (str, list, tuple)):
+            if isinstance(item, str):
+                item = [item]
+
+            df = self._dataframe_of(attribute_names=item, include_bulk=True, include_blobs=True)
+
+            # For single column, return pd.Series
+            if len(df.columns) == 1:
+                return df.iloc[:, 0]
+
+            return df
 
         raise KeyError(f'Invalid key {item}')
 
@@ -932,16 +904,91 @@ class EntityCollection:
 
         return self._query
 
+    def _column(self, attribute: Union[str, int]):
+
+        # If attribute is string, fetch corresponding primary key
+        if isinstance(attribute, str):
+            query = self.analysis.session.query(AttributeTable.pk).filter(AttributeTable.name == attribute)
+
+            if query.count() == 0:
+                raise KeyError(f'No attribute with name {attribute} found for {self}')
+            attribute_pk = query.first().pk
+        else:
+            attribute_pk = attribute
+
+        # Subquery on entity primary keys
+        subquery = self.query.subquery().primary_key
+
+        # Query attribute values
+        values = (self.analysis.session.query(self._entity_type.attr_value_table)
+                  .filter(self._entity_type.attr_value_table.entity_pk.in_(subquery))
+                  .filter(self._entity_type.attr_value_table.attribute_pk == attribute_pk)).all()
+
+        return values
+
+    def _dataframe_of(self, attribute_names: List[str] = None, attribute_pks: List[int] = None,
+                      include_blobs: bool = False, include_bulk: bool =False) -> pd.DataFrame:
+
+        # Add to excluded list
+        excluded = []
+        if not include_blobs:
+            excluded.append('value_blob')
+        if not include_bulk:
+            excluded.append('value_path')
+
+        # Prepare args
+        if attribute_pks is None:
+            attribute_pks = [None] * len(attribute_names)
+        elif attribute_names is None:
+            attribute_names = [None] * len(attribute_pks)
+
+        if attribute_pks is None or attribute_names is None:
+            raise ValueError('No attribute list specified')
+
+        # Iterate through specified attributes
+        cols = []
+        for attr_pk, attr_name in zip(attribute_pks, attribute_names):
+
+            # Fetch rows
+            rows = self._column(attr_name if attr_pk is None else attr_pk)
+
+            # If no attribute name was give, fetch it
+            if attr_name is None:
+                self.analysis.session.query(AttributeTable.name).filter(AttributeTable.pk == attr_pk)
+
+            # Get indices and data
+            idcs = [v.entity_pk for v in rows if v.column_str not in excluded]
+            data = [v.value for v in rows if v.column_str not in excluded]
+
+            # Create series
+            series = pd.Series(index=idcs, data=data, name=attr_name)
+
+            # Include if not empty
+            if series.count() > 0:
+                cols.append(series)
+
+        return pd.concat(cols, axis=1)
+
     @property
     def dataframe(self):
-        return pd.DataFrame([entity.scalar_attributes for entity in self])
 
-    # @property
-    # def extended_dataframe(self):
-    #     df = self.dataframe
-    #     ext_df = pd.DataFrame([entity.parent.extended_dataframe for entity in self])
-    #     return pd.DataFrame([entity.df for entity in self])
+        # Fetch all entity related, unique attributes
+        unique_value_rows = self.analysis.session.query(RoiValueTable).group_by(RoiValueTable.attribute_pk).all()
 
+        # Return dataframe of all attributes
+        return self._dataframe_of(attribute_names = [row.attribute.name for row in unique_value_rows],
+                                  attribute_pks = [row.attribute.pk for row in unique_value_rows],
+                                  include_blobs=False, include_bulk=False)
+
+    @property
+    def extended_dataframe(self):
+        # Fetch all entity related, unique attributes
+        unique_value_rows = self.analysis.session.query(RoiValueTable).group_by(RoiValueTable.attribute_pk).all()
+
+        # Return dataframe of all attributes
+        return self._dataframe_of(attribute_names = [row.attribute.name for row in unique_value_rows],
+                                  attribute_pks = [row.attribute.pk for row in unique_value_rows],
+                                  include_blobs=True, include_bulk=False)
     def _get_entity(self, row: EntityTable) -> Entity:
         return self._entity_type(row=row, analysis=self.analysis)
 

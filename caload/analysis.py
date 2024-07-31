@@ -23,6 +23,7 @@ class Mode(Enum):
 
 class Analysis:
     _default_bulk_format = 'hdf5'
+    _default_max_blob_size = 2 ** 20  # 2^20 ~ 1MB
     mode: Mode
     analysis_path: str
     sql_engine: Engine
@@ -31,11 +32,10 @@ class Analysis:
     write_timeout = 3.  # s
     lazy_init: bool
     echo: bool
-    max_blob_size: int
     entities: Dict[tuple, Union[Animal, Recording, Roi, Phase]]
 
     def __init__(self, path: str, mode: Mode = Mode.analyse, bulk_format: str = None,
-                 lazy_init: bool = False, echo: bool = False, max_blob_size: int = 2 ** 22):
+                 lazy_init: bool = False, echo: bool = False, max_blob_size: int = None):
 
         # Set mode
         self.mode = mode
@@ -51,13 +51,19 @@ class Analysis:
             if bulk_format is None:
                 bulk_format = self._default_bulk_format
 
+            if max_blob_size is None:
+                max_blob_size = self._default_max_blob_size
+
             with open(f'{self.analysis_path}/configuration.yaml', 'w') as f:
-                self.config = {'bulk_format': bulk_format}
+                self.config = {'bulk_format': bulk_format,
+                               'max_blob_size': max_blob_size}
                 yaml.safe_dump(self.config, f)
 
         else:
             if bulk_format is not None:
                 print('WARNING: Bulk format may only be set during creation')
+            if max_blob_size is not None:
+                print('WARNING: Max blob size may only be set during creation')
 
             with open(f'{self.analysis_path}/configuration.yaml', 'r') as f:
                 self.config = yaml.safe_load(f)
@@ -65,7 +71,6 @@ class Analysis:
         # Set optionals
         self.lazy_init = lazy_init
         self.echo = echo
-        self.max_blob_size = max_blob_size
 
         # Open SQL session by default
         if not lazy_init:
@@ -98,6 +103,10 @@ class Analysis:
     @property
     def bulk_format(self):
         return self.config['bulk_format']
+
+    @property
+    def max_blob_size(self) -> int:
+        return self.config['max_blob_size']
 
     def open_session(self):
 

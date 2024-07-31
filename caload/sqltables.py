@@ -5,12 +5,9 @@ from typing import List
 from sqlalchemy import Index, ForeignKey, event, Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
-__all__ = ['SQLBase', 'EntityTable',
-
-           'AnimalTable', 'RecordingTable', 'RoiTable', 'PhaseTable',
-
-           'AttributeTable', 'AttributeValueTable', 'AnimalValueTable',
-           'RecordingValueTable', 'RoiValueTable', 'PhaseValueTable']
+__all__ = ['SQLBase', 'EntityTable', 'AttributeBlobTable',
+           'AttributeTable', 'AnimalTable', 'RecordingTable', 'RoiTable', 'PhaseTable',
+           'AttributeValueTable', 'AnimalValueTable', 'RecordingValueTable', 'RoiValueTable', 'PhaseValueTable']
 
 
 # Set WAL
@@ -19,6 +16,7 @@ def set_sqlite_pragma(dbapi_connection, connection_record):
     cursor = dbapi_connection.cursor()
     # print('Set timeout and WAL')
     cursor.execute('PRAGMA journal_mode=WAL;')
+    cursor.execute('PRAGMA synchronous = NORMAL;')
     cursor.execute('PRAGMA busy_timeout=30000;')
     cursor.close()
 
@@ -117,6 +115,13 @@ class AttributeTable(SQLBase):
     roi_values: Mapped[List['RoiValueTable']] = relationship('RoiValueTable', back_populates='attribute')
 
 
+class AttributeBlobTable(SQLBase):
+    __tablename__ = 'attribute_blobs'
+    pk: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+
+    value: Mapped[bytes] = mapped_column(nullable=True)
+
+
 class AttributeValueTable:
     entity_pk: Mapped[int]
     entity: Mapped
@@ -124,13 +129,15 @@ class AttributeValueTable:
     attribute_pk: Mapped[int]
     attribute: Mapped
 
+    value_blob_pk: Mapped[int]
+    value_blob: Mapped['AttributeBlobTable']
+
     value_str: Mapped[str] = mapped_column(nullable=True)
     value_int: Mapped[int] = mapped_column(nullable=True)
     value_float: Mapped[float] = mapped_column(nullable=True)
     value_bool: Mapped[bool] = mapped_column(nullable=True)
     value_date: Mapped[date] = mapped_column(nullable=True)
     value_datetime: Mapped[datetime] = mapped_column(nullable=True)
-    value_blob: Mapped[bytes] = mapped_column(nullable=True)
     value_path: Mapped[str] = mapped_column(nullable=True)
     column_str: Mapped[str] = mapped_column(nullable=True)
 
@@ -141,16 +148,26 @@ class AttributeValueTable:
 
     @property
     def value(self):
-        if self.column_str is not None:
-            if self.column_str == 'value_blob':
-                return pickle.loads(self.value_blob)
-            return getattr(self, self.column_str)
-        return None
+
+        if self.column_str is None:
+            return None
+
+        # If blob, load from associated row in AttributeBlobTable
+        if self.column_str == 'value_blob':
+            return pickle.loads(self.value_blob.value)
+
+        # Otherwise load from this row based on column_str
+        return getattr(self, self.column_str)
 
     @value.setter
     def value(self, value):
+
+        # If blob, dump to associated row in AttributeBlobTable
         if self.column_str == 'value_blob':
-            value = pickle.dumps(value)
+            self.value_blob.value = pickle.dumps(value)
+            return
+
+        # Otherwise write directly
         setattr(self, self.column_str, value)
 
 
@@ -163,6 +180,9 @@ class AnimalValueTable(AttributeValueTable, SQLBase):
     attribute_pk: Mapped[int] = mapped_column(ForeignKey('attributes.pk'), primary_key=True)
     attribute: Mapped['AttributeTable'] = relationship('AttributeTable', back_populates='animal_values')
 
+    value_blob_pk: Mapped[int] = mapped_column(ForeignKey('attribute_blobs.pk'), nullable=True)
+    value_blob: Mapped['AttributeBlobTable'] = relationship('AttributeBlobTable')
+
 
 class RecordingValueTable(AttributeValueTable, SQLBase):
     __tablename__ = 'recording_attributes'
@@ -172,6 +192,9 @@ class RecordingValueTable(AttributeValueTable, SQLBase):
 
     attribute_pk: Mapped[int] = mapped_column(ForeignKey('attributes.pk'), primary_key=True)
     attribute: Mapped['AttributeTable'] = relationship('AttributeTable', back_populates='recording_values')
+
+    value_blob_pk: Mapped[int] = mapped_column(ForeignKey('attribute_blobs.pk'), nullable=True)
+    value_blob: Mapped['AttributeBlobTable'] = relationship('AttributeBlobTable')
 
 
 class PhaseValueTable(AttributeValueTable, SQLBase):
@@ -183,6 +206,9 @@ class PhaseValueTable(AttributeValueTable, SQLBase):
     attribute_pk: Mapped[int] = mapped_column(ForeignKey('attributes.pk'), primary_key=True)
     attribute: Mapped['AttributeTable'] = relationship('AttributeTable', back_populates='phase_values')
 
+    value_blob_pk: Mapped[int] = mapped_column(ForeignKey('attribute_blobs.pk'), nullable=True)
+    value_blob: Mapped['AttributeBlobTable'] = relationship('AttributeBlobTable')
+
 
 class RoiValueTable(AttributeValueTable, SQLBase):
     __tablename__ = 'roi_attributes'
@@ -192,6 +218,9 @@ class RoiValueTable(AttributeValueTable, SQLBase):
 
     attribute_pk: Mapped[int] = mapped_column(ForeignKey('attributes.pk'), primary_key=True)
     attribute: Mapped['AttributeTable'] = relationship('AttributeTable', back_populates='roi_values')
+
+    value_blob_pk: Mapped[int] = mapped_column(ForeignKey('attribute_blobs.pk'), nullable=True)
+    value_blob: Mapped['AttributeBlobTable'] = relationship('AttributeBlobTable')
 
 
 if __name__ == '__main__':
