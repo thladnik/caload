@@ -39,22 +39,22 @@ class Entity:
     # caused by lazy loading
     parents: List[EntityTable]
 
-    def __new__(cls, *args, **kwargs):
-        """Implement entities as Singletons
-        """
-
-        row = kwargs.get('row')
-        entities = getattr(kwargs.get('analysis'), 'entities')
-
-        # Check if instance of entity already exists in this analysis
-        if cls.unique_identifier(row) in entities:
-            return entities[cls.unique_identifier(row)]
-
-        # If entity does not exist yet, create new one
-        new_entity = super(Entity, cls).__new__(cls)
-        entities[new_entity.unique_identifier(row)] = new_entity
-
-        return new_entity
+    # def __new__(cls, *args, **kwargs):
+    #     """Implement entities as Singletons
+    #     """
+    #
+    #     row = kwargs.get('row')
+    #     entities = getattr(kwargs.get('analysis'), 'entities')
+    #
+    #     # Check if instance of entity already exists in this analysis
+    #     if cls.unique_identifier(row) in entities:
+    #         return entities[cls.unique_identifier(row)]
+    #
+    #     # If entity does not exist yet, create new one
+    #     new_entity = super(Entity, cls).__new__(cls)
+    #     entities[new_entity.unique_identifier(row)] = new_entity
+    #
+    #     return new_entity
 
     def __init__(self,
                  row,
