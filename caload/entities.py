@@ -235,11 +235,15 @@ class Entity:
                 try:
                     with h5py.File(os.path.join(self.analysis.analysis_path, path), 'a') as f:
                         if key not in f:
-                            f.create_dataset(key, data=value)
+                            f.create_dataset(key, data=value,
+                                             compression=self.analysis.compression,
+                                             compression_opts=self.analysis.compression_opts)
                         else:
                             if value.shape != f[key].shape:
                                 del f[key]
-                                f.create_dataset(key, data=value)
+                                f.create_dataset(key, data=value,
+                                                 compression=self.analysis.compression,
+                                                 compression_opts=self.analysis.compression_opts)
                             else:
                                 f[key][:] = value
 
@@ -364,30 +368,17 @@ class Animal(Entity):
     def add_recording(self, *args, **kwargs) -> Recording:
         return Recording.create(*args, animal=self, analysis=self.analysis, **kwargs)
 
-    def recordings(self, *args, **kwargs) -> RecordingCollection:
-        return Recording.filter(self.analysis, animal_id=self.id, *args, **kwargs)
+    @property
+    def recordings(self) -> RecordingCollection:
+        return self.analysis.get_recordings_by_id(animal_id=self.id)
 
-    def rois(self, *args, **kwargs) -> RoiCollection:
-        return Roi.filter(self.analysis, animal_id=self.id, *args, **kwargs)
+    @property
+    def rois(self) -> RoiCollection:
+        return self.analysis.get_rois_by_id(animal_id=self.id)
 
-    def phases(self, *args, **kwargs) -> PhaseCollection:
-        return Phase.filter(self.analysis, animal_id=self.id, *args, **kwargs)
-
-    @classmethod
-    def filter(cls,
-               analysis: Analysis,
-               *attr_filters,
-               **key_filters) -> AnimalCollection:
-        query = _filter(analysis,
-                        AnimalTable,
-                        [],
-                        AnimalValueTable,
-                        *attr_filters,
-                        *[caload.equal(k, v) for k, v in key_filters.items()])
-
-        # TODO: Maybe add separate method to filter exclusively by indexed entity columns ('key_filters') for faster filtering?
-
-        return AnimalCollection(analysis=analysis, query=query)
+    @property
+    def phases(self) -> PhaseCollection:
+        return self.analysis.get_phases_by_id(animal_id=self.id)
 
 
 class Recording(Entity):
@@ -425,13 +416,13 @@ class Recording(Entity):
     def add_phase(self, *args, **kwargs) -> Phase:
         return Phase.create(*args, recording=self, analysis=self.analysis, **kwargs)
 
-    def rois(self, *args, **kwargs) -> RoiCollection:
-        return Roi.filter(self.analysis, animal_id=self.animal_id, rec_id=self.id, rec_date=self.rec_date, *args,
-                          **kwargs)
+    @property
+    def rois(self) -> RoiCollection:
+        return self.analysis.get_rois_by_id(animal_id=self.animal_id, rec_id=self.id, rec_date=self.rec_date)
 
-    def phases(self, *args, **kwargs) -> PhaseCollection:
-        return Phase.filter(self.analysis, animal_id=self.animal_id, rec_id=self.id, rec_date=self.rec_date, *args,
-                            **kwargs)
+    @property
+    def phases(self) -> PhaseCollection:
+        return self.analysis.get_phases_by_id(animal_id=self.animal_id, rec_id=self.id, rec_date=self.rec_date)
 
     @property
     def parent(self):
@@ -456,20 +447,6 @@ class Recording(Entity):
     @property
     def animal(self) -> Animal:
         return Animal(analysis=self.analysis, row=self._row.parent)
-
-    @classmethod
-    def filter(cls,
-               analysis: Analysis,
-               *attr_filters,
-               **key_filters) -> RecordingCollection:
-        query = _filter(analysis,
-                        RecordingTable,
-                        [AnimalTable],
-                        RecordingValueTable,
-                        *attr_filters,
-                        *[caload.equal(k, v) for k, v in key_filters.items()])
-
-        return RecordingCollection(analysis=analysis, query=query)
 
 
 class Phase(Entity):
@@ -539,20 +516,6 @@ class Phase(Entity):
     @property
     def recording(self) -> Recording:
         return Recording(analysis=self.analysis, row=self.row.parent)
-
-    @classmethod
-    def filter(cls,
-               analysis: Analysis,
-               *attr_filters,
-               **key_filters) -> PhaseCollection:
-        query = _filter(analysis,
-                        PhaseTable,
-                        [RecordingTable, AnimalTable],
-                        PhaseValueTable,
-                        *attr_filters,
-                        *[caload.equal(k, v) for k, v in key_filters.items()])
-
-        return PhaseCollection(analysis=analysis, query=query)
 
     def export_to(self, f: h5py.File):
 
@@ -637,20 +600,6 @@ class Roi(Entity):
     def recording(self) -> Recording:
         return Recording(analysis=self.analysis, row=self.row.parent)
 
-    @classmethod
-    def filter(cls,
-               analysis: Analysis,
-               *attr_filters,
-               **key_filters) -> RoiCollection:
-        query = _filter(analysis,
-                        RoiTable,
-                        [RecordingTable, AnimalTable],
-                        RoiValueTable,
-                        *attr_filters,
-                        *[caload.equal(k, v) for k, v in key_filters.items()])
-
-        return RoiCollection(analysis=analysis, query=query)
-
     def export_to(self, f: h5py.File):
 
         with h5py.File(f'{self.analysis.analysis_path}/{self.path}/data.hdf5', 'r') as f2:
@@ -664,179 +613,6 @@ class Roi(Entity):
                     f[self.path].attrs[k] = v
                 except:
                     print(f'Failed to export scalar attribute {k} in {self} (type: {type(v)})')
-
-
-def _filter(analysis: Analysis,
-            base_table: Type[AnimalTable, RecordingTable, RoiTable, PhaseTable],
-            joined_tables: List[Type[AnimalTable, RecordingTable, RoiTable, PhaseTable]],
-            attr_value_table: Type[AnimalValueTable, RecordingValueTable, RoiValueTable, PhaseValueTable],
-            *attribute_filters: List[Tuple[str, str, Any]],
-            **kwargs):
-    from sqlalchemy import or_, and_
-    from sqlalchemy.orm import aliased
-
-    _query = analysis.session.query(base_table)
-
-    for filt in attribute_filters:
-        if isinstance(filt, tuple):
-            name, comp, value = filt
-        elif isinstance(filt, str):
-            name, comp, value = filt.split(' ')
-
-            cast_value = {'true': True, 'false': False}.get(value.lower(), None)
-            if cast_value is None:
-                for _type in (int, float):
-                    try:
-                        cast_value = _type(value)
-                    except:
-                        pass
-                    else:
-                        break
-
-            if cast_value is not None:
-                value = cast_value
-            # If no valid conversion, assume string is correct one
-
-        else:
-            raise Exception(f'Invalid filter argument {filt}')
-
-        # Create alias
-        _alias = aliased(attr_value_table)
-
-        if comp in ('has', 'hasnot'):
-            # Build subquery to filter attribute name
-            subquery = analysis.session.query(AttributeTable).filter(AttributeTable.name == name).subquery()
-            # Build WHERE clause based on attribute name subquery
-            if comp == 'has':
-                _query = _query.filter(subquery.c.pk == _alias.attribute_pk)
-            else:
-                _query = _query.filter(subquery.c.pk != _alias.attribute_pk)
-
-            # Skip rest
-            continue
-
-        # Determine value type
-        if isinstance(value, (bool, int, float, str, date, datetime)):
-            _aliased_value_field = getattr(_alias, f'value_{str(type(value).__name__)}')
-        else:
-            raise TypeError(f'Invalid type "{type(value)}" to filter for in attributes')
-
-        # Apply value filter
-        if comp == '<':
-            w1 = _aliased_value_field < value
-        elif comp == '<=':
-            w1 = _aliased_value_field <= value
-        elif comp == '==':
-            w1 = _aliased_value_field == value
-        elif comp == '>=':
-            w1 = _aliased_value_field >= value
-        elif comp == '>':
-            w1 = _aliased_value_field > value
-        else:
-            raise ValueError('Invalid filter format')
-
-        # Build subquery to filter attribute name
-        subquery = analysis.session.query(AttributeTable).filter(AttributeTable.name == name).subquery()
-        # Build WHERE clause based on attribute name subquery
-        w = and_(w1, subquery.c.pk == _alias.attribute_pk)
-
-        # Add to main query
-        _query = _query.join(_alias).filter(w)
-
-    return _query
-
-
-def _filter_old(analysis: Analysis,
-                base_table: Type[AnimalTable, RecordingTable, RoiTable, PhaseTable],
-                joined_tables: List[Type[AnimalTable, RecordingTable, RoiTable, PhaseTable]],
-                attr_value_table: Type[AnimalValueTable, RecordingValueTable, RoiValueTable, PhaseValueTable],
-                *attribute_filters: Tuple[(str, str, Any)],
-                animal_id: str = None,
-                rec_date: Union[str, date, datetime] = None,
-                rec_id: str = None,
-                roi_id: int = None,
-                phase_id: int = None) -> Query:
-    # Possible solution for future:
-    """
-    Apply multiple attribute filters:
-    SELECT * FROM rois
-        LEFT JOIN roi_attributes as attr ON rois.pk = attr.entity_pk
-        GROUP BY rois.pk
-        HAVING  SUM(CASE WHEN attr.name == 's2p/npix' AND attr.value_int < 50 THEN 1 ELSE 0 END) > 0 AND
-                SUM(CASE WHEN attr.name == 's2p/radius' AND attr.value_float > 5.0 THEN 1 ELSE 0 END) > 0
-    """
-
-    # Convert date
-    rec_date = utils.parse_date(rec_date)
-
-    # Join parent tables
-    query = analysis.session.query(base_table)
-    for t in joined_tables:
-        query = query.join(t)
-
-    # Filter
-    if animal_id is not None:
-        query = query.filter(AnimalTable.id == animal_id)
-    if rec_date is not None:
-        query = query.filter(RecordingTable.date == rec_date)
-    if rec_id is not None:
-        query = query.filter(RecordingTable.id == rec_id)
-    if roi_id is not None:
-        query = query.filter(RoiTable.id == roi_id)
-    if phase_id is not None:
-        query = query.filter(PhaseTable.id == phase_id)
-
-    # Apply attribute filters
-    _attr_filters = []
-    if len(attribute_filters) > 0:
-
-        for name, comp, value in attribute_filters:
-
-            if query.join(attr_value_table).filter(attr_value_table.attribute.name == name).count() == 0:
-                raise KeyError(f'Unkown filter for {attr_value_table} with name {name}')
-
-            attr_value_alias = aliased(attr_value_table)
-            query = query.join(attr_value_alias)
-
-            # Filter attribute name
-            query = query.filter(attr_value_alias.attribute.name == name)
-
-            # Only check if entity has an attribute of "name"
-            if comp == 'contains':
-                continue
-
-            attr_value_field = None
-            # Booleans need to be checked first, because they isinstance(True/False, int) evaluates to True
-            if isinstance(value, bool):
-                attr_value_field = attr_value_alias.value_bool
-            elif isinstance(value, int):
-                attr_value_field = attr_value_alias.value_int
-            elif isinstance(value, float):
-                attr_value_field = attr_value_alias.value_float
-            elif isinstance(value, str):
-                attr_value_field = attr_value_alias.value_str
-
-            if attr_value_field is None:
-                raise TypeError(f'Invalid type "{type(value)}" to filter for in attributes')
-
-            if comp == 'l':
-                query = query.filter(attr_value_field < value)
-            elif comp == 'le':
-                query = query.filter(attr_value_field <= value)
-            elif comp == 'e':
-                query = query.filter(attr_value_field == value)
-            elif comp == 'ge':
-                query = query.filter(attr_value_field >= value)
-            elif comp == 'g':
-                query = query.filter(attr_value_field > value)
-            else:
-                raise ValueError('Invalid filter format')
-
-    return query
-
-
-if __name__ == '__main__':
-    pass
 
 
 class EntityCollection:
@@ -1022,9 +798,9 @@ class EntityCollection:
     def _get_entity(self, row: EntityTable) -> Entity:
         return self._entity_type(row=row, analysis=self.analysis)
 
-    def sortby(self, name: str, order: str = 'ASC'):
-        # TODO: implement sorting
-        pass
+    # def sortby(self, name: str, order: str = 'ASC'):
+    #     # TODO: implement sorting
+    #     pass
 
     def map(self, fun: Callable, **kwargs) -> Any:
         print(f'Run function {fun.__name__} on {self} with args '
@@ -1132,12 +908,18 @@ class AnimalCollection(EntityCollection):
     def _get_entity(self, row: AnimalTable) -> Animal:
         return super()._get_entity(row)
 
+    def where(self, *attr_filters):
+        return self.analysis.animals(*attr_filters, entity_query=self.query)
+
 
 class RecordingCollection(EntityCollection):
     _entity_type = Recording
 
     def _get_entity(self, row: RecordingTable) -> Recording:
         return super()._get_entity(row)
+
+    def where(self, *attr_filters):
+        return self.analysis.recordings(*attr_filters, entity_query=self.query)
 
 
 class RoiCollection(EntityCollection):
@@ -1146,9 +928,23 @@ class RoiCollection(EntityCollection):
     def _get_entity(self, row: RoiTable) -> Roi:
         return super()._get_entity(row)
 
+    def __getitem__(self, item) -> Union[Roi, List[Roi], pd.DataFrame]:
+        return super().__getitem__(item)
+
+    def where(self, *attr_filters):
+        return self.analysis.rois(*attr_filters, entity_query=self.query)
+
 
 class PhaseCollection(EntityCollection):
     _entity_type = Phase
 
     def _get_entity(self, row: PhaseTable) -> Phase:
         return super()._get_entity(row)
+
+    def where(self, *attr_filters):
+        return self.analysis.phases(*attr_filters, entity_query=self.query)
+
+
+if __name__ == '__main__':
+    pass
+
