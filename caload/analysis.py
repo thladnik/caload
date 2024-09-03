@@ -157,14 +157,14 @@ class Analysis:
 
         return AnimalCollection(analysis=self, query=query)
 
-    def get_animal_by_id(self, animal_id: str = None) -> Animal:
+    def get_animal_by_id(self, animal_id: str = None) -> Union[Animal, None]:
 
         # Build query
         query = _get_entity_query_by_ids(self, AnimalTable, animal_id=animal_id)
 
         # Return data
         if query.count() == 0:
-            raise Exception('No animals for given identifiers')
+            return None
         if query.count() == 1:
             return Animal(analysis=self, row=query.first())
         raise Exception('This should not happen')
@@ -175,7 +175,7 @@ class Analysis:
         return RecordingCollection(analysis=self, query=query)
 
     def get_recordings_by_id(self, rec_id: str = None, rec_date: Union[str, date] = None, animal_id: str = None) \
-            -> Union[Recording, RecordingCollection]:
+            -> Union[Recording, RecordingCollection, None]:
 
         # Build query
         query = _get_entity_query_by_ids(self, RecordingTable, rec_id=rec_id,
@@ -183,7 +183,7 @@ class Analysis:
 
         # Return data
         if query.count() == 0:
-            raise Exception('No recordings for given identifiers')
+            return None
         if query.count() == 1:
             return Recording(analysis=self, row=query.first())
         return RecordingCollection(analysis=self, query=query)
@@ -196,7 +196,7 @@ class Analysis:
     def get_rois_by_id(self,
                        roi_id: int = None, rec_id: str = None,
                        rec_date: Union[str, date] = None, animal_id: str = None) \
-            -> Union[Roi, RoiCollection]:
+            -> Union[Roi, RoiCollection, None]:
 
         # Build query
         query = _get_entity_query_by_ids(self, RoiTable,
@@ -205,7 +205,7 @@ class Analysis:
 
         # Return data
         if query.count() == 0:
-            raise Exception('No roi for given identifiers')
+            return None
         if query.count() == 1:
             return Roi(analysis=self, row=query.first())
         return RoiCollection(analysis=self, query=query)
@@ -218,7 +218,7 @@ class Analysis:
     def get_phases_by_id(self,
                          phase_id: int = None, rec_id: str = None,
                          rec_date: Union[str, date] = None, animal_id: str = None) \
-            -> Union[Phase, PhaseCollection]:
+            -> Union[Phase, PhaseCollection, None]:
 
         # Build query
         query = _get_entity_query_by_ids(self, PhaseTable,
@@ -227,7 +227,7 @@ class Analysis:
 
         # Return data
         if query.count() == 0:
-            raise Exception('No phases for given identifiers')
+            return None
         if query.count() == 1:
             return Phase(analysis=self, row=query.first())
         return PhaseCollection(analysis=self, query=query)
@@ -289,24 +289,61 @@ def _get_entity_query_by_ids(analysis: Analysis,
     if base_table == PhaseTable and phase_id is not None:
         query = query.filter(PhaseTable.id == phase_id)
 
+
+    # # Join parents and filter
+    # # if base_table != AnimalTable and animal_id is not None:
+    # # query = query.join(AnimalTable)
+    #
+    # if animal_id is not None:
+    #     query = query.filter(AnimalTable.id == animal_id)
+    #
+    # if base_table != RecordingTable and (rec_date is not None or rec_id is not None):
+    #     query = query.join(RecordingTable)
+    #
+    # if rec_date is not None:
+    #     query = query.filter(RecordingTable.date == rec_date)
+    # if rec_id is not None:
+    #     query = query.filter(RecordingTable.id == rec_id)
+    #
+    # # Filter bottom entities
+    # if roi_id is not None:
+    #     query = query.filter(RoiTable.id == roi_id)
+    #
+    # if phase_id is not None:
+    #     query = query.filter(PhaseTable.id == phase_id)
+
     return query
 
 
 def _get_entity_query_by_attributes(analysis: Analysis,
                                     base_table: Type[AnimalTable, RecordingTable, RoiTable, PhaseTable],
                                     attr_value_table: Type[AnimalValueTable, RecordingValueTable, RoiValueTable, PhaseValueTable],
-                                    *attribute_filters: List[Tuple[str, str, Any]],
-                                    entity_query: Query = None):
+                                    *attribute_filters: Tuple[Union[str, Tuple[str, str, Any]]],
+                                    entity_query: Query = None,
+                                    **equality_filters):
+
+    # Convert to list
+    attribute_filters = list(attribute_filters)
+
+    # Add kwargs as equality filters
+    for key, value in equality_filters.items():
+        attribute_filters.append(f'{key} == {value}')
+
     # Create query
     _query = analysis.session.query(base_table)
 
+    # If an entity query was provided, use it to query all entities where Entity.pk in (pk1, pk2, ...)
     if entity_query is not None:
         _subquery = entity_query.subquery().primary_key
         _query = _query.filter(base_table.pk.in_(_subquery))
 
+    # Filter by attributes
     for filt in attribute_filters:
+
+        # Parse filter
         if isinstance(filt, tuple):
             name, comp, value = filt
+
         elif isinstance(filt, str):
             name, comp, value = filt.split(' ')
 

@@ -816,7 +816,7 @@ class EntityCollection:
         # Prepare pool and entities
         import multiprocessing as mp
         if worker_num is None:
-            worker_num = mp.cpu_count() - 1
+            worker_num = mp.cpu_count() - 4
             if len(self) < worker_num:
                 worker_num = len(self)
         print(f'Start pool with {worker_num} workers')
@@ -865,9 +865,6 @@ class EntityCollection:
                                  f'/{timedelta(seconds=int(time_elapsed + time_rest))} '
                                  f'-> {timedelta(seconds=int(time_rest))} remaining ')
 
-                # # Truncate
-                # if len(execution_times) > 1000:
-                #     execution_times = execution_times[len(execution_times) - 1000:]
         formatted_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
         print(f'\nFinish processing at {formatted_time}')
 
