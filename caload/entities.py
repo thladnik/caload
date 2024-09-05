@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import pickle
 import pprint
@@ -167,10 +168,17 @@ class Entity:
             # Set value type
             value_type_map = {str: 'str', float: 'float', int: 'int',
                               bool: 'bool', date: 'date', datetime: 'datetime'}
-            column_str = f'value_{value_type_map.get(type(value))}'
+            value_type = value_type_map.get(type(value))
+
+            # Some SQL dialects don't support inf float values
+            if value_type == 'float' and math.isinf(value):
+                value_type = 'blob'
+
+            # Set column string
+            column_str = f'value_{value_type}'
 
         # NOTE: there is no universal way to get the byte number of objects
-        # Builtin object have __sizeof__(), but this only returns the overhead for numpy.ndarrays
+        # Builtin object have __sizeof__(), but this only returns the overhead for some numpy.ndarrays
         # For numpy arrays it's numpy.ndarray.nbytes
         # Set small objects
         elif (not isinstance(value, np.ndarray) and value.__sizeof__() < self.analysis.max_blob_size) \
@@ -178,12 +186,6 @@ class Entity:
 
             # Set value type
             column_str = 'value_blob'
-
-            # Create new blob row
-            if value_row_is_new:
-                blob_row = AttributeBlobTable()
-                self.analysis.session.add(blob_row)
-                value_row.value_blob = blob_row
 
         # Set large objects
         else:
@@ -193,6 +195,12 @@ class Entity:
 
             # Write any non-scalar data that is too large according to specified bulk storage format
             value = getattr(self, f'_write_{self.analysis.bulk_format}')(key, value, value_row.value)
+
+        # Create new blob row
+        if value_row_is_new and column_str == 'value_blob':
+            blob_row = AttributeBlobTable()
+            self.analysis.session.add(blob_row)
+            value_row.value_blob = blob_row
 
         # Reset old value in case it was set to different type before
         if type(value_row.column_str) is str and value_row.column_str != column_str and value_row.value is not None:
@@ -775,24 +783,32 @@ class EntityCollection:
         return pd.concat(cols, axis=1)
 
     @property
+    def attribute_rows(self):
+        unique_attr_query = (self.analysis.session.query(self._entity_type.attr_value_table.attribute_pk)
+                             .filter(self._entity_type.attr_value_table.entity_pk.in_(self.query.subquery().primary_key))
+                             .group_by(self._entity_type.attr_value_table.attribute_pk))
+
+        return (self.analysis.session.query(AttributeTable)
+                .filter(AttributeTable.pk.in_(unique_attr_query.subquery().select()))).all()
+
+    @property
     def dataframe(self):
 
-        # Fetch all entity related, unique attributes
-        unique_value_rows = self.analysis.session.query(RoiValueTable).group_by(RoiValueTable.attribute_pk).all()
+        attribute_rows = self.attribute_rows
 
         # Return dataframe of all attributes
-        return self._dataframe_of(attribute_names=[row.attribute.name for row in unique_value_rows],
-                                  attribute_pks=[row.attribute.pk for row in unique_value_rows],
+        return self._dataframe_of(attribute_names=[str(row.name) for row in attribute_rows],
+                                  attribute_pks=[int(row.pk) for row in attribute_rows],
                                   include_blobs=False, include_bulk=False)
 
     @property
     def extended_dataframe(self):
-        # Fetch all entity related, unique attributes
-        unique_value_rows = self.analysis.session.query(RoiValueTable).group_by(RoiValueTable.attribute_pk).all()
+
+        attribute_rows = self.attribute_rows
 
         # Return dataframe of all attributes
-        return self._dataframe_of(attribute_names=[row.attribute.name for row in unique_value_rows],
-                                  attribute_pks=[row.attribute.pk for row in unique_value_rows],
+        return self._dataframe_of(attribute_names=[str(row.name) for row in attribute_rows],
+                                  attribute_pks=[int(row.pk) for row in attribute_rows],
                                   include_blobs=True, include_bulk=False)
 
     def _get_entity(self, row: EntityTable) -> Entity:
@@ -882,10 +898,10 @@ class EntityCollection:
 
         # Re-open session in worker
         if isinstance(entity, list):
-            entity[0].analysis.open_session()
+            entity[0].analysis.open_session(pool_size=1)
             close_session = entity[0].analysis.close_session
         else:
-            entity.analysis.open_session()
+            entity.analysis.open_session(pool_size=1)
             close_session = entity.analysis.close_session
 
         # Run function on entity
@@ -944,4 +960,3 @@ class PhaseCollection(EntityCollection):
 
 if __name__ == '__main__':
     pass
-

@@ -2,7 +2,8 @@ import pickle
 from datetime import date, datetime
 from typing import List
 
-from sqlalchemy import Index, ForeignKey, event, Engine
+from sqlalchemy import Index, ForeignKey, String, event, Engine
+from sqlalchemy.dialects.mysql import MEDIUMBLOB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 __all__ = ['SQLBase', 'EntityTable', 'AttributeBlobTable',
@@ -11,14 +12,14 @@ __all__ = ['SQLBase', 'EntityTable', 'AttributeBlobTable',
 
 
 # Set WAL
-@event.listens_for(Engine, 'connect')
-def set_sqlite_pragma(dbapi_connection, connection_record):
-    cursor = dbapi_connection.cursor()
-    # print('Set timeout and WAL')
-    cursor.execute('PRAGMA journal_mode=WAL;')
-    cursor.execute('PRAGMA synchronous = NORMAL;')
-    cursor.execute('PRAGMA busy_timeout=30000;')
-    cursor.close()
+# @event.listens_for(Engine, 'connect')
+# def set_sqlite_pragma(dbapi_connection, connection_record):
+#     cursor = dbapi_connection.cursor()
+#     # print('Set timeout and WAL')
+#     cursor.execute('PRAGMA journal_mode=WAL;')
+#     cursor.execute('PRAGMA synchronous = NORMAL;')
+#     cursor.execute('PRAGMA busy_timeout=30000;')
+#     cursor.close()
 
 
 class SQLBase(DeclarativeBase):
@@ -34,7 +35,7 @@ class EntityTable:
 class AnimalTable(EntityTable, SQLBase):
     __tablename__ = 'animals'
 
-    id: Mapped[str] = mapped_column(unique=True)
+    id: Mapped[str] = mapped_column(String(500), unique=True)
 
     recordings: Mapped[List['RecordingTable']] = relationship('RecordingTable', back_populates='parent')
     attributes: Mapped[List['AnimalValueTable']] = relationship('AnimalValueTable', back_populates='entity')
@@ -48,7 +49,7 @@ class RecordingTable(EntityTable, SQLBase):
     pk: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     parent_pk: Mapped[int] = mapped_column(ForeignKey('animals.pk'))
 
-    id: Mapped[str]
+    id: Mapped[str] = mapped_column(String(500))
     date: Mapped[date]
 
     parent: Mapped['AnimalTable'] = relationship('AnimalTable', back_populates='recordings')
@@ -107,7 +108,7 @@ class AttributeTable(SQLBase):
     __tablename__ = 'attributes'
     pk: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
 
-    name: Mapped[str] = mapped_column(unique=True)
+    name: Mapped[str] = mapped_column(String(500), unique=True)
 
     animal_values: Mapped[List['AnimalValueTable']] = relationship('AnimalValueTable', back_populates='attribute')
     recording_values: Mapped[List['RecordingValueTable']] = relationship('RecordingValueTable', back_populates='attribute')
@@ -119,7 +120,7 @@ class AttributeBlobTable(SQLBase):
     __tablename__ = 'attribute_blobs'
     pk: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
 
-    value: Mapped[bytes] = mapped_column(nullable=True)
+    value: Mapped[bytes] = mapped_column(MEDIUMBLOB, nullable=True)
 
 
 class AttributeValueTable:
@@ -132,14 +133,14 @@ class AttributeValueTable:
     value_blob_pk: Mapped[int]
     value_blob: Mapped['AttributeBlobTable']
 
-    value_str: Mapped[str] = mapped_column(nullable=True)
+    value_str: Mapped[str] = mapped_column(String(500), nullable=True)
     value_int: Mapped[int] = mapped_column(nullable=True)
     value_float: Mapped[float] = mapped_column(nullable=True)
     value_bool: Mapped[bool] = mapped_column(nullable=True)
     value_date: Mapped[date] = mapped_column(nullable=True)
     value_datetime: Mapped[datetime] = mapped_column(nullable=True)
-    value_path: Mapped[str] = mapped_column(nullable=True)
-    column_str: Mapped[str] = mapped_column(nullable=True)
+    value_path: Mapped[str] = mapped_column(String(500), nullable=True)
+    column_str: Mapped[str] = mapped_column(String(500), nullable=True)
 
     is_persistent: Mapped[bool] = mapped_column(nullable=True)
 
