@@ -15,6 +15,7 @@ from typing import Any, Callable, Dict, List, TYPE_CHECKING, Tuple, Type, Union
 import h5py
 import numpy as np
 import pandas as pd
+from sqlalchemy import text
 from sqlalchemy.orm import Query, aliased, joinedload
 from tqdm import tqdm
 
@@ -25,7 +26,8 @@ from caload import utils
 if TYPE_CHECKING:
     from caload.analysis import Analysis
 
-__all__ = ['EntityCollection', 'Animal', 'Recording', 'Roi', 'Phase']
+__all__ = ['Entity', 'Animal', 'Recording', 'Roi', 'Phase',
+           'EntityCollection', 'AnimalCollection', 'RecordingCollection', 'RoiCollection', 'PhaseCollection']
 
 
 class Entity:
@@ -34,6 +36,7 @@ class Entity:
     _row: Union[AnimalTable, RecordingTable, RoiTable, PhaseTable]
     _attribute_name_pk_map: Dict[str, int] = {}
 
+    entity_table: Union[Type[AnimalTable, RecordingTable, RoiTable, PhaseTable]]
     attr_value_table: Union[Type[AnimalValueTable, RecordingValueTable, RoiValueTable, PhaseValueTable]]
     # Keep references to parent table instances,
     # to avoid cold references during multiprocessing,
@@ -118,21 +121,26 @@ class Entity:
 
         # Get attribute name entry
         if key not in self._attribute_name_pk_map:
+
+            self.analysis.session.execute(text(f'CALL insert_attribute_name("{key}")'))
+
             query_name = self.analysis.session.query(AttributeTable).filter(AttributeTable.name == key)
-            if query_name.count() > 0:
-                attribute_row = query_name.first()
-            else:
-                try:
-                    attribute_row = AttributeTable(name=key)
-                    self.analysis.session.add(attribute_row)
-                    self.analysis.session.commit()
-                except Exception as _exc:
-                    # If insert fails, assume it was already added by concurrent process and re-query
-                    self.analysis.session.rollback()
-                    if query_name.count() == 0:
-                        print(f'Failed to add non-existent attribute name {key}, Traceback:')
-                        raise _exc
-                    attribute_row = query_name.first()
+            if query_name.count() == 0:
+                raise Exception(f'Attribute {key} does not exist')
+
+            attribute_row = query_name.first()
+
+            # try:
+            #     attribute_row = AttributeTable(name=key)
+            #     self.analysis.session.add(attribute_row)
+            #     self.analysis.session.commit()
+            # except Exception as _exc:
+            #     # If insert fails, assume it was already added by concurrent process and re-query
+            #     self.analysis.session.rollback()
+            #     if query_name.count() == 0:
+            #         print(f'Failed to add non-existent attribute name {key}, Traceback:')
+            #         raise _exc
+            #     attribute_row = query_name.first()
 
             # Add PK to map
             self._attribute_name_pk_map[key] = attribute_row.pk
@@ -337,6 +345,7 @@ class Entity:
 
 
 class Animal(Entity):
+    entity_table = AnimalTable
     attr_value_table = AnimalValueTable
 
     def __init__(self, *args, **kwargs):
@@ -390,6 +399,7 @@ class Animal(Entity):
 
 
 class Recording(Entity):
+    entity_table = RecordingTable
     attr_value_table = RecordingValueTable
 
     def __init__(self, *args, **kwargs):
@@ -458,6 +468,7 @@ class Recording(Entity):
 
 
 class Phase(Entity):
+    entity_table = PhaseTable
     attr_value_table = PhaseValueTable
 
     def __init__(self, *args, **kwargs):
@@ -541,6 +552,7 @@ class Phase(Entity):
 
 
 class Roi(Entity):
+    entity_table = RoiTable
     attr_value_table = RoiValueTable
 
     def __init__(self, *args, **kwargs):
@@ -625,12 +637,12 @@ class Roi(Entity):
 
 class EntityCollection:
     analysis: Analysis
-    _entity_type: Type[Entity]
+    _entity_type: Type[Animal, Recording, Roi, Phase]
     _query: Query
     _iteration_count: int = -1
     _batch_offset: int = 0
     _batch_size: int = 100
-    _batch_results: List[EntityTable]
+    _batch_results: List[AnimalTable, RecordingTable, RoiTable, PhaseTable]
 
     def __init__(self, analysis: Analysis, query: Query):
         self.analysis = analysis
@@ -782,10 +794,17 @@ class EntityCollection:
 
         return pd.concat(cols, axis=1)
 
+    def where(self, *expr) -> EntityCollection:
+        query = caload.filter.get_entity_query_by_attributes(self._entity_type, self.analysis.session,
+                                                             ' AND '.join(expr), entity_query=self.query)
+
+        return self.__class__(analysis=self.analysis, query=query)
+
     @property
     def attribute_rows(self):
         unique_attr_query = (self.analysis.session.query(self._entity_type.attr_value_table.attribute_pk)
-                             .filter(self._entity_type.attr_value_table.entity_pk.in_(self.query.subquery().primary_key))
+                             .filter(
+            self._entity_type.attr_value_table.entity_pk.in_(self.query.subquery().primary_key))
                              .group_by(self._entity_type.attr_value_table.attribute_pk))
 
         return (self.analysis.session.query(AttributeTable)
@@ -921,8 +940,8 @@ class AnimalCollection(EntityCollection):
     def _get_entity(self, row: AnimalTable) -> Animal:
         return super()._get_entity(row)
 
-    def where(self, *attr_filters):
-        return self.analysis.animals(*attr_filters, entity_query=self.query)
+    # def where(self, *attr_filters):
+    #     return self.analysis.animals(*attr_filters, entity_query=self.query)
 
 
 class RecordingCollection(EntityCollection):
@@ -931,8 +950,8 @@ class RecordingCollection(EntityCollection):
     def _get_entity(self, row: RecordingTable) -> Recording:
         return super()._get_entity(row)
 
-    def where(self, *attr_filters):
-        return self.analysis.recordings(*attr_filters, entity_query=self.query)
+    # def where(self, *attr_filters):
+    #     return self.analysis.recordings(*attr_filters, entity_query=self.query)
 
 
 class RoiCollection(EntityCollection):
@@ -941,11 +960,8 @@ class RoiCollection(EntityCollection):
     def _get_entity(self, row: RoiTable) -> Roi:
         return super()._get_entity(row)
 
-    def __getitem__(self, item) -> Union[Roi, List[Roi], pd.DataFrame]:
-        return super().__getitem__(item)
-
-    def where(self, *attr_filters):
-        return self.analysis.rois(*attr_filters, entity_query=self.query)
+    # def where(self, *attr_filters):
+    #     return self.analysis.rois(*attr_filters, entity_query=self.query)
 
 
 class PhaseCollection(EntityCollection):
@@ -954,8 +970,8 @@ class PhaseCollection(EntityCollection):
     def _get_entity(self, row: PhaseTable) -> Phase:
         return super()._get_entity(row)
 
-    def where(self, *attr_filters):
-        return self.analysis.phases(*attr_filters, entity_query=self.query)
+    # def where(self, *attr_filters):
+    #     return self.analysis.phases(*attr_filters, entity_query=self.query)
 
 
 if __name__ == '__main__':

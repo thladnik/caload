@@ -2,24 +2,13 @@ import pickle
 from datetime import date, datetime
 from typing import List
 
-from sqlalchemy import Index, ForeignKey, String, event, Engine
+from sqlalchemy import Index, ForeignKey, String
 from sqlalchemy.dialects.mysql import MEDIUMBLOB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 __all__ = ['SQLBase', 'EntityTable', 'AttributeBlobTable',
            'AttributeTable', 'AnimalTable', 'RecordingTable', 'RoiTable', 'PhaseTable',
            'AttributeValueTable', 'AnimalValueTable', 'RecordingValueTable', 'RoiValueTable', 'PhaseValueTable']
-
-
-# Set WAL
-# @event.listens_for(Engine, 'connect')
-# def set_sqlite_pragma(dbapi_connection, connection_record):
-#     cursor = dbapi_connection.cursor()
-#     # print('Set timeout and WAL')
-#     cursor.execute('PRAGMA journal_mode=WAL;')
-#     cursor.execute('PRAGMA synchronous = NORMAL;')
-#     cursor.execute('PRAGMA busy_timeout=30000;')
-#     cursor.close()
 
 
 class SQLBase(DeclarativeBase):
@@ -225,14 +214,4 @@ class RoiValueTable(AttributeValueTable, SQLBase):
 
 
 if __name__ == '__main__':
-    from sqlalchemy import create_engine
-    from sqlalchemy.orm import Session
-
-    # Create engine
-    engine = create_engine('sqlite:///test.db')
-    SQLBase.metadata.create_all(engine)
-
-    # Create a session
-    session = Session(engine)
-
-    session.close()
+    pass

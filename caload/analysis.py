@@ -2,32 +2,25 @@ from __future__ import annotations
 
 import logging
 import os
-import shutil
 import sys
-from datetime import date, datetime
+from datetime import date
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Type, Union
+from typing import Any, Dict, List, Tuple, Union
 
 import h5py
 import numpy as np
 import scipy
 import tifffile
 import yaml
-from sqlalchemy import Engine, create_engine, and_, text
-from sqlalchemy.orm import Query, Session, aliased
-from sqlalchemy.schema import CreateSchema
+from sqlalchemy import Engine, create_engine, text
+from sqlalchemy.orm import Session
 from tqdm import tqdm
 
 import caload
-from caload import utils
-from caload.entities import Animal, Recording, Roi, Phase, \
-    AnimalCollection, RecordingCollection, RoiCollection, PhaseCollection
-from caload.sqltables import AnimalValueTable, AttributeTable, PhaseValueTable, RecordingValueTable, RoiValueTable, \
-    SQLBase, \
-    AnimalTable, RecordingTable, \
-    RoiTable, \
-    PhaseTable
+from caload.entities import *
+from caload.filter import *
+from caload.sqltables import *
 
 __all__ = ['Analysis', 'Mode', 'open_analysis']
 
@@ -49,68 +42,84 @@ def create_analysis(analysis_path: str, data_root: str,
     analysis_path = Path(analysis_path).as_posix()
 
     if os.path.exists(analysis_path):
-        print(f'Open existing analysis at {analysis_path}')
-        analysis = open_analysis(analysis_path, mode=Mode.create, **kwargs)
+        raise FileExistsError(f'Analysis path {analysis_path} already exists')
 
-    else:
+    # Get connection parameters
 
-        # Get connection parameters
+    if dbhost is None:
+        dbname = input(f'MySQL host name [default: "localhost"]: ')
+        if dbname == '':
+            dbname = 'localhost'
 
-        if dbhost is None:
-            dbname = input(f'MySQL host name [default: "localhost"]: ')
-            if dbname == '':
-                dbname = 'localhost'
+    if dbname is None:
+        default_dbname = analysis_path.split('/')[-1]
+        dbname = input(f'New schema name on host "{dbhost}" [default: "{default_dbname}"]: ')
+        if dbname == '':
+            dbname = default_dbname
 
-        if dbname is None:
-            default_dbname = analysis_path.split('/')[-1]
-            dbname = input(f'New schema name on host "{dbhost}" [default: "{default_dbname}"]: ')
-            if dbname == '':
-                dbname = default_dbname
+    if dbuser is None:
+        dbuser = input(f'User name for schema "{dbname}" [default: caload_user]: ')
+        if dbuser == '':
+            dbuser = 'caload_user'
 
-        if dbuser is None:
-            dbuser = input(f'User name for schema "{dbname}" [default: caload_user]: ')
-            if dbuser == '':
-                dbuser = 'caload_user'
+    if dbpassword is None:
+        import getpass
+        dbpassword = getpass.getpass(f'Password for user {dbuser}: ')
 
-        if dbpassword is None:
-            import getpass
-            dbpassword = getpass.getpass(f'Password for user {dbuser}: ')
+    # Set bulk format type
+    if bulk_format is None:
+        bulk_format = caload.default_bulk_format
 
-        # Set bulk format type
-        if bulk_format is None:
-            bulk_format = caload.default_bulk_format
+    # Set max blob size
+    if max_blob_size is None:
+        max_blob_size = caload.default_max_blob_size
 
-        # Set max blob size
-        if max_blob_size is None:
-            max_blob_size = caload.default_max_blob_size
+    # Create schema
+    engine = create_engine(f'mysql+pymysql://{dbuser}:{dbpassword}@{dbhost}')
+    with engine.connect() as connection:
+        connection.execute(text(f'CREATE SCHEMA IF NOT EXISTS {dbname}'))
+    engine.dispose()
 
-        # Create schema
-        engine = create_engine(f'mysql+pymysql://{dbuser}:{dbpassword}@{dbhost}?charset=utf8mb4')
-        with engine.connect() as connection:
-            connection.execute(CreateSchema(dbname, if_not_exists=True))
-            connection.commit()
+    # Create engine for dbname
+    engine = create_engine(f'mysql+pymysql://{dbuser}:{dbpassword}@{dbhost}/{dbname}')
 
-        # Create analysis data folder
-        os.mkdir(analysis_path)
+    # Create tables
+    SQLBase.metadata.create_all(engine)
 
-        # Set config data
-        config = {'dbhost': dbhost,
-                  'dbname': dbname,
-                  'dbuser': dbuser,
-                  'dbpassword': dbpassword,
-                  'bulk_format': bulk_format,
-                  'max_blob_size': max_blob_size,
-                  'compression': compression,
-                  'compression_opts': compression_opts,
-                  'shuffle_filter': shuffle_filter}
+    # Create procedures
+    with engine.connect() as connection:
+        connection.execute(text(
+            """
+            CREATE PROCEDURE insert_attribute_name(IN attribute_name VARCHAR(255))
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM attributes WHERE name = attribute_name) THEN
+                    INSERT INTO attributes (name) VALUES (attribute_name);
+                END IF;
+            END;
+            """))
 
-        # Create config file
-        with open(os.path.join(analysis_path, 'caload.yaml'), 'w') as f:
-            yaml.safe_dump(config, f)
+    # Create analysis data folder
+    os.mkdir(analysis_path)
 
-        # Create analysis
-        print(f'Create new analysis at {analysis_path}')
-        analysis = Analysis(analysis_path, mode=Mode.create, **kwargs)
+    # Set config data
+    config = {'data_root': data_root,
+              'dbhost': dbhost,
+              'dbname': dbname,
+              'dbuser': dbuser,
+              'dbpassword': dbpassword,
+              'bulk_format': bulk_format,
+              'max_blob_size': max_blob_size,
+              'compression': compression,
+              'compression_opts': compression_opts,
+              'shuffle_filter': shuffle_filter}
+
+    # Create config file
+    with open(os.path.join(analysis_path, 'caload.yaml'), 'w') as f:
+        yaml.safe_dump(config, f)
+
+    # Create analysis
+    print(f'Create new analysis at {analysis_path}')
+    analysis = Analysis(analysis_path, mode=Mode.create, **kwargs)
 
     # Scan for data folders
     recording_folders = scan_folder(data_root, [])
@@ -119,6 +128,18 @@ def create_analysis(analysis_path: str, data_root: str,
     digest_folder(recording_folders, analysis)
 
     return analysis
+
+
+def update_analysis(analysis_path: str, **kwargs):
+    print(f'Open existing analysis at {analysis_path}')
+
+    analysis = open_analysis(analysis_path, mode=Mode.create, **kwargs)
+
+    # Scan for data folders
+    recording_folders = scan_folder(analysis.config['data_root'], [])
+
+    # Start digesting recordings
+    digest_folder(recording_folders, analysis)
 
 
 def delete_analysis(analysis_path: str):
@@ -276,10 +297,7 @@ class Analysis:
 
         # Create engine
         connstr = f'{self.config["dbuser"]}:{self.config["dbpassword"]}@{self.config["dbhost"]}/{self.config["dbname"]}'
-        self.sql_engine = create_engine(f'mysql+pymysql://{connstr}?charset=utf8mb4',
-                                        echo=self.echo, pool_size=pool_size)
-
-        SQLBase.metadata.create_all(self.sql_engine)
+        self.sql_engine = create_engine(f'mysql+pymysql://{connstr}', echo=self.echo, pool_size=pool_size)
 
         # Create a session
         self.session = Session(self.sql_engine)
@@ -297,14 +315,18 @@ class Analysis:
         return Animal.create(analysis=self, animal_id=animal_id)
 
     def animals(self, *attr_filters, **kwargs) -> AnimalCollection:
-        query = _get_entity_query_by_attributes(self, AnimalTable, AnimalValueTable, *attr_filters, **kwargs)
+
+        # Concat expression
+        expr = ' AND '.join(attr_filters)
+
+        query = get_entity_query_by_attributes(Animal, self.session, expr, **kwargs)
 
         return AnimalCollection(analysis=self, query=query)
 
     def get_animal_by_id(self, animal_id: str = None) -> Union[Animal, None]:
 
         # Build query
-        query = _get_entity_query_by_ids(self, AnimalTable, animal_id=animal_id)
+        query = get_entity_query_by_ids(self, AnimalTable, animal_id=animal_id)
 
         # Return data
         if query.count() == 0:
@@ -314,7 +336,11 @@ class Analysis:
         raise Exception('This should not happen')
 
     def recordings(self, *attr_filters, **kwargs) -> RecordingCollection:
-        query = _get_entity_query_by_attributes(self, RecordingTable, RecordingValueTable, *attr_filters, **kwargs)
+
+        # Concat expression
+        expr = ' AND '.join(attr_filters)
+
+        query = get_entity_query_by_attributes(Recording, self.session, expr, **kwargs)
 
         return RecordingCollection(analysis=self, query=query)
 
@@ -322,8 +348,8 @@ class Analysis:
             -> Union[Recording, RecordingCollection, None]:
 
         # Build query
-        query = _get_entity_query_by_ids(self, RecordingTable, rec_id=rec_id,
-                                         rec_date=rec_date, animal_id=animal_id)
+        query = get_entity_query_by_ids(self, RecordingTable, rec_id=rec_id,
+                                        rec_date=rec_date, animal_id=animal_id)
 
         # Return data
         if query.count() == 0:
@@ -333,7 +359,11 @@ class Analysis:
         return RecordingCollection(analysis=self, query=query)
 
     def rois(self, *attr_filters, **kwargs) -> RoiCollection:
-        query = _get_entity_query_by_attributes(self, RoiTable, RoiValueTable, *attr_filters, **kwargs)
+
+        # Concat expression
+        expr = ' AND '.join(attr_filters)
+
+        query = get_entity_query_by_attributes(Roi, self.session, expr, **kwargs)
 
         return RoiCollection(analysis=self, query=query)
 
@@ -343,9 +373,9 @@ class Analysis:
             -> Union[Roi, RoiCollection, None]:
 
         # Build query
-        query = _get_entity_query_by_ids(self, RoiTable,
-                                         roi_id=roi_id, rec_id=rec_id,
-                                         rec_date=rec_date, animal_id=animal_id)
+        query = get_entity_query_by_ids(self, RoiTable,
+                                        roi_id=roi_id, rec_id=rec_id,
+                                        rec_date=rec_date, animal_id=animal_id)
 
         # Return data
         if query.count() == 0:
@@ -355,7 +385,11 @@ class Analysis:
         return RoiCollection(analysis=self, query=query)
 
     def phases(self, *attr_filters, **kwargs) -> PhaseCollection:
-        query = _get_entity_query_by_attributes(self, PhaseTable, PhaseValueTable, *attr_filters, **kwargs)
+
+        # Concat expression
+        expr = ' AND '.join(attr_filters)
+
+        query = get_entity_query_by_attributes(Phase, self.session, expr, **kwargs)
 
         return PhaseCollection(analysis=self, query=query)
 
@@ -365,9 +399,9 @@ class Analysis:
             -> Union[Phase, PhaseCollection, None]:
 
         # Build query
-        query = _get_entity_query_by_ids(self, PhaseTable,
-                                         phase_id=phase_id, rec_id=rec_id,
-                                         rec_date=rec_date, animal_id=animal_id)
+        query = get_entity_query_by_ids(self, PhaseTable,
+                                        phase_id=phase_id, rec_id=rec_id,
+                                        rec_date=rec_date, animal_id=animal_id)
 
         # Return data
         if query.count() == 0:
@@ -389,159 +423,6 @@ class Analysis:
             os.makedirs(temp_path, exist_ok=True)
 
         return temp_path
-
-
-def _get_entity_query_by_ids(analysis: Analysis,
-                             base_table: Type[AnimalTable, RecordingTable, RoiTable, PhaseTable],
-                             animal_id: str = None,
-                             rec_date: Union[str, date, datetime] = None,
-                             rec_id: str = None,
-                             roi_id: int = None,
-                             phase_id: int = None) -> Query:
-    # Convert date
-    rec_date = utils.parse_date(rec_date)
-
-    # Create query
-    query = analysis.session.query(base_table)
-
-    # Join parents and filter by ID
-    if base_table in (RoiTable, PhaseTable):
-        if rec_date is not None or rec_id is not None:
-            query = query.join(RecordingTable)
-
-        if rec_date is not None:
-            query = query.filter(RecordingTable.date == rec_date)
-        if rec_id is not None:
-            query = query.filter(RecordingTable.id == rec_id)
-
-    if base_table in (RecordingTable, RoiTable, PhaseTable) and animal_id is not None:
-        query = query.join(AnimalTable).filter(AnimalTable.id == animal_id)
-
-    # Filter bottom entities
-    if base_table == RoiTable and roi_id is not None:
-        query = query.filter(RoiTable.id == roi_id)
-    if base_table == PhaseTable and phase_id is not None:
-        query = query.filter(PhaseTable.id == phase_id)
-
-
-    # # Join parents and filter
-    # # if base_table != AnimalTable and animal_id is not None:
-    # # query = query.join(AnimalTable)
-    #
-    # if animal_id is not None:
-    #     query = query.filter(AnimalTable.id == animal_id)
-    #
-    # if base_table != RecordingTable and (rec_date is not None or rec_id is not None):
-    #     query = query.join(RecordingTable)
-    #
-    # if rec_date is not None:
-    #     query = query.filter(RecordingTable.date == rec_date)
-    # if rec_id is not None:
-    #     query = query.filter(RecordingTable.id == rec_id)
-    #
-    # # Filter bottom entities
-    # if roi_id is not None:
-    #     query = query.filter(RoiTable.id == roi_id)
-    #
-    # if phase_id is not None:
-    #     query = query.filter(PhaseTable.id == phase_id)
-
-    return query
-
-
-def _get_entity_query_by_attributes(analysis: Analysis,
-                                    base_table: Type[AnimalTable, RecordingTable, RoiTable, PhaseTable],
-                                    attr_value_table: Type[AnimalValueTable, RecordingValueTable, RoiValueTable, PhaseValueTable],
-                                    *attribute_filters: Tuple[Union[str, Tuple[str, str, Any]]],
-                                    entity_query: Query = None,
-                                    **equality_filters):
-
-    # Convert to list
-    attribute_filters = list(attribute_filters)
-
-    # Add kwargs as equality filters
-    for key, value in equality_filters.items():
-        attribute_filters.append(f'{key} == {value}')
-
-    # Create query
-    _query = analysis.session.query(base_table)
-
-    # If an entity query was provided, use it to query all entities where Entity.pk in (pk1, pk2, ...)
-    if entity_query is not None:
-        _subquery = entity_query.subquery().primary_key
-        _query = _query.filter(base_table.pk.in_(_subquery))
-
-    # Filter by attributes
-    for filt in attribute_filters:
-
-        # Parse filter
-        if isinstance(filt, tuple):
-            name, comp, value = filt
-
-        elif isinstance(filt, str):
-            name, comp, value = filt.split(' ')
-
-            cast_value = {'true': True, 'false': False}.get(value.lower(), None)
-            if cast_value is None:
-                for _type in (int, float):
-                    try:
-                        cast_value = _type(value)
-                    except:
-                        pass
-                    else:
-                        break
-
-            if cast_value is not None:
-                value = cast_value
-            # If no valid conversion, assume string is correct one
-
-        else:
-            raise Exception(f'Invalid filter argument {filt}')
-
-        # Create alias
-        _alias = aliased(attr_value_table)
-
-        if comp in ('has', 'hasnot'):
-            # Build subquery to filter attribute name
-            subquery = analysis.session.query(AttributeTable).filter(AttributeTable.name == name).subquery()
-            # Build WHERE clause based on attribute name subquery
-            if comp == 'has':
-                _query = _query.filter(subquery.c.pk == _alias.attribute_pk)
-            else:
-                _query = _query.filter(subquery.c.pk != _alias.attribute_pk)
-
-            # Skip rest
-            continue
-
-        # Determine value type
-        if isinstance(value, (bool, int, float, str, date, datetime)):
-            _aliased_value_field = getattr(_alias, f'value_{str(type(value).__name__)}')
-        else:
-            raise TypeError(f'Invalid type "{type(value)}" to filter for in attributes')
-
-        # Apply value filter
-        if comp == '<':
-            w1 = _aliased_value_field < value
-        elif comp == '<=':
-            w1 = _aliased_value_field <= value
-        elif comp == '==':
-            w1 = _aliased_value_field == value
-        elif comp == '>=':
-            w1 = _aliased_value_field >= value
-        elif comp == '>':
-            w1 = _aliased_value_field > value
-        else:
-            raise ValueError('Invalid filter format')
-
-        # Build subquery to filter attribute name
-        subquery = analysis.session.query(AttributeTable).filter(AttributeTable.name == name).subquery()
-        # Build WHERE clause based on attribute name subquery
-        w = and_(w1, subquery.c.pk == _alias.attribute_pk)
-
-        # Add to main query
-        _query = _query.join(_alias).filter(w)
-
-    return _query
 
 
 def _recording_id_from_path(path: Union[Path, str]) -> Tuple[str, str]:

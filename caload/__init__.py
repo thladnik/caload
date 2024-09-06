@@ -11,7 +11,7 @@ __email__ = 'tim.github@hladnik.de'
 __status__ = 'Development'
 
 
-__all__ = ['sqltables', 'entities', 'analysis', 'open_analysis', 'utils','s2p_autorun',
+__all__ = ['sqltables', 'entities', 'analysis', 'filter', 'open_analysis', 'utils','s2p_autorun',
            'less', 'lessequal', 'equal', 'greaterequal', 'greater', 'is_true', 'is_false']
 
 default_bulk_format = 'hdf5'
