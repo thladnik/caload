@@ -122,9 +122,18 @@ class Entity:
         # Get attribute name entry
         if key not in self._attribute_name_pk_map:
 
+            # Call procedure to add attribute name
             self.analysis.session.execute(text(f'CALL insert_attribute_name("{key}")'))
+            self.analysis.session.commit()
 
+            # Create query to check if
             query_name = self.analysis.session.query(AttributeTable).filter(AttributeTable.name == key)
+
+            # # Wait end check until timeout
+            # _t = time.perf_counter()
+            # while query_name.count() == 0 and time.perf_counter() < _t+1.:
+            #     time.sleep(1/1000)
+
             if query_name.count() == 0:
                 raise Exception(f'Attribute {key} does not exist')
 

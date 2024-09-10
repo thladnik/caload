@@ -14,7 +14,7 @@ import scipy
 import tifffile
 import yaml
 from sqlalchemy import Engine, create_engine, text
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Query, Session
 from tqdm import tqdm
 
 import caload
@@ -314,12 +314,18 @@ class Analysis:
     def add_animal(self, animal_id: str) -> Animal:
         return Animal.create(analysis=self, animal_id=animal_id)
 
-    def animals(self, *attr_filters, **kwargs) -> AnimalCollection:
+    def animals(self, *filter_expressions, entity_query: Query = None, **equalities) -> AnimalCollection:
+
+        # Add equality filters to filter expressions
+        for k, v in equalities.items():
+            filter_expressions = filter_expressions + (f'{k} == {v}',)
 
         # Concat expression
-        expr = ' AND '.join(attr_filters)
+        expr = ' AND '.join(filter_expressions)
 
-        query = get_entity_query_by_attributes(Animal, self.session, expr, **kwargs)
+        print(expr)
+
+        query = get_entity_query_by_attributes(Animal, self.session, expr, entity_query=entity_query)
 
         return AnimalCollection(analysis=self, query=query)
 
@@ -335,12 +341,16 @@ class Analysis:
             return Animal(analysis=self, row=query.first())
         raise Exception('This should not happen')
 
-    def recordings(self, *attr_filters, **kwargs) -> RecordingCollection:
+    def recordings(self, *filter_expressions, entity_query: Query = None, **equalities) -> RecordingCollection:
+
+        # Add equality filters to filter expressions
+        for k, v in equalities.items():
+            filter_expressions = filter_expressions + (f'{k} == {v}',)
 
         # Concat expression
-        expr = ' AND '.join(attr_filters)
+        expr = ' AND '.join(filter_expressions)
 
-        query = get_entity_query_by_attributes(Recording, self.session, expr, **kwargs)
+        query = get_entity_query_by_attributes(Recording, self.session, expr, entity_query=entity_query)
 
         return RecordingCollection(analysis=self, query=query)
 
@@ -358,12 +368,16 @@ class Analysis:
             return Recording(analysis=self, row=query.first())
         return RecordingCollection(analysis=self, query=query)
 
-    def rois(self, *attr_filters, **kwargs) -> RoiCollection:
+    def rois(self, *filter_expressions, entity_query: Query = None, **equalities) -> RoiCollection:
+
+        # Add equality filters to filter expressions
+        for k, v in equalities.items():
+            filter_expressions = filter_expressions + (f'{k} == {v}',)
 
         # Concat expression
-        expr = ' AND '.join(attr_filters)
+        expr = ' AND '.join(filter_expressions)
 
-        query = get_entity_query_by_attributes(Roi, self.session, expr, **kwargs)
+        query = get_entity_query_by_attributes(Roi, self.session, expr, entity_query=entity_query)
 
         return RoiCollection(analysis=self, query=query)
 
@@ -384,12 +398,16 @@ class Analysis:
             return Roi(analysis=self, row=query.first())
         return RoiCollection(analysis=self, query=query)
 
-    def phases(self, *attr_filters, **kwargs) -> PhaseCollection:
+    def phases(self, *filter_expressions, entity_query: Query = None, **equalities) -> PhaseCollection:
+
+        # Add equality filters to filter expressions
+        for k, v in equalities.items():
+            filter_expressions = filter_expressions + (f'{k} == {v}',)
 
         # Concat expression
-        expr = ' AND '.join(attr_filters)
+        expr = ' AND '.join(filter_expressions)
 
-        query = get_entity_query_by_attributes(Phase, self.session, expr, **kwargs)
+        query = get_entity_query_by_attributes(Phase, self.session, expr, entity_query=entity_query)
 
         return PhaseCollection(analysis=self, query=query)
 
@@ -501,7 +519,7 @@ def digest_folder(folder_list: List[str], analysis: caload.analysis.Analysis):
 
         # Check if animal exists
         animal_id = _animal_id_from_path(recording_path)
-        _animal_list = analysis.animals(animal_id=animal_id)
+        _animal_list = analysis.animals(f'animal_id == "{animal_id}"')
 
         if len(_animal_list) == 0:
             # Add new animal
@@ -518,7 +536,9 @@ def digest_folder(folder_list: List[str], analysis: caload.analysis.Analysis):
         # Expected recording folder format "<rec_date('YYYY-mm-dd')>_<rec_id>_*"
         rec_date, rec_id, *_ = _recording_id_from_path(recording_path)
         rec_date = caload.utils.parse_date(rec_date)
-        _recording_list = analysis.recordings(animal_id=animal.id, rec_date=rec_date, rec_id=rec_id)
+        _recording_list = analysis.recordings(f'animal_id == "{animal.id}"',
+                                              f'rec_date == {rec_date}',
+                                              f'rec_id == "{rec_id}"')
         # Add recording
         if len(_recording_list) > 0:
             print('Recording already exists. Skip')
