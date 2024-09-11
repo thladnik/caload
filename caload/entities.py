@@ -43,23 +43,6 @@ class Entity:
     # caused by lazy loading
     parents: List[EntityTable]
 
-    # def __new__(cls, *args, **kwargs):
-    #     """Implement entities as Singletons
-    #     """
-    #
-    #     row = kwargs.get('row')
-    #     entities = getattr(kwargs.get('analysis'), 'entities')
-    #
-    #     # Check if instance of entity already exists in this analysis
-    #     if cls.unique_identifier(row) in entities:
-    #         return entities[cls.unique_identifier(row)]
-    #
-    #     # If entity does not exist yet, create new one
-    #     new_entity = super(Entity, cls).__new__(cls)
-    #     entities[new_entity.unique_identifier(row)] = new_entity
-    #
-    #     return new_entity
-
     def __init__(self,
                  row,
                  analysis,
@@ -138,18 +121,6 @@ class Entity:
                 raise Exception(f'Attribute {key} does not exist')
 
             attribute_row = query_name.first()
-
-            # try:
-            #     attribute_row = AttributeTable(name=key)
-            #     self.analysis.session.add(attribute_row)
-            #     self.analysis.session.commit()
-            # except Exception as _exc:
-            #     # If insert fails, assume it was already added by concurrent process and re-query
-            #     self.analysis.session.rollback()
-            #     if query_name.count() == 0:
-            #         print(f'Failed to add non-existent attribute name {key}, Traceback:')
-            #         raise _exc
-            #     attribute_row = query_name.first()
 
             # Add PK to map
             self._attribute_name_pk_map[key] = attribute_row.pk
@@ -427,7 +398,7 @@ class Recording(Entity):
     @staticmethod
     def create(animal: Animal, rec_date: date, rec_id: str, analysis: Analysis):
         # Add row
-        row = RecordingTable(parent=animal.row, date=utils.parse_date(rec_date), id=rec_id)
+        row = RecordingTable(parent=animal.row, date=caload.utils.parse_date(rec_date), id=rec_id)
         analysis.session.add(row)
         analysis.session.commit()
 
