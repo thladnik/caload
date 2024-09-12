@@ -10,6 +10,7 @@ import time
 from abc import abstractmethod
 
 from datetime import datetime, date, timedelta
+from pathlib import Path
 from typing import Any, Callable, Dict, List, TYPE_CHECKING, Tuple, Type, Union
 
 import h5py
@@ -26,46 +27,40 @@ from caload import utils
 if TYPE_CHECKING:
     from caload.analysis import Analysis
 
-__all__ = ['Entity', 'Animal', 'Recording', 'Roi', 'Phase',
-           'EntityCollection', 'AnimalCollection', 'RecordingCollection', 'RoiCollection', 'PhaseCollection']
+__all__ = ['Entity', 'EntityCollection']
 
 
 class Entity:
+    _type: Type[Entity]
     _analysis: Analysis
-    _collection: EntityCollection
-    _row: Union[AnimalTable, RecordingTable, RoiTable, PhaseTable]
+    _row: EntityTable
+    entity_type_name: str
     _attribute_name_pk_map: Dict[str, int] = {}
 
-    entity_table: Union[Type[AnimalTable, RecordingTable, RoiTable, PhaseTable]]
-    attr_value_table: Union[Type[AnimalValueTable, RecordingValueTable, RoiValueTable, PhaseValueTable]]
     # Keep references to parent table instances,
     # to avoid cold references during multiprocessing,
     # caused by lazy loading
-    parents: List[EntityTable]
+    _parent_row: EntityTable
 
-    def __init__(self,
-                 row,
-                 analysis,
-                 collection=None):
+    def __init__(self, row: EntityTable, analysis: Analysis):
         self._analysis = analysis
         self._row = row
-        self._collection = collection
+        self.entity_type_name = row.entity_type.name
+        self._parent_row = row.parent
 
-        self.parents = []
+    def __repr__(self):
+        return f"{self.entity_type_name} entity(id='{self.row.id}', parent={self.parent})"
 
     def __contains__(self, item):
-        subquery = self.analysis.session.query(AttributeTable.pk).filter(AttributeTable.name == item).subquery()
-        value_query = (self.analysis.session.query(self.attr_value_table)
-                       .filter(self.attr_value_table.attribute_pk == subquery.c.pk)
-                       .filter(self.attr_value_table.entity_pk == self.row.pk))
+        # subquery = self.analysis.session.query(AttributeTable.pk).filter(AttributeTable.name == item).subquery()
+        value_query = (self.analysis.session.query(AttributeTable)
+                       .filter(AttributeTable.name == item, AttributeTable.entity_pk == self.row.pk))
         return value_query.count() > 0
 
     def __getitem__(self, item: str):
 
-        value_query = (self.analysis.session.query(self.attr_value_table)
-                       .join(AttributeTable)
-                       .filter(self.attr_value_table.entity_pk == self.row.pk)
-                       .filter(AttributeTable.name == item))
+        value_query = (self.analysis.session.query(AttributeTable)
+                       .filter(AttributeTable.name == item, AttributeTable.entity_pk == self.row.pk))
 
         if value_query.count() == 0:
             raise KeyError(f'Attribute {item} not found for entity {self}')
@@ -102,39 +97,12 @@ class Entity:
             # Convert to the corresponding Python built-in type using the item() method
             value = value.item()
 
-        # Get attribute name entry
-        if key not in self._attribute_name_pk_map:
-
-            # Call procedure to add attribute name
-            self.analysis.session.execute(text(f'CALL insert_attribute_name("{key}")'))
-            self.analysis.session.commit()
-
-            # Create query to check if
-            query_name = self.analysis.session.query(AttributeTable).filter(AttributeTable.name == key)
-
-            # # Wait end check until timeout
-            # _t = time.perf_counter()
-            # while query_name.count() == 0 and time.perf_counter() < _t+1.:
-            #     time.sleep(1/1000)
-
-            if query_name.count() == 0:
-                raise Exception(f'Attribute {key} does not exist')
-
-            attribute_row = query_name.first()
-
-            # Add PK to map
-            self._attribute_name_pk_map[key] = attribute_row.pk
-
-        attribute_row_pk = self._attribute_name_pk_map[key]
-
         value_row = None
         # Query attribute row if not in create mode
         if not self.analysis.is_create_mode:
             # Build query
-            value_query = (self.analysis.session.query(self.attr_value_table)
-                           .join(AttributeTable)
-                           .filter(self.attr_value_table.entity_pk == self.row.pk)
-                           .filter(AttributeTable.name == key))
+            value_query = (self.analysis.session.query(AttributeTable)
+                           .filter(AttributeTable.name == key, AttributeTable.entity_pk == self.row.pk))
 
             # Evaluate
             if value_query.count() == 1:
@@ -145,8 +113,7 @@ class Entity:
         # Create row if it doesn't exist yet
         value_row_is_new = False
         if value_row is None:
-            value_row = self.attr_value_table(entity_pk=self.row.pk, attribute_pk=attribute_row_pk,
-                                              is_persistent=self.analysis.is_create_mode)
+            value_row = AttributeTable(entity_pk=self.row.pk, name=key, is_persistent=self.analysis.is_create_mode)
             self.analysis.session.add(value_row)
             value_row_is_new = True
 
@@ -202,11 +169,6 @@ class Entity:
         if not self.analysis.is_create_mode:
             self.analysis.session.commit()
 
-    @classmethod
-    @abstractmethod
-    def unique_identifier(cls, row: Union[AnimalTable, RecordingTable, RoiTable, PhaseTable]) -> tuple:
-        pass
-
     def _write_hdf5(self, key: str, value: Any, data_path) -> str:
 
         # If not data_path is provided, generate it
@@ -261,7 +223,7 @@ class Entity:
 
         return data_path
 
-    def _write_asdf(self, key: str, value: Any, row: AttributeValueTable = None):
+    def _write_asdf(self, key: str, value: Any, row: AttributeTable = None):
         pass
 
     @property
@@ -294,14 +256,12 @@ class Entity:
             self[key] = value
 
     @property
-    @abstractmethod
     def parent(self):
-        pass
+        return Entity(row=self._parent_row, analysis=self.analysis)
 
     @property
-    @abstractmethod
     def path(self) -> str:
-        pass
+        return Path(os.path.join(self.analysis.analysis_path, 'entities', self.entity_type_name.lower())).as_posix()
 
     @property
     def row(self):
@@ -311,320 +271,30 @@ class Entity:
     def analysis(self) -> Analysis:
         return self._analysis
 
-    def _create_file(self):
-        entity_path = f'{self.analysis.analysis_path}/{self.path}'
+    def create_file(self):
+        entity_path = self.path
 
         # Create directoty of necessary
         if not os.path.exists(entity_path):
             os.makedirs(entity_path)
 
         # Create data file
-        path = f'{entity_path}/data.hdf5'
-        with h5py.File(path, 'w') as _:
-            pass
-
-
-class Animal(Entity):
-    entity_table = AnimalTable
-    attr_value_table = AnimalValueTable
-
-    def __init__(self, *args, **kwargs):
-        Entity.__init__(self, *args, **kwargs)
-
-    def __repr__(self):
-        return f"Animal(id='{self.id}')"
-
-    @classmethod
-    def unique_identifier(cls, row: AnimalTable) -> tuple:
-        return Animal.__name__, row.id
-
-    @staticmethod
-    def create(animal_id: str, analysis: Analysis):
-        # Add row
-        row = AnimalTable(id=animal_id)
-        analysis.session.add(row)
-        analysis.session.commit()
-
-        # Add entity
-        entity = Animal(row=row, analysis=analysis)
-        entity._create_file()
-        return entity
-
-    @property
-    def parent(self):
-        return None
-
-    @property
-    def path(self) -> str:
-        return f'animals/{self.id}'
-
-    @property
-    def id(self) -> str:
-        return self._row.id
-
-    def add_recording(self, *args, **kwargs) -> Recording:
-        return Recording.create(*args, animal=self, analysis=self.analysis, **kwargs)
-
-    @property
-    def recordings(self) -> RecordingCollection:
-        return self.analysis.get_recordings_by_id(animal_id=self.id)
-
-    @property
-    def rois(self) -> RoiCollection:
-        return self.analysis.get_rois_by_id(animal_id=self.id)
-
-    @property
-    def phases(self) -> PhaseCollection:
-        return self.analysis.get_phases_by_id(animal_id=self.id)
-
-
-class Recording(Entity):
-    entity_table = RecordingTable
-    attr_value_table = RecordingValueTable
-
-    def __init__(self, *args, **kwargs):
-        Entity.__init__(self, *args, **kwargs)
-        self.parents.append(self.row.parent)
-
-    def __repr__(self):
-        return f"Recording(id={self.id}, " \
-               f"rec_date='{self.rec_date}', " \
-               f"animal_id='{self.animal_id}')"
-
-    @classmethod
-    def unique_identifier(cls, row: RecordingTable) -> tuple:
-        return Recording.__name__, row.parent.id, row.date, row.id
-
-    @staticmethod
-    def create(animal: Animal, rec_date: date, rec_id: str, analysis: Analysis):
-        # Add row
-        row = RecordingTable(parent=animal.row, date=caload.utils.parse_date(rec_date), id=rec_id)
-        analysis.session.add(row)
-        analysis.session.commit()
-
-        # Add entity
-        entity = Recording(row=row, analysis=analysis)
-        entity._create_file()
-
-        return entity
-
-    def add_roi(self, *args, **kwargs) -> Roi:
-        return Roi.create(*args, recording=self, analysis=self.analysis, **kwargs)
-
-    def add_phase(self, *args, **kwargs) -> Phase:
-        return Phase.create(*args, recording=self, analysis=self.analysis, **kwargs)
-
-    @property
-    def rois(self) -> RoiCollection:
-        return self.analysis.get_rois_by_id(animal_id=self.animal_id, rec_id=self.id, rec_date=self.rec_date)
-
-    @property
-    def phases(self) -> PhaseCollection:
-        return self.analysis.get_phases_by_id(animal_id=self.animal_id, rec_id=self.id, rec_date=self.rec_date)
-
-    @property
-    def parent(self):
-        return self.animal
-
-    @property
-    def path(self) -> str:
-        return f'{self.parent.path}/recordings/{self.rec_date}_{self.id}'
-
-    @property
-    def id(self) -> str:
-        return self._row.id
-
-    @property
-    def rec_date(self) -> date:
-        return self._row.date
-
-    @property
-    def animal_id(self) -> str:
-        return self._row.parent.id
-
-    @property
-    def animal(self) -> Animal:
-        return Animal(analysis=self.analysis, row=self._row.parent)
-
-
-class Phase(Entity):
-    entity_table = PhaseTable
-    attr_value_table = PhaseValueTable
-
-    def __init__(self, *args, **kwargs):
-        Entity.__init__(self, *args, **kwargs)
-
-        self.parents.append(self.row.parent)
-        self.parents.append(self.row.parent.parent)
-
-        self.analysis.session.flush()
-
-    def __repr__(self):
-        return f"Phase(id={self.id}, " \
-               f"rec_date='{self.rec_date}', " \
-               f"rec_id='{self.rec_id}', " \
-               f"animal_id='{self.animal_id}')"
-
-    @classmethod
-    def unique_identifier(cls, row: PhaseTable) -> tuple:
-        return Phase.__name__, row.parent.parent.id, row.parent.id, row.parent.date, row.id
-
-    @staticmethod
-    def create(recording: Recording, phase_id: int, analysis: Analysis):
-        # Add row
-        row = PhaseTable(parent=recording.row, id=phase_id)
-        analysis.session.add(row)
-        # Immediately commit if not in create mode
-        if not analysis.is_create_mode:
-            analysis.session.commit()
-
-        # Add entity
-        entity = Phase(row=row, analysis=analysis)
-        entity._create_file()
-
-        return entity
-
-    @property
-    def parent(self):
-        return self.recording
-
-    @property
-    def path(self) -> str:
-        return f'{self.parent.path}/phases/{self.id}'
-
-    @property
-    def id(self) -> int:
-        return self._row.id
-
-    @property
-    def animal_id(self) -> str:
-        return self.parent.parent.id
-
-    @property
-    def rec_date(self) -> date:
-        return self.recording.rec_date
-
-    @property
-    def rec_id(self) -> str:
-        return self.recording.id
-
-    @property
-    def animal(self) -> Animal:
-        return Animal(analysis=self.analysis, row=self.row.parent.parent)
-
-    @property
-    def recording(self) -> Recording:
-        return Recording(analysis=self.analysis, row=self.row.parent)
-
-    def export_to(self, f: h5py.File):
-
-        with h5py.File(f'{self.analysis.analysis_path}/{self.path}/data.hdf5', 'r') as f2:
-            f2.copy(source='/', dest=f, name=self.path)
-
-        try:
-            f[self.path].attrs.update(self.scalar_attributes)
-        except:
-            for k, v in self.scalar_attributes.items():
-                try:
-                    f[self.path].attrs[k] = v
-                except:
-                    print(f'Failed to export scalar attribute {k} in {self} (type: {type(v)})')
-
-
-class Roi(Entity):
-    entity_table = RoiTable
-    attr_value_table = RoiValueTable
-
-    def __init__(self, *args, **kwargs):
-        Entity.__init__(self, *args, **kwargs)
-
-        self.parents.append(self.row.parent)
-        self.parents.append(self.row.parent.parent)
-
-        self.analysis.session.flush()
-
-    def __repr__(self):
-        return f"Roi(id={self.id}, " \
-               f"rec_date='{self.rec_date}', " \
-               f"rec_id='{self.rec_id}', " \
-               f"animal_id='{self.animal_id}')"
-
-    @classmethod
-    def unique_identifier(cls, row: RoiTable) -> tuple:
-        return Roi.__name__, row.parent.parent.id, row.parent.id, row.parent.date, row.id
-
-    @staticmethod
-    def create(recording: Recording, roi_id: int, analysis: Analysis):
-        # Add row
-        row = RoiTable(parent=recording.row, id=roi_id)
-        analysis.session.add(row)
-        # Immediately commit if not in create mode
-        if not analysis.is_create_mode:
-            analysis.session.commit()
-
-        # Add entity
-        entity = Roi(row=row, analysis=analysis)
-        entity._create_file()
-
-        return entity
-
-    @property
-    def path(self) -> str:
-        return f'{self.parent.path}/rois/{self.id}'
-
-    @property
-    def parent(self):
-        return self.recording
-
-    @property
-    def id(self) -> int:
-        return self._row.id
-
-    @property
-    def animal_id(self) -> str:
-        return self.animal.id
-
-    @property
-    def rec_date(self) -> date:
-        return self.recording.rec_date
-
-    @property
-    def rec_id(self) -> str:
-        return self.recording.id
-
-    @property
-    def animal(self) -> Animal:
-        return Animal(analysis=self.analysis, row=self.row.parent.parent)
-
-    @property
-    def recording(self) -> Recording:
-        return Recording(analysis=self.analysis, row=self.row.parent)
-
-    def export_to(self, f: h5py.File):
-
-        with h5py.File(f'{self.analysis.analysis_path}/{self.path}/data.hdf5', 'r') as f2:
-            f2.copy(source='/', dest=f, name=self.path)
-
-        try:
-            f[self.path].attrs.update(self.scalar_attributes)
-        except:
-            for k, v in self.scalar_attributes.items():
-                try:
-                    f[self.path].attrs[k] = v
-                except:
-                    print(f'Failed to export scalar attribute {k} in {self} (type: {type(v)})')
+        path = os.path.join(entity_path, 'data.hdf5')
+        if not os.path.exists(path):
+            with h5py.File(path, 'w') as _:
+                pass
 
 
 class EntityCollection:
     analysis: Analysis
-    _entity_type: Type[Animal, Recording, Roi, Phase]
     _query: Query
     _iteration_count: int = -1
     _batch_offset: int = 0
     _batch_size: int = 100
-    _batch_results: List[AnimalTable, RecordingTable, RoiTable, PhaseTable]
+    _batch_results: List[Entity]
 
-    def __init__(self, analysis: Analysis, query: Query):
+    def __init__(self, entity_type_name: str, analysis: Analysis, query: Query):
+        self.entity_type_name = entity_type_name
         self.analysis = analysis
         self._query = query
         self._query_custom_orderby = False
@@ -706,32 +376,22 @@ class EntityCollection:
 
         return self._query
 
-    def _column(self, attribute: Union[str, int], include_blobs: bool = False):
-
-        # If attribute is string, fetch corresponding primary key
-        if isinstance(attribute, str):
-            pk_query = self.analysis.session.query(AttributeTable.pk).filter(AttributeTable.name == attribute)
-
-            if pk_query.count() == 0:
-                raise KeyError(f'No attribute with name {attribute} found for {self}')
-            attribute_pk = pk_query.first().pk
-        else:
-            attribute_pk = attribute
+    def _column(self, attribute_name: str, include_blobs: bool = False):
 
         # Subquery on entity primary keys
         entity_query = self.query.subquery().primary_key
 
         # Query attribute values
-        value_query = (self.analysis.session.query(self._entity_type.attr_value_table)
-                       .filter(self._entity_type.attr_value_table.entity_pk.in_(entity_query))
-                       .filter(self._entity_type.attr_value_table.attribute_pk == attribute_pk))
+        value_query = (self.analysis.session.query(AttributeTable)
+                       .filter(AttributeTable.name == attribute_name)
+                       .filter(AttributeTable.entity_pk.in_(entity_query)))
 
         if include_blobs:
-            value_query = value_query.options(joinedload(self._entity_type.attr_value_table.value_blob))
+            value_query = value_query.options(joinedload(AttributeTable.value_blob))
 
         return value_query.all()
 
-    def _dataframe_of(self, attribute_names: List[str] = None, attribute_pks: List[int] = None,
+    def _dataframe_of(self, attribute_names: List[str] = None,
                       include_blobs: bool = False, include_bulk: bool = False) -> pd.DataFrame:
 
         # Add to excluded list
@@ -741,25 +401,12 @@ class EntityCollection:
         if not include_bulk:
             excluded.append('value_path')
 
-        # Prepare args
-        if attribute_pks is None:
-            attribute_pks = [None] * len(attribute_names)
-        elif attribute_names is None:
-            attribute_names = [None] * len(attribute_pks)
-
-        if attribute_pks is None or attribute_names is None:
-            raise ValueError('No attribute list specified')
-
         # Iterate through specified attributes
         cols = []
-        for attr_pk, attr_name in zip(attribute_pks, attribute_names):
+        for attr_name in attribute_names:
 
             # Fetch rows
-            rows = self._column(attr_name if attr_pk is None else attr_pk, include_blobs)
-
-            # If no attribute name was give, fetch it
-            if attr_name is None:
-                self.analysis.session.query(AttributeTable.name).filter(AttributeTable.pk == attr_pk)
+            rows = self._column(attr_name, include_blobs=include_blobs)
 
             # Get indices and data
             idcs = [v.entity_pk for v in rows if v.column_str not in excluded]
@@ -775,10 +422,10 @@ class EntityCollection:
         return pd.concat(cols, axis=1)
 
     def where(self, *expr) -> EntityCollection:
-        query = caload.filter.get_entity_query_by_attributes(self._entity_type, self.analysis.session,
+        query = caload.filter.get_entity_query_by_attributes(self.entity_type_name, self.analysis.session,
                                                              ' AND '.join(expr), entity_query=self.query)
 
-        return self.__class__(analysis=self.analysis, query=query)
+        return EntityCollection(self.entity_type_name, analysis=self.analysis, query=query)
 
     @property
     def attribute_rows(self):
@@ -928,45 +575,289 @@ class EntityCollection:
         return elapsed_time
 
 
-class AnimalCollection(EntityCollection):
-    _entity_type = Animal
+# class Animal(Entity):
+#     entity_table = AnimalTable
+#     attr_value_table = AnimalValueTable
+#
+#     def __init__(self, *args, **kwargs):
+#         Entity.__init__(self, *args, **kwargs)
+#
+#     def __repr__(self):
+#         return f"Animal(id='{self.id}')"
+#
+#     @classmethod
+#     def unique_identifier(cls, row: AnimalTable) -> tuple:
+#         return Animal.__name__, row.id
+#
+#     @staticmethod
+#     def create(animal_id: str, analysis: Analysis):
+#         # Add row
+#         row = AnimalTable(id=animal_id)
+#         analysis.session.add(row)
+#         analysis.session.commit()
+#
+#         # Add entity
+#         entity = Animal(row=row, analysis=analysis)
+#         entity._create_file()
+#         return entity
+#
+#     @property
+#     def parent(self):
+#         return None
+#
+#     @property
+#     def path(self) -> str:
+#         return f'animals/{self.id}'
+#
+#     @property
+#     def id(self) -> str:
+#         return self._row.id
+#
+#     def add_recording(self, *args, **kwargs) -> Recording:
+#         return Recording.create(*args, animal=self, analysis=self.analysis, **kwargs)
+#
+#     @property
+#     def recordings(self) -> RecordingCollection:
+#         return self.analysis.get_recordings_by_id(animal_id=self.id)
+#
+#     @property
+#     def rois(self) -> RoiCollection:
+#         return self.analysis.get_rois_by_id(animal_id=self.id)
+#
+#     @property
+#     def phases(self) -> PhaseCollection:
+#         return self.analysis.get_phases_by_id(animal_id=self.id)
+#
+#
+# class Recording(Entity):
+#     entity_table = RecordingTable
+#     attr_value_table = RecordingValueTable
+#
+#     def __init__(self, *args, **kwargs):
+#         Entity.__init__(self, *args, **kwargs)
+#         self.parents.append(self.row.parent)
+#
+#     def __repr__(self):
+#         return f"Recording(id={self.id}, " \
+#                f"rec_date='{self.rec_date}', " \
+#                f"animal_id='{self.animal_id}')"
+#
+#     @classmethod
+#     def unique_identifier(cls, row: RecordingTable) -> tuple:
+#         return Recording.__name__, row.parent.id, row.date, row.id
+#
+#     @staticmethod
+#     def create(animal: Animal, rec_date: date, rec_id: str, analysis: Analysis):
+#         # Add row
+#         row = RecordingTable(parent=animal.row, date=caload.utils.parse_date(rec_date), id=rec_id)
+#         analysis.session.add(row)
+#         analysis.session.commit()
+#
+#         # Add entity
+#         entity = Recording(row=row, analysis=analysis)
+#         entity._create_file()
+#
+#         return entity
+#
+#     def add_roi(self, *args, **kwargs) -> Roi:
+#         return Roi.create(*args, recording=self, analysis=self.analysis, **kwargs)
+#
+#     def add_phase(self, *args, **kwargs) -> Phase:
+#         return Phase.create(*args, recording=self, analysis=self.analysis, **kwargs)
+#
+#     @property
+#     def rois(self) -> RoiCollection:
+#         return self.analysis.get_rois_by_id(animal_id=self.animal_id, rec_id=self.id, rec_date=self.rec_date)
+#
+#     @property
+#     def phases(self) -> PhaseCollection:
+#         return self.analysis.get_phases_by_id(animal_id=self.animal_id, rec_id=self.id, rec_date=self.rec_date)
+#
+#     @property
+#     def parent(self):
+#         return self.animal
+#
+#     @property
+#     def path(self) -> str:
+#         return f'{self.parent.path}/recordings/{self.rec_date}_{self.id}'
+#
+#     @property
+#     def id(self) -> str:
+#         return self._row.id
+#
+#     @property
+#     def rec_date(self) -> date:
+#         return self._row.date
+#
+#     @property
+#     def animal_id(self) -> str:
+#         return self._row.parent.id
+#
+#     @property
+#     def animal(self) -> Animal:
+#         return Animal(analysis=self.analysis, row=self._row.parent)
+#
+#
+# class Phase(Entity):
+#     entity_table = PhaseTable
+#     attr_value_table = PhaseValueTable
+#
+#     def __init__(self, *args, **kwargs):
+#         Entity.__init__(self, *args, **kwargs)
+#
+#         self.parents.append(self.row.parent)
+#         self.parents.append(self.row.parent.parent)
+#
+#         self.analysis.session.flush()
+#
+#     def __repr__(self):
+#         return f"Phase(id={self.id}, " \
+#                f"rec_date='{self.rec_date}', " \
+#                f"rec_id='{self.rec_id}', " \
+#                f"animal_id='{self.animal_id}')"
+#
+#     @classmethod
+#     def unique_identifier(cls, row: PhaseTable) -> tuple:
+#         return Phase.__name__, row.parent.parent.id, row.parent.id, row.parent.date, row.id
+#
+#     @staticmethod
+#     def create(recording: Recording, phase_id: int, analysis: Analysis):
+#         # Add row
+#         row = PhaseTable(parent=recording.row, id=phase_id)
+#         analysis.session.add(row)
+#         # Immediately commit if not in create mode
+#         if not analysis.is_create_mode:
+#             analysis.session.commit()
+#
+#         # Add entity
+#         entity = Phase(row=row, analysis=analysis)
+#         entity._create_file()
+#
+#         return entity
+#
+#     @property
+#     def parent(self):
+#         return self.recording
+#
+#     @property
+#     def path(self) -> str:
+#         return f'{self.parent.path}/phases/{self.id}'
+#
+#     @property
+#     def id(self) -> int:
+#         return self._row.id
+#
+#     @property
+#     def animal_id(self) -> str:
+#         return self.parent.parent.id
+#
+#     @property
+#     def rec_date(self) -> date:
+#         return self.recording.rec_date
+#
+#     @property
+#     def rec_id(self) -> str:
+#         return self.recording.id
+#
+#     @property
+#     def animal(self) -> Animal:
+#         return Animal(analysis=self.analysis, row=self.row.parent.parent)
+#
+#     @property
+#     def recording(self) -> Recording:
+#         return Recording(analysis=self.analysis, row=self.row.parent)
+#
+#     def export_to(self, f: h5py.File):
+#
+#         with h5py.File(f'{self.analysis.analysis_path}/{self.path}/data.hdf5', 'r') as f2:
+#             f2.copy(source='/', dest=f, name=self.path)
+#
+#         try:
+#             f[self.path].attrs.update(self.scalar_attributes)
+#         except:
+#             for k, v in self.scalar_attributes.items():
+#                 try:
+#                     f[self.path].attrs[k] = v
+#                 except:
+#                     print(f'Failed to export scalar attribute {k} in {self} (type: {type(v)})')
+#
+#
+# class Roi(Entity):
+#     entity_table = RoiTable
+#     attr_value_table = RoiValueTable
+#
+#     def __init__(self, *args, **kwargs):
+#         Entity.__init__(self, *args, **kwargs)
+#
+#         self.parents.append(self.row.parent)
+#         self.parents.append(self.row.parent.parent)
+#
+#         self.analysis.session.flush()
+#
+#     def __repr__(self):
+#         return f"Roi(id={self.id}, " \
+#                f"rec_date='{self.rec_date}', " \
+#                f"rec_id='{self.rec_id}', " \
+#                f"animal_id='{self.animal_id}')"
+#
+#     @staticmethod
+#     def create(recording: Recording, roi_id: int, analysis: Analysis):
+#         # Add row
+#         row = RoiTable(parent=recording.row, id=roi_id)
+#         analysis.session.add(row)
+#         # Immediately commit if not in create mode
+#         if not analysis.is_create_mode:
+#             analysis.session.commit()
+#
+#         # Add entity
+#         entity = Roi(row=row, analysis=analysis)
+#         entity._create_file()
+#
+#         return entity
+#
+#     @property
+#     def path(self) -> str:
+#         return f'{self.parent.path}/rois/{self.id}'
+#
+#     @property
+#     def parent(self):
+#         return self.recording
+#
+#     @property
+#     def id(self) -> int:
+#         return self._row.id
+#
+#     @property
+#     def animal_id(self) -> str:
+#         return self.animal.id
+#
+#     @property
+#     def rec_date(self) -> date:
+#         return self.recording.rec_date
+#
+#     @property
+#     def rec_id(self) -> str:
+#         return self.recording.id
+#
+#     @property
+#     def animal(self) -> Animal:
+#         return Animal(analysis=self.analysis, row=self.row.parent.parent)
+#
+#     @property
+#     def recording(self) -> Recording:
+#         return Recording(analysis=self.analysis, row=self.row.parent)
+#
+#     def export_to(self, f: h5py.File):
+#
+#         with h5py.File(f'{self.analysis.analysis_path}/{self.path}/data.hdf5', 'r') as f2:
+#             f2.copy(source='/', dest=f, name=self.path)
+#
+#         try:
+#             f[self.path].attrs.update(self.scalar_attributes)
+#         except:
+#             for k, v in self.scalar_attributes.items():
+#                 try:
+#                     f[self.path].attrs[k] = v
+#                 except:
+#                     print(f'Failed to export scalar attribute {k} in {self} (type: {type(v)})')
 
-    def _get_entity(self, row: AnimalTable) -> Animal:
-        return super()._get_entity(row)
-
-    # def where(self, *attr_filters):
-    #     return self.analysis.animals(*attr_filters, entity_query=self.query)
-
-
-class RecordingCollection(EntityCollection):
-    _entity_type = Recording
-
-    def _get_entity(self, row: RecordingTable) -> Recording:
-        return super()._get_entity(row)
-
-    # def where(self, *attr_filters):
-    #     return self.analysis.recordings(*attr_filters, entity_query=self.query)
-
-
-class RoiCollection(EntityCollection):
-    _entity_type = Roi
-
-    def _get_entity(self, row: RoiTable) -> Roi:
-        return super()._get_entity(row)
-
-    # def where(self, *attr_filters):
-    #     return self.analysis.rois(*attr_filters, entity_query=self.query)
-
-
-class PhaseCollection(EntityCollection):
-    _entity_type = Phase
-
-    def _get_entity(self, row: PhaseTable) -> Phase:
-        return super()._get_entity(row)
-
-    # def where(self, *attr_filters):
-    #     return self.analysis.phases(*attr_filters, entity_query=self.query)
-
-
-if __name__ == '__main__':
-    pass

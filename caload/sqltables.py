@@ -2,13 +2,11 @@ import pickle
 from datetime import date, datetime
 from typing import List
 
-from sqlalchemy import Index, ForeignKey, String
+from sqlalchemy import Index, ForeignKey, String, create_engine
 from sqlalchemy.dialects.mysql import MEDIUMBLOB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
-__all__ = ['SQLBase', 'EntityTable', 'AttributeBlobTable',
-           'AttributeTable', 'AnimalTable', 'RecordingTable', 'RoiTable', 'PhaseTable',
-           'AttributeValueTable', 'AnimalValueTable', 'RecordingValueTable', 'RoiValueTable', 'PhaseValueTable']
+__all__ = ['SQLBase', 'EntityTypeTable', 'EntityTable', 'AttributeTable', 'AttributeBlobTable']
 
 
 class SQLBase(DeclarativeBase):
@@ -17,110 +15,55 @@ class SQLBase(DeclarativeBase):
 
 # Entities
 
-class EntityTable:
+class EntityTypeTable(SQLBase):
+    __tablename__ = 'entity_types'
+
     pk: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
 
+    name: Mapped[str] = mapped_column(String(500), unique=True)
 
-class AnimalTable(EntityTable, SQLBase):
-    __tablename__ = 'animals'
-
-    id: Mapped[str] = mapped_column(String(500), unique=True)
-
-    recordings: Mapped[List['RecordingTable']] = relationship('RecordingTable', back_populates='parent')
-    attributes: Mapped[List['AnimalValueTable']] = relationship('AnimalValueTable', back_populates='entity')
-
-    def __repr__(self):
-        return f"<Animal(id={self.id}')>"
+    entities: Mapped[List['EntityTable']] = relationship('EntityTable', back_populates='entity_type')
 
 
-class RecordingTable(EntityTable, SQLBase):
-    __tablename__ = 'recordings'
+class EntityTable(SQLBase):
+    __tablename__ = 'entities'
+
     pk: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    parent_pk: Mapped[int] = mapped_column(ForeignKey('animals.pk'))
+    entity_type_pk: Mapped[int] = mapped_column(ForeignKey('entity_types.pk'))
+    parent_pk: Mapped[int] = mapped_column(ForeignKey('entities.pk'), nullable=True)
 
     id: Mapped[str] = mapped_column(String(500))
-    date: Mapped[date]
 
-    parent: Mapped['AnimalTable'] = relationship('AnimalTable', back_populates='recordings')
-    rois: Mapped[List['RoiTable']] = relationship('RoiTable', back_populates='parent')
-    phases: Mapped[List['PhaseTable']] = relationship('PhaseTable', back_populates='parent')
-    attributes: Mapped[List['RecordingValueTable']] = relationship('RecordingValueTable', back_populates='entity')
+    # Many-to-One
+    entity_type: Mapped['EntityTypeTable'] = relationship('EntityTypeTable', back_populates='entities')
+    parent: Mapped['EntityTable'] = relationship('EntityTable', back_populates='children')
 
-    # Define partial unique index
+    # One-to-Many
+    children: Mapped[List['EntityTable']] = relationship('EntityTable', back_populates='parent')
+    attributes: Mapped[List['AttributeTable']] = relationship('AttributeTable', back_populates='entity')
+
     __table_args__ = (
-        Index('ix_unique_rec_id_per_animal_date', 'parent_pk', 'date', 'id', unique=True),
+        Index('ix_unique_id_per_parent_pk', 'parent_pk', 'id', unique=True),
     )
 
     def __repr__(self):
-        return f"<Recording(id={self.id}, animal={self.parent}, date={self.date})>"
-
-
-class RoiTable(EntityTable, SQLBase):
-    __tablename__ = 'rois'
-    pk: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    parent_pk: Mapped[int] = mapped_column(ForeignKey('recordings.pk'))
-
-    id: Mapped[int]
-
-    parent: Mapped['RecordingTable'] = relationship('RecordingTable', back_populates='rois')
-    attributes: Mapped[List['RoiValueTable']] = relationship('RoiValueTable', back_populates='entity')
-
-    __table_args__ = (
-        Index('ix_unique_roi_id_per_recording', 'parent_pk', 'id', unique=True),
-    )
-
-    def __repr__(self):
-        return f"<Roi(id={self.id}, recording={self.parent})>"
-
-
-class PhaseTable(EntityTable, SQLBase):
-    __tablename__ = 'phases'
-    pk: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    parent_pk: Mapped[int] = mapped_column(ForeignKey('recordings.pk'))
-
-    id: Mapped[int]
-
-    parent: Mapped['RecordingTable'] = relationship('RecordingTable', back_populates='phases')
-    attributes: Mapped[List['PhaseValueTable']] = relationship('PhaseValueTable', back_populates='entity')
-
-    __table_args__ = (
-        Index('ix_unique_phase_id_per_recording', 'parent_pk', 'id', unique=True),
-    )
-
-    def __repr__(self):
-        return f"<Phase(id={self.id}, recording={self.parent})>"
+        return f"<Entity(name={self.entity_type.name}, id={self.id}, animal={self.parent}, date={self.date})>"
 
 
 # Attributes
 
 class AttributeTable(SQLBase):
-    __tablename__ = 'attributes'
-    pk: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    __tablename__ = 'attribute_values'
 
+    entity_pk: Mapped[int] = mapped_column(ForeignKey('entities.pk'), primary_key=True)
+    entity: Mapped['EntityTable'] = relationship('EntityTable', back_populates='attributes')
+
+    # attribute_pk: Mapped[int] = mapped_column(ForeignKey('attributes.pk'), primary_key=True)
+    # attribute: Mapped['AttributeTable'] = relationship('AttributeTable', back_populates='attribute_values')
     name: Mapped[str] = mapped_column(String(500), unique=True)
 
-    animal_values: Mapped[List['AnimalValueTable']] = relationship('AnimalValueTable', back_populates='attribute')
-    recording_values: Mapped[List['RecordingValueTable']] = relationship('RecordingValueTable', back_populates='attribute')
-    phase_values: Mapped[List['PhaseValueTable']] = relationship('PhaseValueTable', back_populates='attribute')
-    roi_values: Mapped[List['RoiValueTable']] = relationship('RoiValueTable', back_populates='attribute')
-
-
-class AttributeBlobTable(SQLBase):
-    __tablename__ = 'attribute_blobs'
-    pk: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-
-    value: Mapped[bytes] = mapped_column(MEDIUMBLOB, nullable=True)
-
-
-class AttributeValueTable:
-    entity_pk: Mapped[int]
-    entity: Mapped
-
-    attribute_pk: Mapped[int]
-    attribute: Mapped
-
-    value_blob_pk: Mapped[int]
-    value_blob: Mapped['AttributeBlobTable']
+    value_blob_pk: Mapped[int] = mapped_column(ForeignKey('attribute_blobs.pk'), nullable=True)
+    value_blob: Mapped['AttributeBlobTable'] = relationship('AttributeBlobTable')
 
     value_str: Mapped[str] = mapped_column(String(500), nullable=True)
     value_int: Mapped[int] = mapped_column(nullable=True)
@@ -132,6 +75,10 @@ class AttributeValueTable:
     column_str: Mapped[str] = mapped_column(String(500), nullable=True)
 
     is_persistent: Mapped[bool] = mapped_column(nullable=True)
+
+    __table_args__ = (
+        Index('ix_name', 'name'),
+    )
 
     def __repr__(self):
         return f"<{self.__class__.__name__}({self.entity}, {self.attribute.name}, {self.value})>"
@@ -161,57 +108,16 @@ class AttributeValueTable:
         setattr(self, self.column_str, value)
 
 
-class AnimalValueTable(AttributeValueTable, SQLBase):
-    __tablename__ = 'animal_attributes'
+class AttributeBlobTable(SQLBase):
+    __tablename__ = 'attribute_blobs'
+    pk: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
 
-    entity_pk: Mapped[int] = mapped_column(ForeignKey('animals.pk'), primary_key=True)
-    entity: Mapped['AnimalTable'] = relationship('AnimalTable', back_populates='attributes')
-
-    attribute_pk: Mapped[int] = mapped_column(ForeignKey('attributes.pk'), primary_key=True)
-    attribute: Mapped['AttributeTable'] = relationship('AttributeTable', back_populates='animal_values')
-
-    value_blob_pk: Mapped[int] = mapped_column(ForeignKey('attribute_blobs.pk'), nullable=True)
-    value_blob: Mapped['AttributeBlobTable'] = relationship('AttributeBlobTable')
-
-
-class RecordingValueTable(AttributeValueTable, SQLBase):
-    __tablename__ = 'recording_attributes'
-
-    entity_pk: Mapped[int] = mapped_column(ForeignKey('recordings.pk'), primary_key=True)
-    entity: Mapped['RecordingTable'] = relationship('RecordingTable', back_populates='attributes')
-
-    attribute_pk: Mapped[int] = mapped_column(ForeignKey('attributes.pk'), primary_key=True)
-    attribute: Mapped['AttributeTable'] = relationship('AttributeTable', back_populates='recording_values')
-
-    value_blob_pk: Mapped[int] = mapped_column(ForeignKey('attribute_blobs.pk'), nullable=True)
-    value_blob: Mapped['AttributeBlobTable'] = relationship('AttributeBlobTable')
-
-
-class PhaseValueTable(AttributeValueTable, SQLBase):
-    __tablename__ = 'phase_attributes'
-
-    entity_pk: Mapped[int] = mapped_column(ForeignKey('phases.pk'), primary_key=True)
-    entity: Mapped['PhaseTable'] = relationship('PhaseTable', back_populates='attributes')
-
-    attribute_pk: Mapped[int] = mapped_column(ForeignKey('attributes.pk'), primary_key=True)
-    attribute: Mapped['AttributeTable'] = relationship('AttributeTable', back_populates='phase_values')
-
-    value_blob_pk: Mapped[int] = mapped_column(ForeignKey('attribute_blobs.pk'), nullable=True)
-    value_blob: Mapped['AttributeBlobTable'] = relationship('AttributeBlobTable')
-
-
-class RoiValueTable(AttributeValueTable, SQLBase):
-    __tablename__ = 'roi_attributes'
-
-    entity_pk: Mapped[int] = mapped_column(ForeignKey('rois.pk'), primary_key=True)
-    entity: Mapped['RoiTable'] = relationship('RoiTable', back_populates='attributes')
-
-    attribute_pk: Mapped[int] = mapped_column(ForeignKey('attributes.pk'), primary_key=True)
-    attribute: Mapped['AttributeTable'] = relationship('AttributeTable', back_populates='roi_values')
-
-    value_blob_pk: Mapped[int] = mapped_column(ForeignKey('attribute_blobs.pk'), nullable=True)
-    value_blob: Mapped['AttributeBlobTable'] = relationship('AttributeBlobTable')
+    value: Mapped[bytes] = mapped_column(MEDIUMBLOB, nullable=True)
 
 
 if __name__ == '__main__':
-    pass
+
+    engine = create_engine('mysql+pymysql://python_analysis:start123@localhost:3306/python_analysis')
+
+    SQLBase.metadata.create_all(engine)
+

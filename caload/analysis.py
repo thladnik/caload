@@ -6,7 +6,7 @@ import sys
 from datetime import date
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Dict, List, Tuple, Type, Union
 
 import h5py
 import numpy as np
@@ -218,7 +218,7 @@ class Analysis:
     write_timeout = 3.  # s
     lazy_init: bool
     echo: bool
-    entities: Dict[tuple, Union[Animal, Recording, Roi, Phase]]
+    _entity_type_pk_map: Dict[str, int]
 
     def __init__(self, path: str, mode: Mode = Mode.analyse, lazy_init: bool = False, echo: bool = False):
 
@@ -228,9 +228,6 @@ class Analysis:
 
         # Set path as posix
         self._analysis_path = Path(path).as_posix()
-
-        # Set up entity dictionary
-        self.entities = {}
 
         # Load config
         config_path = os.path.join(self.analysis_path, 'caload.yaml')
@@ -248,26 +245,20 @@ class Analysis:
         if not lazy_init:
             self.open_session()
 
-        # else:
-        #     if self.is_create_mode:
-        #         raise Exception('Cannot lazily initialize in create mode')
-        #
-        # # Preload all entities for fast lookup of existing entities during creation
-        # if self.is_create_mode:
-        #     for row in self.session.query(AnimalTable).all():
-        #         Animal(row=row, analysis=self)
-        #
-        #     for row in self.session.query(RecordingTable).all():
-        #         Recording(row=row, analysis=self)
-        #
-        #     for row in self.session.query(RoiTable).all():
-        #         Roi(row=row, analysis=self)
-        #
-        #     for row in self.session.query(PhaseTable).all():
-        #         Phase(row=row, analysis=self)
-
     def __repr__(self):
         return f"Analysis('{self.analysis_path}')"
+
+    def create_entity(self, _type: Type[Entity], _id: str, parent: Entity = None):
+        # Add row
+        row = EntityTable(parent=parent.row, entity_type_pk=self._entity_type_pk_map[_type.__name__], id=_id)
+        self.session.add(row)
+        self.session.commit()
+
+        # Add entity
+        entity = Entity(row=row, analysis=self)
+        entity.create_file()
+
+        return entity
 
     @property
     def analysis_path(self):
