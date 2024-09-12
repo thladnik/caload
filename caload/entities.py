@@ -818,6 +818,9 @@ class EntityCollection:
     #     pass
 
     def map(self, fun: Callable, **kwargs) -> Any:
+        """Sequentially apply a function to each Entity of the collection (kwargs are passed onto the function)
+        """
+
         print(f'Run function {fun.__name__} on {self} with args '
               f'{[f"{k}:{v}" for k, v in kwargs.items()]} on {len(self)} entities')
 
@@ -825,6 +828,14 @@ class EntityCollection:
             fun(entity, **kwargs)
 
     def map_async(self, fun: Callable, chunk_size: int = None, worker_num: int = None, **kwargs) -> Any:
+        """Concurrently apply a function to each Entity of the collection (kwargs are passed onto the function)
+
+        worker_num: int number of subprocess workers to spawn for parallel execution
+        chunk_size: int (optional) size of chunks for batched execution of function to decrease overhead
+            (note that for batch execution the first argument
+            of fun is going to be of type List[Entity] instead of Entity)
+        """
+
         print(f'Run function {fun.__name__} on {self} with args '
               f'{[f"{k}:{v}" for k, v in kwargs.items()]} on {len(self)} entities')
 
@@ -888,6 +899,9 @@ class EntityCollection:
 
     @staticmethod
     def worker_wrapper(args):
+        """Subprocess wrapper function for concurrent execution, which handles the MySQL session
+        and provides feedback on execution time to parent process
+        """
 
         start_time = time.perf_counter()
         # Unpack args
