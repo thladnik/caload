@@ -10,8 +10,9 @@ import time
 from abc import abstractmethod
 
 from datetime import datetime, date, timedelta
-from typing import Any, Callable, Dict, List, TYPE_CHECKING, Tuple, Type, Union
+from typing import Any, Callable, Dict, Iterable, List, TYPE_CHECKING, Tuple, Type, Union
 
+import cloudpickle
 import h5py
 import numpy as np
 import pandas as pd
@@ -97,9 +98,8 @@ class Entity:
 
     def __setitem__(self, key: str, value: Any):
 
-        # Find corresponding builtin python scalar type for numpy scalars and shape () arrays
-        if isinstance(value, np.generic) or (isinstance(value, np.ndarray) and np.squeeze(value).shape == ()):
-            # Convert to the corresponding Python built-in type using the item() method
+        # Find corresponding builtin python scalar type for numpy scalars
+        if isinstance(value, np.generic):
             value = value.item()
 
         # Get attribute name entry
@@ -184,8 +184,8 @@ class Entity:
             # Write any non-scalar data that is too large according to specified bulk storage format
             value = getattr(self, f'_write_{self.analysis.bulk_format}')(key, value, value_row.value)
 
-        # Create new blob row
-        if value_row_is_new and column_str == 'value_blob':
+        # Create new blob row if none exists
+        if column_str == 'value_blob' and value_row.value_blob is None:
             blob_row = AttributeBlobTable()
             self.analysis.session.add(blob_row)
             value_row.value_blob = blob_row
@@ -194,7 +194,12 @@ class Entity:
         if type(value_row.column_str) is str and value_row.column_str != column_str and value_row.value is not None:
             value_row.value = None
 
-        # Set row type and value
+            # TODO: check how this is handled in reality. By default, orphaned rows should be deleted
+            # # If value type was changed from blob to something else: delete old blod
+            # if value_row.column_str == 'value_blob' and column_str != 'value_blob':
+            #     self.analysis.session.delete(value_row.value_blob)
+
+        # Only now: Set row type and value
         value_row.column_str = column_str
         value_row.value = value
 
@@ -847,6 +852,8 @@ class EntityCollection:
                 worker_num = len(self)
         print(f'Start pool with {worker_num} workers')
 
+        print(f'Prepare entities')
+        t = time.perf_counter()
         kwargs = tuple([(k, v) for k, v in kwargs.items()])
         if chunk_size is None:
             worker_args = [(fun, e, kwargs) for e in self]
@@ -855,6 +862,7 @@ class EntityCollection:
             chunk_num = int(np.ceil(len(self) / chunk_size))
             worker_args = [(fun, self[i * chunk_size:(i + 1) * chunk_size], kwargs) for i in range(chunk_num)]
             print(f'Entity chunksize {chunk_size}')
+        print(f'> Preparation finished in {time.perf_counter()-t:.2f}s')
 
         # Close session first
         self.analysis.close_session()
@@ -864,7 +872,8 @@ class EntityCollection:
         start_time = time.time()
         formatted_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time))
         print(f'Start processing at {formatted_time}')
-        with mp.Pool(processes=worker_num) as pool:
+        with (mp.Pool(processes=worker_num) as pool,
+              tqdm(total=len(worker_args), desc='Processing', unit='iter', smoothing=0.) as pbar):
             iterator = pool.imap_unordered(self.worker_wrapper, worker_args)
             for iter_num in range(1, len(self) + 1):
 
@@ -883,13 +892,20 @@ class EntityCollection:
                 time_elapsed = time.time() - start_time
                 time_rest = time_per_entity * (len(self) - iter_num * chunk_size)
 
-                # Print timing info
-                sys.stdout.write('\r'
-                                 f'[{iter_num * chunk_size}/{len(self)}] '
-                                 f'{time_per_entity:.2f}s/iter '
-                                 f'- {timedelta(seconds=int(time_elapsed))}'
-                                 f'/{timedelta(seconds=int(time_elapsed + time_rest))} '
-                                 f'-> {timedelta(seconds=int(time_rest))} remaining ')
+                pbar.update(chunk_size)
+                pbar.set_postfix({
+                    'time_per_iter': f'{time_per_entity:.2f}s',
+                    'elapsed': str(timedelta(seconds=int(time_elapsed))),
+                    'eta': str(timedelta(seconds=int(time_rest))),
+                })
+
+                # # Print timing info
+                # sys.stdout.write('\r'
+                #                  f'[{iter_num * chunk_size}/{len(self)}] '
+                #                  f'{time_per_entity:.2f}s/iter '
+                #                  f'- {timedelta(seconds=int(time_elapsed))}'
+                #                  f'/{timedelta(seconds=int(time_elapsed + time_rest))} '
+                #                  f'-> {timedelta(seconds=int(time_rest))} remaining ')
 
         formatted_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
         print(f'\nFinish processing at {formatted_time}')
@@ -911,10 +927,10 @@ class EntityCollection:
 
         # Re-open session in worker
         if isinstance(entity, list):
-            entity[0].analysis.open_session(pool_size=1)
+            entity[0].analysis.open_session(pool_size=1, echo=False)
             close_session = entity[0].analysis.close_session
         else:
-            entity.analysis.open_session(pool_size=1)
+            entity.analysis.open_session(pool_size=1, echo=False)
             close_session = entity.analysis.close_session
 
         # Run function on entity
@@ -926,6 +942,36 @@ class EntityCollection:
         elapsed_time = time.perf_counter() - start_time
 
         return elapsed_time
+
+    def create_task(self, fun: Callable, **kwargs):
+
+        print(f'Create new task for {fun.__name__} with args '
+              f'{[f"{k}:{v}" for k, v in kwargs.items()]} on {len(self)} entities')
+
+        funstr = cloudpickle.dumps(fun)
+        argstr = cloudpickle.dumps(kwargs)
+
+        task_row = TaskTable(target_fun=funstr, target_args=argstr)
+        self.analysis.session.add(task_row)
+        self.analysis.session.commit()
+
+        for entity in self:
+
+            if isinstance(entity, Animal):
+                _id = {'animal_pk': entity.row.pk}
+            elif isinstance(entity, Recording):
+                _id = {'recording_pk': entity.row.pk}
+            elif isinstance(entity, Roi):
+                _id = {'roi_pk': entity.row.pk}
+            elif isinstance(entity, Phase):
+                _id = {'phase_pk': entity.row.pk}
+            else:
+                raise ValueError(f'What is a {entity}?')
+
+            # Add to task
+            self.analysis.session.add(TaskedEntityTable(task_pk=task_row.pk, **_id))
+
+        self.analysis.session.commit()
 
 
 class AnimalCollection(EntityCollection):

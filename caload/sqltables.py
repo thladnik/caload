@@ -8,7 +8,8 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 __all__ = ['SQLBase', 'EntityTable', 'AttributeBlobTable',
            'AttributeTable', 'AnimalTable', 'RecordingTable', 'RoiTable', 'PhaseTable',
-           'AttributeValueTable', 'AnimalValueTable', 'RecordingValueTable', 'RoiValueTable', 'PhaseValueTable']
+           'AttributeValueTable', 'AnimalValueTable', 'RecordingValueTable', 'RoiValueTable', 'PhaseValueTable',
+           'TaskTable', 'TaskedEntityTable']
 
 
 class SQLBase(DeclarativeBase):
@@ -211,6 +212,35 @@ class RoiValueTable(AttributeValueTable, SQLBase):
 
     value_blob_pk: Mapped[int] = mapped_column(ForeignKey('attribute_blobs.pk'), nullable=True)
     value_blob: Mapped['AttributeBlobTable'] = relationship('AttributeBlobTable')
+
+
+class TaskTable(SQLBase):
+    __tablename__ = 'tasks'
+
+    pk: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+
+    target_fun: Mapped[bytes] = mapped_column(MEDIUMBLOB, nullable=True)
+    target_args: Mapped[bytes] = mapped_column(MEDIUMBLOB, nullable=True)
+
+    status: Mapped[int] = mapped_column(nullable=False, default=0)  # 0: pending, 1: finished
+
+
+class TaskedEntityTable(SQLBase):
+    __tablename__ = 'tasked_entities'
+
+    pk: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    task_pk: Mapped[int] = mapped_column(ForeignKey('tasks.pk'))
+
+    animal_pk: Mapped[int] = mapped_column(ForeignKey('animals.pk'), nullable=True)
+    recording_pk: Mapped[int] = mapped_column(ForeignKey('recordings.pk'), nullable=True)
+    roi_pk: Mapped[int] = mapped_column(ForeignKey('rois.pk'), nullable=True)
+    phase_pk: Mapped[int] = mapped_column(ForeignKey('phases.pk'), nullable=True)
+
+    status: Mapped[int] = mapped_column(nullable=False, default=0)  # 0: pending, 1: acquired, 2: finished
+
+    @property
+    def entity_pk(self):
+        return self.animal_pk or self.recording_pk or self.roi_pk or self.phase_pk
 
 
 if __name__ == '__main__':

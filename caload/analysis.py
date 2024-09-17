@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-import logging
-import os
-import sys
 from datetime import date
 from enum import Enum
+import logging
+import multiprocessing as mp
+import os
 from pathlib import Path
+import sys
 from typing import Any, Dict, List, Tuple, Union
 
+import cloudpickle
 import h5py
 import numpy as np
 import scipy
@@ -293,11 +295,14 @@ class Analysis:
     def shuffle_filter(self) -> Any:
         return self.config['shuffle_filter']
 
-    def open_session(self, pool_size: int = 20):
+    def open_session(self, pool_size: int = 20, echo: bool = None):
+
+        if echo is None:
+            echo = self.echo
 
         # Create engine
         connstr = f'{self.config["dbuser"]}:{self.config["dbpassword"]}@{self.config["dbhost"]}/{self.config["dbname"]}'
-        self.sql_engine = create_engine(f'mysql+pymysql://{connstr}', echo=self.echo, pool_size=pool_size)
+        self.sql_engine = create_engine(f'mysql+pymysql://{connstr}', echo=echo, pool_size=pool_size)
 
         # Create a session
         self.session = Session(self.sql_engine)
@@ -441,6 +446,71 @@ class Analysis:
             os.makedirs(temp_path, exist_ok=True)
 
         return temp_path
+
+    def process_tasks(self, batch_size: int = 500):
+
+        query_task = self.session.query(TaskTable).filter(TaskTable.status != 1).order_by('pk')
+
+        while query_task.count() > 0:
+
+            # Fetch first unfinished task
+            task_row = query_task.first()
+
+            # Continue while there are tasked entities left
+            while True:
+
+                # Query to fetch and lock first <batch_size> pending rows
+                tasked_entity_query = (self.session.query(TaskedEntityTable).with_for_update()
+                                       .filter(TaskedEntityTable.task_pk == task_row.pk)
+                                       .filter(TaskedEntityTable.status == 0).limit(batch_size))
+
+                # If no rows are left, break loop
+                if tasked_entity_query.count() == 0:
+                    break
+
+                # Get a batch of rows
+                tasked_entity_rows = tasked_entity_query.all()
+
+                # Set status to acquired and add entity PKs to list
+                entity_pks = []
+                for row in tasked_entity_rows:
+                    row.status = 1
+                    entity_pks.append(row.entity_pk)
+
+                # Commit changes
+                self.session.commit()
+
+                # Get function and parameters for processing
+                fun, kwargs = cloudpickle.loads(task_row.target_fun), cloudpickle.loads(task_row.target_args)
+
+                # TODO: adapt this for other entities
+                # Create entity collection from PKs
+                entity_collection = RoiCollection(analysis=self, query=self.session.query(RoiTable).filter(RoiTable.pk.in_(entity_pks)))
+
+                # Map function to collection
+                try:
+                    entity_collection.map_async(fun, **kwargs)
+
+                except Exception as e:
+                    # If errors were encountered, rollback all to status pending
+                    # TODO: adapt this for other entities
+                    for row in self.session.query(TaskedEntityTable).filter(TaskedEntityTable.roi_pk.in_(entity_pks)).all():
+                        row.status = 0  # pending
+                    self.session.commit()
+
+                    # Raise original error
+                    raise e
+
+                else:
+                    # If no errors were encountered, set all tasked entity rows to finished
+                    # TODO: adapt this for other entities
+                    for row in self.session.query(TaskedEntityTable).filter(TaskedEntityTable.roi_pk.in_(entity_pks)).all():
+                        row.status = 2  # finished
+                    self.session.commit()
+
+            # Set task to finished
+            task_row.status = 1
+            self.session.commit()
 
 
 def _recording_id_from_path(path: Union[Path, str]) -> Tuple[str, str]:
