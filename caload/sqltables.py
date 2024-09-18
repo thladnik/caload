@@ -98,7 +98,7 @@ class AttributeTable(SQLBase):
     __tablename__ = 'attributes'
     pk: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
 
-    name: Mapped[str] = mapped_column(String(500), unique=True)
+    name: Mapped[str] = mapped_column(String(500), unique=True, index=True)
 
     animal_values: Mapped[List['AnimalValueTable']] = relationship('AnimalValueTable', back_populates='attribute')
     recording_values: Mapped[List['RecordingValueTable']] = relationship('RecordingValueTable', back_populates='attribute')
@@ -236,7 +236,7 @@ class TaskedEntityTable(SQLBase):
     roi_pk: Mapped[int] = mapped_column(ForeignKey('rois.pk'), nullable=True)
     phase_pk: Mapped[int] = mapped_column(ForeignKey('phases.pk'), nullable=True)
 
-    status: Mapped[int] = mapped_column(nullable=False, default=0)  # 0: pending, 1: acquired, 2: finished
+    status: Mapped[int] = mapped_column(nullable=False, default=0, index=True)  # 0: pending, 1: acquired, 2: finished
 
     @property
     def entity_pk(self):

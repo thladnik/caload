@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import pprint
+import subprocess
+import time
 from datetime import date
 from enum import Enum
 import logging
@@ -40,7 +43,6 @@ def create_analysis(analysis_path: str, data_root: str,
                     bulk_format: str = None, compression: str = 'gzip', compression_opts: Any = None,
                     shuffle_filter: bool = True, max_blob_size: int = None,
                     **kwargs) -> Analysis:
-
     analysis_path = Path(analysis_path).as_posix()
 
     if os.path.exists(analysis_path):
@@ -145,7 +147,6 @@ def update_analysis(analysis_path: str, **kwargs):
 
 
 def delete_analysis(analysis_path: str):
-
     # Convert
     analysis_path = Path(analysis_path).as_posix()
 
@@ -205,7 +206,6 @@ def delete_analysis(analysis_path: str):
 
 
 def open_analysis(analysis_path: str, **kwargs) -> Analysis:
-
     print(f'Open analysis {analysis_path}')
     summary = Analysis(analysis_path, **kwargs)
 
@@ -447,6 +447,78 @@ class Analysis:
 
         return temp_path
 
+    def start_slurm_task_processor(self, partition='bigmem', node_num=1, cpu_num=64, batch_size=500):
+
+        # Create random job id
+        job_id = time.strftime('%Y-%m-%d-%H-%S-%M')
+
+        # Set shell script path
+        slurm_job_path = self.get_temp_path(f'slurm_jobs/{job_id}')
+        run_filepath = os.path.join(slurm_job_path, 'slurm_task_processor_run.sh')
+
+        # Create shell script
+        venv_path = os.environ['VIRTUAL_ENV']
+
+#        job_script = \
+# f"""#!/bin/sh
+#
+# source {venv_path}/bin/activate
+# python -c "from caload.analysis import Analysis; {self}.process_tasks(batch_size={batch_size})"
+# deactivate
+# """
+
+#         job_script = \
+# f"""#!/bin/bash
+# #SBATCH --partition={partition}
+# #SBATCH --job-name=f'task_processor_job_{job_id}'      # Job name
+# #SBATCH --nodes={node_num}                       # Number of nodes (X)
+# #SBATCH --ntasks-per-node=1             # Number of tasks per node
+# #SBATCH --time=24:00:00                 # Time limit (hh:mm:ss)
+# #SBATCH --output=my_python_job_%j.out   # Standard output and error log
+#
+# srun --mpi=pmi2 {run_filepath}
+# """
+
+        run_script = \
+            f"""#!/bin/bash
+source {venv_path}/bin/activate
+python -c "from caload.analysis import Analysis; {self}.process_tasks(batch_size={batch_size})"
+deactivate
+"""
+
+        print(f'Create slurm run script {run_filepath}:')
+        print('-' * 16)
+        pprint.pprint(run_script[0])
+        print('-' * 16)
+
+        # Create shell script file for running python processing
+        with open(run_filepath, 'w') as f:
+            f.writelines(run_script)
+
+        command = ['sbatch',
+                   f'--partition={partition}',
+                   f'--nodes={node_num}',
+                   '--ntasks-per-node=1',
+                   f'--cpus-per-task={cpu_num}',
+                   # '-n', str(core_num),
+                   f'--job-name=task_processor_{job_id}',
+                   f'-o {os.path.join(slurm_job_path, "slurm-%j.out")}',
+                   run_filepath]
+
+        # command = ['sbatch',
+        #            '-N', str(node_num),
+        #            '-T'
+        #            '-n', str(core_num),
+        #            '-p', partition,
+        #            '-J', f'TaskProcessorJob{job_id}',
+        #            job_filepath]
+
+        # command = ['sbatch', str(job_filepath)]
+        print(f'Run command {command}')
+
+        # Run slurm batch
+        subprocess.run(command)
+
     def process_tasks(self, batch_size: int = 500):
 
         query_task = self.session.query(TaskTable).filter(TaskTable.status != 1).order_by('pk')
@@ -485,7 +557,8 @@ class Analysis:
 
                 # TODO: adapt this for other entities
                 # Create entity collection from PKs
-                entity_collection = RoiCollection(analysis=self, query=self.session.query(RoiTable).filter(RoiTable.pk.in_(entity_pks)))
+                entity_collection = RoiCollection(analysis=self, query=self.session.query(RoiTable).filter(
+                    RoiTable.pk.in_(entity_pks)))
 
                 # Map function to collection
                 try:
@@ -494,7 +567,8 @@ class Analysis:
                 except Exception as e:
                     # If errors were encountered, rollback all to status pending
                     # TODO: adapt this for other entities
-                    for row in self.session.query(TaskedEntityTable).filter(TaskedEntityTable.roi_pk.in_(entity_pks)).all():
+                    for row in self.session.query(TaskedEntityTable).filter(
+                            TaskedEntityTable.roi_pk.in_(entity_pks)).all():
                         row.status = 0  # pending
                     self.session.commit()
 
@@ -504,13 +578,18 @@ class Analysis:
                 else:
                     # If no errors were encountered, set all tasked entity rows to finished
                     # TODO: adapt this for other entities
-                    for row in self.session.query(TaskedEntityTable).filter(TaskedEntityTable.roi_pk.in_(entity_pks)).all():
+                    for row in self.session.query(TaskedEntityTable).filter(
+                            TaskedEntityTable.roi_pk.in_(entity_pks)).all():
                         row.status = 2  # finished
                     self.session.commit()
 
-            # Set task to finished
-            task_row.status = 1
-            self.session.commit()
+            # Set task to finished if there aren't any tasked entities left which aren't finished
+            #  (so neither pending nor acquired)
+            if (self.session.query(TaskedEntityTable)
+                    .filter(TaskedEntityTable.task_pk == task_row.pk)
+                    .filter(TaskedEntityTable.status != 2).count()) == 0:
+                task_row.status = 1
+                self.session.commit()
 
 
 def _recording_id_from_path(path: Union[Path, str]) -> Tuple[str, str]:
@@ -522,7 +601,6 @@ def _animal_id_from_path(path: Union[Path, str]) -> str:
 
 
 def scan_folder(root_path: str, recording_list: List[str]) -> List[str]:
-
     for fld in os.listdir(root_path):
         current_path = os.path.join(root_path, fld)
 
@@ -544,7 +622,6 @@ def scan_folder(root_path: str, recording_list: List[str]) -> List[str]:
 
 
 def create_animal(analysis: caload.analysis.Analysis, path: str) -> caload.entities.Animal:
-
     # Create animal
     animal_id = _animal_id_from_path(path)
     animal_path = '/'.join(Path(path).as_posix().split('/')[:-1])
@@ -580,7 +657,6 @@ def create_animal(analysis: caload.analysis.Analysis, path: str) -> caload.entit
 
 
 def digest_folder(folder_list: List[str], analysis: caload.analysis.Analysis):
-
     print(f'Process folders: {folder_list}')
     for recording_path in folder_list:
 
@@ -657,7 +733,7 @@ def digest_folder(folder_list: List[str], analysis: caload.analysis.Analysis):
         # Check if frame times and signal match
         if frame_times.shape[0] != fluorescence.shape[1]:
             print(f'Detected frame times\' length doesn\'t match frame count. '
-                        f'Detected frame times ({frame_times.shape[0]}) / Frames ({fluorescence.shape[1]})')
+                  f'Detected frame times ({frame_times.shape[0]}) / Frames ({fluorescence.shape[1]})')
 
             # Shorten signal
             if frame_times.shape[0] < fluorescence.shape[1]:
@@ -670,7 +746,7 @@ def digest_folder(folder_list: List[str], analysis: caload.analysis.Analysis):
                 print('Truncated detected frame times at end to resolve mismatch. Check debug output to verify')
 
         # Get imaging rate from sync signal
-        imaging_rate = 1./np.mean(np.diff(frame_times))  # Hz
+        imaging_rate = 1. / np.mean(np.diff(frame_times))  # Hz
         print(f'Estimated imaging rate {imaging_rate:.2f}Hz')
 
         # Save to recording
@@ -798,7 +874,6 @@ def unravel_dict(dict_data: dict, entity: caload.entities.Entity, path: str):
 
 
 def calculate_ca_frame_times(mirror_position: np.ndarray, mirror_time: np.ndarray):
-
     peak_prominence = (mirror_position.max() - mirror_position.min()) / 4
     peak_idcs, _ = scipy.signal.find_peaks(mirror_position, prominence=peak_prominence)
     trough_idcs, _ = scipy.signal.find_peaks(-mirror_position, prominence=peak_prominence)
