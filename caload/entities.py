@@ -575,6 +575,38 @@ class EntityCollection:
         return elapsed_time
 
 
+def parse_hierarchy(*entity_types: List[Type]) -> Dict[str, Dict[str, ...]]:
+
+    # Parse into flat dictionary of child:parent relations between entity types
+    flat = {}
+    for _type in entity_types:
+        parent = getattr(_type, 'parent_type', None)
+        if parent is not None:
+            parent = parent.__name__
+        flat[_type.__name__] = parent
+
+    # Creates nested representation of hierarchy
+    def build_nested_dict(flat):
+        def nest_key(key):
+            nested = {}
+            for k, v in flat.items():
+                if v == key:
+                    nested[k] = nest_key(k)
+            return nested
+
+        nested_dict = {}
+        for key, value in flat.items():
+            if value is None:
+                nested_dict[key] = nest_key(key)
+
+        return nested_dict
+
+    # print(flat)
+    # pprint.pprint(build_nested_dict(flat))
+
+    return build_nested_dict(flat)
+
+
 # class Animal(Entity):
 #     entity_table = AnimalTable
 #     attr_value_table = AnimalValueTable
