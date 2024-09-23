@@ -55,18 +55,16 @@ class Entity:
         self.parents = []
 
     def __contains__(self, item):
-        subquery = self.analysis.session.query(AttributeTable.pk).filter(AttributeTable.name == item).subquery()
         value_query = (self.analysis.session.query(self.attr_value_table)
-                       .filter(self.attr_value_table.attribute_pk == subquery.c.pk)
+                       .filter(self.attr_value_table.name == item)
                        .filter(self.attr_value_table.entity_pk == self.row.pk))
         return value_query.count() > 0
 
     def __getitem__(self, item: str):
 
         value_query = (self.analysis.session.query(self.attr_value_table)
-                       .join(AttributeTable)
-                       .filter(self.attr_value_table.entity_pk == self.row.pk)
-                       .filter(AttributeTable.name == item))
+                       .filter(self.attr_value_table.name == item)
+                       .filter(self.attr_value_table.entity_pk == self.row.pk))
 
         if value_query.count() == 0:
             raise KeyError(f'Attribute {item} not found for entity {self}')
@@ -102,39 +100,13 @@ class Entity:
         if isinstance(value, np.generic):
             value = value.item()
 
-        # Get attribute name entry
-        if key not in self._attribute_name_pk_map:
-
-            # Call procedure to add attribute name
-            self.analysis.session.execute(text(f'CALL insert_attribute_name("{key}")'))
-            self.analysis.session.commit()
-
-            # Create query to check if
-            query_name = self.analysis.session.query(AttributeTable).filter(AttributeTable.name == key)
-
-            # # Wait end check until timeout
-            # _t = time.perf_counter()
-            # while query_name.count() == 0 and time.perf_counter() < _t+1.:
-            #     time.sleep(1/1000)
-
-            if query_name.count() == 0:
-                raise Exception(f'Attribute {key} does not exist')
-
-            attribute_row = query_name.first()
-
-            # Add PK to map
-            self._attribute_name_pk_map[key] = attribute_row.pk
-
-        attribute_row_pk = self._attribute_name_pk_map[key]
-
         value_row = None
         # Query attribute row if not in create mode
         if not self.analysis.is_create_mode:
             # Build query
             value_query = (self.analysis.session.query(self.attr_value_table)
-                           .join(AttributeTable)
-                           .filter(self.attr_value_table.entity_pk == self.row.pk)
-                           .filter(AttributeTable.name == key))
+                           .filter(self.attr_value_table.name == key)
+                           .filter(self.attr_value_table.entity_pk == self.row.pk))
 
             # Evaluate
             if value_query.count() == 1:
@@ -145,7 +117,7 @@ class Entity:
         # Create row if it doesn't exist yet
         value_row_is_new = False
         if value_row is None:
-            value_row = self.attr_value_table(entity_pk=self.row.pk, attribute_pk=attribute_row_pk,
+            value_row = self.attr_value_table(entity_pk=self.row.pk, name=key,
                                               is_persistent=self.analysis.is_create_mode)
             self.analysis.session.add(value_row)
             value_row_is_new = True
@@ -266,7 +238,7 @@ class Entity:
 
         return data_path
 
-    def _write_asdf(self, key: str, value: Any, row: AttributeValueTable = None):
+    def _write_asdf(self, key: str, value: Any, row: AttributeTable = None):
         pass
 
     @property
@@ -275,7 +247,7 @@ class Entity:
         query = (self.analysis.session.query(self.attr_value_table)
                  .filter(self.attr_value_table.entity_pk == self.row.pk)
                  .filter(self.attr_value_table.column_str.not_in(['value_path', 'value_blob'])))
-        return {value_row.attribute.name: value_row.value for value_row in query.all()}
+        return {value_row.name: value_row.value for value_row in query.all()}
 
     @property
     def attributes(self):
@@ -287,9 +259,9 @@ class Entity:
         attributes = {}
         for value_row in query.all():
             if value_row.column_str == 'value_path':
-                attributes[value_row.attribute.name] = self[value_row.attribute.name]
+                attributes[value_row.name] = self[value_row.name]
             else:
-                attributes[value_row.attribute.name] = value_row.value
+                attributes[value_row.name] = value_row.value
 
         return attributes
 
@@ -711,17 +683,7 @@ class EntityCollection:
 
         return self._query
 
-    def _column(self, attribute: Union[str, int], include_blobs: bool = False):
-
-        # If attribute is string, fetch corresponding primary key
-        if isinstance(attribute, str):
-            pk_query = self.analysis.session.query(AttributeTable.pk).filter(AttributeTable.name == attribute)
-
-            if pk_query.count() == 0:
-                raise KeyError(f'No attribute with name {attribute} found for {self}')
-            attribute_pk = pk_query.first().pk
-        else:
-            attribute_pk = attribute
+    def _column(self, attribute_name: str, include_blobs: bool = False):
 
         # Subquery on entity primary keys
         entity_query = self.query.subquery().primary_key
@@ -729,14 +691,14 @@ class EntityCollection:
         # Query attribute values
         value_query = (self.analysis.session.query(self._entity_type.attr_value_table)
                        .filter(self._entity_type.attr_value_table.entity_pk.in_(entity_query))
-                       .filter(self._entity_type.attr_value_table.attribute_pk == attribute_pk))
+                       .filter(self._entity_type.attr_value_table.name == attribute_name))
 
         if include_blobs:
             value_query = value_query.options(joinedload(self._entity_type.attr_value_table.value_blob))
 
         return value_query.all()
 
-    def _dataframe_of(self, attribute_names: List[str] = None, attribute_pks: List[int] = None,
+    def _dataframe_of(self, attribute_names: List[str] = None,
                       include_blobs: bool = False, include_bulk: bool = False) -> pd.DataFrame:
 
         # Add to excluded list
@@ -746,25 +708,12 @@ class EntityCollection:
         if not include_bulk:
             excluded.append('value_path')
 
-        # Prepare args
-        if attribute_pks is None:
-            attribute_pks = [None] * len(attribute_names)
-        elif attribute_names is None:
-            attribute_names = [None] * len(attribute_pks)
-
-        if attribute_pks is None or attribute_names is None:
-            raise ValueError('No attribute list specified')
-
         # Iterate through specified attributes
         cols = []
-        for attr_pk, attr_name in zip(attribute_pks, attribute_names):
+        for attr_name in attribute_names:
 
             # Fetch rows
             rows = self._column(attr_name if attr_pk is None else attr_pk, include_blobs)
-
-            # If no attribute name was give, fetch it
-            if attr_name is None:
-                self.analysis.session.query(AttributeTable.name).filter(AttributeTable.pk == attr_pk)
 
             # Get indices and data
             idcs = [v.entity_pk for v in rows if v.column_str not in excluded]
@@ -786,33 +735,25 @@ class EntityCollection:
         return self.__class__(analysis=self.analysis, query=query)
 
     @property
-    def attribute_rows(self):
-        unique_attr_query = (self.analysis.session.query(self._entity_type.attr_value_table.attribute_pk)
-                             .filter(
-            self._entity_type.attr_value_table.entity_pk.in_(self.query.subquery().primary_key))
-                             .group_by(self._entity_type.attr_value_table.attribute_pk))
+    def attribute_names(self):
+        query = (self.analysis.session.query(self._entity_type.attr_value_table.name)
+                 .filter(self._entity_type.attr_value_table.entity_pk.in_(self.query.subquery().primary_key))
+                 .group_by(self._entity_type.attr_value_table.name))
 
-        return (self.analysis.session.query(AttributeTable)
-                .filter(AttributeTable.pk.in_(unique_attr_query.subquery().select()))).all()
+        return [str(attr.name) for attr in query.all()]
 
     @property
     def dataframe(self):
 
-        attribute_rows = self.attribute_rows
-
         # Return dataframe of all attributes
-        return self._dataframe_of(attribute_names=[str(row.name) for row in attribute_rows],
-                                  attribute_pks=[int(row.pk) for row in attribute_rows],
+        return self._dataframe_of(attribute_names=self.attribute_names,
                                   include_blobs=False, include_bulk=False)
 
     @property
     def extended_dataframe(self):
 
-        attribute_rows = self.attribute_rows
-
         # Return dataframe of all attributes
-        return self._dataframe_of(attribute_names=[str(row.name) for row in attribute_rows],
-                                  attribute_pks=[int(row.pk) for row in attribute_rows],
+        return self._dataframe_of(attribute_names=self.attribute_names,
                                   include_blobs=True, include_bulk=False)
 
     def _get_entity(self, row: EntityTable) -> Entity:
@@ -862,7 +803,7 @@ class EntityCollection:
             chunk_num = int(np.ceil(len(self) / chunk_size))
             worker_args = [(fun, self[i * chunk_size:(i + 1) * chunk_size], kwargs) for i in range(chunk_num)]
             print(f'Entity chunksize {chunk_size}')
-        print(f'> Preparation finished in {time.perf_counter()-t:.2f}s')
+        print(f'> Preparation finished in {time.perf_counter() - t:.2f}s')
 
         # Close session first
         self.analysis.close_session()

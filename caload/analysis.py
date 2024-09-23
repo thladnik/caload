@@ -90,17 +90,17 @@ def create_analysis(analysis_path: str, data_root: str,
     # Create tables
     SQLBase.metadata.create_all(engine)
 
-    # Create procedures
-    with engine.connect() as connection:
-        connection.execute(text(
-            """
-            CREATE PROCEDURE insert_attribute_name(IN attribute_name VARCHAR(255))
-            BEGIN
-                IF NOT EXISTS (SELECT 1 FROM attributes WHERE name = attribute_name) THEN
-                    INSERT INTO attributes (name) VALUES (attribute_name);
-                END IF;
-            END;
-            """))
+    # # Create procedures
+    # with engine.connect() as connection:
+    #     connection.execute(text(
+    #         """
+    #         CREATE PROCEDURE insert_attribute_name(IN attribute_name VARCHAR(255))
+    #         BEGIN
+    #             IF NOT EXISTS (SELECT 1 FROM attributes WHERE name = attribute_name) THEN
+    #                 INSERT INTO attributes (name) VALUES (attribute_name);
+    #             END IF;
+    #         END;
+    #         """))
 
     # Create analysis data folder
     os.mkdir(analysis_path)
