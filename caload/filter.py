@@ -167,9 +167,8 @@ logical_operators = {
 }
 
 
-def _generate_attribute_filters(session: Session,
+def _generate_attribute_filters(entity_type_name: str, session: Session,
                                 astree: Dict[str, Any]) -> Union[and_, or_, not_, BinaryExpression[bool]]:
-
     """Generate SQLAlchemy ORM filters given a filter syntax tree
     TODO: currently supported operations are nested trees of: AND, OR, IN, EXIST, NOT, <=, <, ==, >, >=
     """
@@ -214,9 +213,9 @@ def _generate_attribute_filters(session: Session,
                 raise ValueError(f"Unsupported comparator: {operator}")
 
         # Build the subquery to filter entities matching the comparison
-        subquery = session.query(AttributeTable.entity_pk) \
-            .filter(AttributeTable.name == name, comparison) \
-            .subquery()
+        subquery = (session.query(AttributeTable.entity_pk).filter(AttributeTable.name == name, comparison).join(EntityTable)
+                    .join(EntityTypeTable).filter(EntityTypeTable.name == entity_type_name)
+                    .subquery())
 
     # Handle unary operators
     elif operator == 'EXIST':
@@ -244,7 +243,7 @@ def parse_boolean_expression(expression):
 def get_entity_query_by_attributes(entity_type_name: str, session: Session,
                                    expr: str, entity_query: Query = None) -> Query:
     # Create base query
-    query = session.query(EntityTable).filter(EntityTable.entity_type.name == entity_type_name)
+    query = session.query(EntityTable).join(EntityTypeTable).filter(EntityTypeTable.name == entity_type_name)
 
     # Filter for entities, if entity_query is provided
     if entity_query is not None:
@@ -268,10 +267,10 @@ if __name__ == '__main__':
     # expression = "(animal_id == 2024-08-02_fish1)"
     # expression = 'rec_id == "rec2" AND rec_date == 2024-07-07 AND animal_id == "2024-08-02_fish1"'
     expression_string = ("name IN (1.2, 10, 'Charlie') "
-                  "AND "
-                  "(EXIST signal1) "
-                  "AND rec_id == 'rec2' "
-                  "AND NOT (rec_date == 2024-07-07 OR animal_id == '2024-08-02_fish1')")
+                         "AND "
+                         "(EXIST signal1) "
+                         "AND rec_id == 'rec2' "
+                         "AND NOT (rec_date == 2024-07-07 OR animal_id == '2024-08-02_fish1')")
 
     parsed_expression = parse_boolean_expression(expression_string)
 

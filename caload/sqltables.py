@@ -16,18 +16,22 @@ class SQLBase(DeclarativeBase):
 
 # Entities
 
-class EntityHierarchyTable(SQLBase):
-
-    __tablename__ = 'entity_hierarchy'
-
-    child_entity_pk: Mapped[int] = mapped_column(ForeignKey('entity_types.pk'), primary_key=True)
-    parent_entity_pk: Mapped[int] = mapped_column(ForeignKey('entity_types.pk'), primary_key=True)
+# class EntityHierarchyTable(SQLBase):
+#
+#     __tablename__ = 'entity_hierarchy'
+#
+#     child_entity_type_pk: Mapped[int] = mapped_column(ForeignKey('entity_types.pk'), primary_key=True)
+#     child_entity_type: Mapped['EntityTypeTable'] = relationship('EntityTypeTable', back_populates='')
+#     parent_entity_type_pk: Mapped[int] = mapped_column(ForeignKey('entity_types.pk'), primary_key=True)
 
 
 class EntityTypeTable(SQLBase):
     __tablename__ = 'entity_types'
 
     pk: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    parent_pk: Mapped[int] = mapped_column(ForeignKey('entity_types.pk'), nullable=True)
+    parent: Mapped['EntityTypeTable'] = relationship('EntityTypeTable', back_populates='children', remote_side=[pk])
+    children: Mapped[List['EntityTypeTable']] = relationship('EntityTypeTable', back_populates='parent', remote_side=[parent_pk])
 
     name: Mapped[str] = mapped_column(String(500), unique=True)
 
@@ -45,10 +49,10 @@ class EntityTable(SQLBase):
 
     # Many-to-One
     entity_type: Mapped['EntityTypeTable'] = relationship('EntityTypeTable', back_populates='entities')
-    parent: Mapped['EntityTable'] = relationship('EntityTable', back_populates='children')
+    parent: Mapped['EntityTable'] = relationship('EntityTable', back_populates='children', remote_side=[pk])
 
     # One-to-Many
-    children: Mapped[List['EntityTable']] = relationship('EntityTable', back_populates='parent')
+    children: Mapped[List['EntityTable']] = relationship('EntityTable', back_populates='parent', remote_side=[parent_pk])
     attributes: Mapped[List['AttributeTable']] = relationship('AttributeTable', back_populates='entity')
 
     __table_args__ = (
@@ -67,7 +71,7 @@ class AttributeTable(SQLBase):
     entity_pk: Mapped[int] = mapped_column(ForeignKey('entities.pk'), primary_key=True)
     entity: Mapped['EntityTable'] = relationship('EntityTable', back_populates='attributes')
 
-    name: Mapped[str] = mapped_column(String(500), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(500), primary_key=True, unique=True, index=True)
 
     value_blob_pk: Mapped[int] = mapped_column(ForeignKey('attribute_blobs.pk'), nullable=True)
     value_blob: Mapped['AttributeBlobTable'] = relationship('AttributeBlobTable')

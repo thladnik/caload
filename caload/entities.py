@@ -232,7 +232,7 @@ class Entity:
         query = (self.analysis.session.query(self.attr_value_table)
                  .filter(self.attr_value_table.entity_pk == self.row.pk)
                  .filter(self.attr_value_table.column_str.not_in(['value_path', 'value_blob'])))
-        return {value_row.attribute.name: value_row.value for value_row in query.all()}
+        return {value_row.name: value_row.value for value_row in query.all()}
 
     @property
     def attributes(self):
@@ -244,9 +244,9 @@ class Entity:
         attributes = {}
         for value_row in query.all():
             if value_row.column_str == 'value_path':
-                attributes[value_row.attribute.name] = self[value_row.attribute.name]
+                attributes[value_row.name] = self[value_row.name]
             else:
-                attributes[value_row.attribute.name] = value_row.value
+                attributes[value_row.name] = value_row.value
 
         return attributes
 
@@ -257,11 +257,15 @@ class Entity:
 
     @property
     def parent(self):
+        if self._parent_row is None:
+            return None
         return Entity(row=self._parent_row, analysis=self.analysis)
 
     @property
     def path(self) -> str:
-        return Path(os.path.join(self.analysis.analysis_path, 'entities', self.entity_type_name.lower())).as_posix()
+        if self.parent is not None:
+            return Path(os.path.join(self.parent.path, self.entity_type_name.lower(), )).as_posix()
+        return Path(os.path.join(self.entity_type_name.lower(), )).as_posix()
 
     @property
     def row(self):
@@ -272,14 +276,14 @@ class Entity:
         return self._analysis
 
     def create_file(self):
-        entity_path = self.path
+        entity_abs_path = os.path.join(self.analysis.analysis_path, 'entities', self.path)
 
         # Create directoty of necessary
-        if not os.path.exists(entity_path):
-            os.makedirs(entity_path)
+        if not os.path.exists(entity_abs_path):
+            os.makedirs(entity_abs_path)
 
         # Create data file
-        path = os.path.join(entity_path, 'data.hdf5')
+        path = os.path.join(entity_abs_path, 'data.hdf5')
         if not os.path.exists(path):
             with h5py.File(path, 'w') as _:
                 pass
@@ -288,6 +292,7 @@ class Entity:
 class EntityCollection:
     analysis: Analysis
     _query: Query
+    _entity_count: int = -1
     _iteration_count: int = -1
     _batch_offset: int = 0
     _batch_size: int = 100
@@ -300,7 +305,9 @@ class EntityCollection:
         self._query_custom_orderby = False
 
     def __len__(self):
-        return self.query.count()
+        if self._entity_count < 0:
+            self._entity_count = self.query.count()
+        return self._entity_count
 
     def __iter__(self):
         return self
@@ -573,38 +580,6 @@ class EntityCollection:
         elapsed_time = time.perf_counter() - start_time
 
         return elapsed_time
-
-
-def parse_hierarchy(*entity_types: List[Type]) -> Dict[str, Dict[str, ...]]:
-
-    # Parse into flat dictionary of child:parent relations between entity types
-    flat = {}
-    for _type in entity_types:
-        parent = getattr(_type, 'parent_type', None)
-        if parent is not None:
-            parent = parent.__name__
-        flat[_type.__name__] = parent
-
-    # Creates nested representation of hierarchy
-    def build_nested_dict(flat):
-        def nest_key(key):
-            nested = {}
-            for k, v in flat.items():
-                if v == key:
-                    nested[k] = nest_key(k)
-            return nested
-
-        nested_dict = {}
-        for key, value in flat.items():
-            if value is None:
-                nested_dict[key] = nest_key(key)
-
-        return nested_dict
-
-    # print(flat)
-    # pprint.pprint(build_nested_dict(flat))
-
-    return build_nested_dict(flat)
 
 
 # class Animal(Entity):
