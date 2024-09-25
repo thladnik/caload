@@ -17,6 +17,7 @@ import h5py
 import numpy as np
 import pandas as pd
 from sqlalchemy import text
+from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.orm import Query, aliased, joinedload
 from tqdm import tqdm
 
@@ -671,6 +672,54 @@ class EntityCollection:
 
         raise KeyError(f'Invalid key {item}')
 
+    def __setitem__(self, key, df):
+        """Set attributes on individual entities in collection
+        """
+        if key != slice(None, None, None):
+            raise KeyError(f'Invalid key {key}')
+        if not isinstance(df, pd.DataFrame):
+            if not isinstance(df, pd.Series):
+                raise ValueError(f'Invalid value of type {type(df)}. Needs to be pandas.Series or pandas.DataFrame')
+            df = pd.DataFrame(df)
+
+        for attr_name in df.columns:
+
+            # Create df for insert
+            df_insert = pd.DataFrame(df[attr_name])
+
+            # Determine data type
+            dtype = str(df_insert[attr_name].dtype).lower()
+            if 'int' in dtype:
+                dtype_str = 'int'
+            elif 'float' in dtype:
+                dtype_str = 'float'
+            elif 'object' in dtype:
+                dtype_str = 'str'
+            else:
+                raise TypeError('')
+
+            # Rename value column
+            columns_str = f'value_{dtype_str}'
+            df_insert.rename(columns={attr_name: columns_str}, inplace=True)
+
+            # Add PK set
+            df_insert['entity_pk'] = df_insert.index
+            df_insert['name'] = attr_name
+            df_insert['column_str'] = columns_str
+            df_insert['is_persistent'] = False
+
+            insert_attr_data = df_insert.to_dict('records')
+
+            insert_stmt = mysql_insert(self._entity_type.attr_value_table).values(insert_attr_data)
+
+            update_attr_data = {columns_str: getattr(insert_stmt.inserted, columns_str),
+                                'is_persistent': insert_stmt.inserted.is_persistent,
+                                'column_str': columns_str}
+
+            upsert_stmt = insert_stmt.on_duplicate_key_update(update_attr_data)
+            self.analysis.session.execute(upsert_stmt)
+            self.analysis.session.commit()
+
     @property
     def query(self):
         """Property which should be used *exclusively* to access the Query object.
@@ -713,7 +762,7 @@ class EntityCollection:
         for attr_name in attribute_names:
 
             # Fetch rows
-            rows = self._column(attr_name if attr_pk is None else attr_pk, include_blobs)
+            rows = self._column(attr_name, include_blobs)
 
             # Get indices and data
             idcs = [v.entity_pk for v in rows if v.column_str not in excluded]

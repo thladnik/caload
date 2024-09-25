@@ -152,7 +152,7 @@ class AttributeTable:
 class AnimalValueTable(AttributeTable, SQLBase):
     __tablename__ = 'animal_attributes'
 
-    entity_pk: Mapped[int] = mapped_column(ForeignKey('animals.pk'), primary_key=True)
+    entity_pk: Mapped[int] = mapped_column(ForeignKey('animals.pk'), primary_key=True, nullable=False)
     entity: Mapped['AnimalTable'] = relationship('AnimalTable', back_populates='attributes')
 
     value_blob_pk: Mapped[int] = mapped_column(ForeignKey('attribute_blobs.pk'), nullable=True)
@@ -162,7 +162,7 @@ class AnimalValueTable(AttributeTable, SQLBase):
 class RecordingValueTable(AttributeTable, SQLBase):
     __tablename__ = 'recording_attributes'
 
-    entity_pk: Mapped[int] = mapped_column(ForeignKey('recordings.pk'), primary_key=True)
+    entity_pk: Mapped[int] = mapped_column(ForeignKey('recordings.pk'), primary_key=True, nullable=False)
     entity: Mapped['RecordingTable'] = relationship('RecordingTable', back_populates='attributes')
 
     value_blob_pk: Mapped[int] = mapped_column(ForeignKey('attribute_blobs.pk'), nullable=True)
@@ -172,7 +172,7 @@ class RecordingValueTable(AttributeTable, SQLBase):
 class PhaseValueTable(AttributeTable, SQLBase):
     __tablename__ = 'phase_attributes'
 
-    entity_pk: Mapped[int] = mapped_column(ForeignKey('phases.pk'), primary_key=True)
+    entity_pk: Mapped[int] = mapped_column(ForeignKey('phases.pk'), primary_key=True, nullable=False)
     entity: Mapped['PhaseTable'] = relationship('PhaseTable', back_populates='attributes')
 
     value_blob_pk: Mapped[int] = mapped_column(ForeignKey('attribute_blobs.pk'), nullable=True)
@@ -182,7 +182,7 @@ class PhaseValueTable(AttributeTable, SQLBase):
 class RoiValueTable(AttributeTable, SQLBase):
     __tablename__ = 'roi_attributes'
 
-    entity_pk: Mapped[int] = mapped_column(ForeignKey('rois.pk'), primary_key=True)
+    entity_pk: Mapped[int] = mapped_column(ForeignKey('rois.pk'), primary_key=True, nullable=False)
     entity: Mapped['RoiTable'] = relationship('RoiTable', back_populates='attributes')
 
     value_blob_pk: Mapped[int] = mapped_column(ForeignKey('attribute_blobs.pk'), nullable=True)
