@@ -178,8 +178,8 @@ def _generate_attribute_filters(entity_type_name: str, session: Session,
     # Handle connectives
     if operator in ('AND', 'OR'):
         op = logical_operators[operator]
-        return op(_generate_attribute_filters(session, astree['left_operand']),
-                  _generate_attribute_filters(session, astree['right_operand']))
+        return op(_generate_attribute_filters(entity_type_name, session, astree['left_operand']),
+                  _generate_attribute_filters(entity_type_name, session, astree['right_operand']))
 
     # Handle comparisons
     elif operator in ('IN', '<=', '<', '==', '>', '>='):

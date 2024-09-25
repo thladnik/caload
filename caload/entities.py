@@ -17,6 +17,7 @@ import h5py
 import numpy as np
 import pandas as pd
 from sqlalchemy import text
+from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.orm import Query, aliased, joinedload
 from tqdm import tqdm
 
@@ -169,6 +170,13 @@ class Entity:
         if not self.analysis.is_create_mode:
             self.analysis.session.commit()
 
+    @property
+    def id(self):
+        return self.row.id
+
+    def add_child_entity(self, entity_type: Union[str, Type[Entity]], entity_id: str):
+        return self.analysis.add_entity(entity_type, entity_id, parent_entity=self)
+
     def _write_hdf5(self, key: str, value: Any, data_path) -> str:
 
         # If not data_path is provided, generate it
@@ -264,8 +272,8 @@ class Entity:
     @property
     def path(self) -> str:
         if self.parent is not None:
-            return Path(os.path.join(self.parent.path, self.entity_type_name.lower(), )).as_posix()
-        return Path(os.path.join(self.entity_type_name.lower(), )).as_posix()
+            return Path(os.path.join(self.parent.path, self.entity_type_name.lower(), self.id)).as_posix()
+        return Path(os.path.join('entities', self.entity_type_name.lower(), self.id)).as_posix()
 
     @property
     def row(self):
@@ -276,7 +284,7 @@ class Entity:
         return self._analysis
 
     def create_file(self):
-        entity_abs_path = os.path.join(self.analysis.analysis_path, 'entities', self.path)
+        entity_abs_path = os.path.join(self.analysis.analysis_path, self.path)
 
         # Create directoty of necessary
         if not os.path.exists(entity_abs_path):
@@ -370,6 +378,55 @@ class EntityCollection:
             return df
 
         raise KeyError(f'Invalid key {item}')
+
+    def __setitem__(self, key, df):
+        """Set attributes on individual entities in collection
+        """
+        if key != slice(None, None, None):
+            raise KeyError(f'Invalid key {key}')
+        if not isinstance(df, pd.DataFrame):
+            if not isinstance(df, pd.Series):
+                raise ValueError(f'Invalid value of type {type(df)}. Needs to be pandas.Series or pandas.DataFrame')
+            df = pd.DataFrame(df)
+
+        for attr_name in df.columns:
+
+            # Create df for insert
+            df_insert = pd.DataFrame(df[attr_name])
+
+            # Determine data type
+            dtype = str(df_insert[attr_name].dtype).lower()
+            if 'int' in dtype:
+                dtype_str = 'int'
+            elif 'float' in dtype:
+                dtype_str = 'float'
+            elif 'object' in dtype:
+                dtype_str = 'str'
+            else:
+                raise TypeError('')
+
+            # Rename value column
+            columns_str = f'value_{dtype_str}'
+            df_insert.rename(columns={attr_name: columns_str}, inplace=True)
+
+            # Add PK set
+            df_insert['entity_pk'] = df_insert.index
+            df_insert['name'] = attr_name
+            df_insert['column_str'] = columns_str
+            df_insert['is_persistent'] = False
+
+            insert_attr_data = df_insert.to_dict('records')
+
+            insert_stmt = mysql_insert(AttributeTable).values(insert_attr_data)
+
+            update_attr_data = {columns_str: getattr(insert_stmt.inserted, columns_str),
+                                'is_persistent': insert_stmt.inserted.is_persistent,
+                                'column_str': columns_str}
+
+            upsert_stmt = insert_stmt.on_duplicate_key_update(update_attr_data)
+            self.analysis.session.execute(upsert_stmt)
+            self.analysis.session.commit()
+
 
     @property
     def query(self):
@@ -465,7 +522,7 @@ class EntityCollection:
                                   include_blobs=True, include_bulk=False)
 
     def _get_entity(self, row: EntityTable) -> Entity:
-        return self._entity_type(row=row, analysis=self.analysis)
+        return Entity(row=row, analysis=self.analysis)
 
     # def sortby(self, name: str, order: str = 'ASC'):
     #     # TODO: implement sorting

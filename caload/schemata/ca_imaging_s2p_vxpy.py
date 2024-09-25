@@ -80,31 +80,7 @@ def digest_folder(analysis: caload.analysis.Analysis):
         # Add animal
         animal = get_animal(analysis, recording_path)
 
-        continue
-
-        # Create debug folder
-        debug_folder_path = os.path.join(recording_path, 'debug')
-        if not os.path.exists(debug_folder_path):
-            os.mkdir(debug_folder_path)
-
-        # Get recording
-        # Expected recording folder format "<rec_date('YYYY-mm-dd')>_<rec_id>_*"
-        rec_id = Path(recording_path).as_posix().split('/')[-1]
-        _recording_list = analysis.recordings(f'animal_id == "{animal.id}"',
-                                              f'rec_date == {rec_date}',
-                                              f'rec_id == "{rec_id}"')
-        # Add recording
-        if len(_recording_list) > 0:
-            print('Recording already exists. Skip')
-            continue
-
-        recording = animal.add_recording(rec_date=rec_date, rec_id=rec_id)
-        recording['animal_id'] = animal_id
-        recording['rec_date'] = rec_date
-        recording['rec_id'] = rec_id
-
-        # Add metadata
-        add_metadata(recording, recording_path)
+        recording = get_recording(animal, recording_path)
 
         # Load s2p processed data
         s2p_path = os.path.join(recording_path, 'suite2p', 'plane0')
@@ -172,10 +148,9 @@ def digest_folder(analysis: caload.analysis.Analysis):
         print('Add ROI stats and signals')
         for roi_id in tqdm(range(fluorescence.shape[0])):
             # Create ROI
-            roi = recording.add_roi(roi_id=roi_id)
-            roi['animal_id'] = animal_id
-            roi['rec_date'] = rec_date
-            roi['rec_id'] = rec_id
+            roi = recording.add_child_entity(Roi, entity_id=f'roi_{roi_id}')
+            roi['animal_id'] = animal.id
+            roi['rec_id'] = recording.id
             roi['roi_id'] = roi_id
 
             roi_stats = roi_stats_all[roi_id]
@@ -213,16 +188,17 @@ def digest_folder(analysis: caload.analysis.Analysis):
 
                 # Add phase
                 if 'phase' in key1:
+                    phase_id = key1
 
-                    phase_id = int(key1.replace('phase', ''))
-                    phase = recording.add_phase(phase_id=phase_id)
-                    phase['animal_id'] = animal_id
-                    phase['rec_date'] = rec_date
-                    phase['rec_id'] = rec_id
+                    phase_id_int = int(key1.replace('phase', ''))
+                    phase = recording.add_child_entity(Phase, entity_id=phase_id)
+                    phase['animal_id'] = animal.id
+                    phase['rec_id'] = recording.id
                     phase['phase_id'] = phase_id
+                    phase['phase_id_int'] = phase_id_int
 
                     # Add calcium start/end indices
-                    in_phase_idcs = np.where(record_group_ids == phase_id)[0]
+                    in_phase_idcs = np.where(record_group_ids == phase_id_int)[0]
                     start_index = np.argmin(np.abs(frame_times - frame_times[in_phase_idcs[0]]))
                     end_index = np.argmin(np.abs(frame_times - frame_times[in_phase_idcs[-1]]))
                     phase['ca_start_index'] = start_index
@@ -317,6 +293,34 @@ def get_animal(analysis: caload.analysis.Analysis, path: str) -> Entity:
     analysis.session.commit()
 
     return animal
+
+
+def get_recording(animal: Entity, path: str) -> Entity:
+    # Create debug folder
+    debug_folder_path = os.path.join(path, 'debug')
+    if not os.path.exists(debug_folder_path):
+        os.mkdir(debug_folder_path)
+
+    # Get recording
+    rec_id = Path(path).as_posix().split('/')[-1]
+    expr = f'animal_id == "{animal.id}" AND rec_id == "{rec_id}"'
+    recording_collection = animal.analysis.get(Recording, expr)
+    # Add recording
+    if len(recording_collection) > 0:
+        if len(recording_collection) > 1:
+            raise Exception(f'Got {len(recording_collection)} recordings with '
+                            f'animal_id == "{animal.id}" and rec_id == "{rec_id}"')
+
+        return recording_collection[0]
+
+    recording = animal.add_child_entity(Recording, rec_id)
+    recording['animal_id'] = animal.id
+    recording['rec_id'] = rec_id
+
+    # Add metadata
+    add_metadata(recording, path)
+
+    return recording
 
 
 def add_metadata(entity: caload.entities.Entity, folder_path: str):

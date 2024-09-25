@@ -71,7 +71,7 @@ class AttributeTable(SQLBase):
     entity_pk: Mapped[int] = mapped_column(ForeignKey('entities.pk'), primary_key=True)
     entity: Mapped['EntityTable'] = relationship('EntityTable', back_populates='attributes')
 
-    name: Mapped[str] = mapped_column(String(500), primary_key=True, unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(500), primary_key=True, index=True)
 
     value_blob_pk: Mapped[int] = mapped_column(ForeignKey('attribute_blobs.pk'), nullable=True)
     value_blob: Mapped['AttributeBlobTable'] = relationship('AttributeBlobTable')

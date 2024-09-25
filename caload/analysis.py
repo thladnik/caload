@@ -95,26 +95,26 @@ def create_analysis(analysis_path: str, data_root: str, digest_fun: Callable, sc
     print('---')
 
     with Session(engine) as session:
-        def _create_entity_type(_hierarchy: Dict[str,  ...], parent_row: Union[EntityTypeTable, None]):
+
+        # Create type hierarchy
+        def _create_entity_type(_hierarchy: Dict[str,  ...], parent_row: EntityTypeTable):
             for name, children in _hierarchy.items():
                 row = EntityTypeTable(name=name, parent=parent_row)
                 session.add(row)
                 _create_entity_type(children, row)
 
-        _create_entity_type(hierarchy, None)
+        # Add Analysis type
+        analysis_type_row = EntityTypeTable(name='Analysis', parent=None)
+        session.add(analysis_type_row)
+
+        # Add custom types
+        _create_entity_type(hierarchy, analysis_type_row)
         session.commit()
 
-    # # Create procedures
-    # with engine.connect() as connection:
-    #     connection.execute(text(
-    #         """
-    #         CREATE PROCEDURE insert_attribute_name(IN attribute_name VARCHAR(255))
-    #         BEGIN
-    #             IF NOT EXISTS (SELECT 1 FROM attributes WHERE name = attribute_name) THEN
-    #                 INSERT INTO attributes (name) VALUES (attribute_name);
-    #             END IF;
-    #         END;
-    #         """))
+        # Add root entity
+        analysis_row = EntityTable(entity_type=analysis_type_row, id='analysis_00')
+        session.add(analysis_row)
+        session.commit()
 
     print('> Create analysis folder')
     # Create analysis data folder
@@ -264,13 +264,15 @@ class Analysis:
     write_timeout = 3.  # s
     lazy_init: bool
     echo: bool
+    _row: EntityTable
 
     # Entity type name -> entity type PK
     _entity_type_pk_map: Dict[str, int]
     # Child entity type -> parent entity type
     _entity_hierachy_map: Dict[str, Union[str, None]]
 
-    def __init__(self, path: str, mode: Mode = Mode.analyse, lazy_init: bool = False, echo: bool = False):
+    def __init__(self, path: str, mode: Mode = Mode.analyse, lazy_init: bool = False,
+                 echo: bool = False, select_analysis: str = None):
 
         # Set mode
         self.mode = mode
@@ -294,8 +296,11 @@ class Analysis:
         self.echo = echo
 
         # Open SQL session by default
-        if not lazy_init:
-            self.open_session()
+        # if not lazy_init:
+        self.open_session()
+
+        # Select analysis entity row
+        self.select_analysis(select_analysis)
 
     def _load_entity_hierarchy(self):
         entity_type_rows = self.session.query(EntityTypeTable).order_by(EntityTypeTable.pk).all()
@@ -335,7 +340,10 @@ class Analysis:
 
             parent_entity_row = parent_entity.row
         else:
-            parent_entity_row = None
+            # If no parent entity was provided, this should be top level
+            if self._entity_hierachy_map[entity_type_name] != 'Analysis':
+                raise Exception('No parent entity provided, but entity type is not top level')
+            parent_entity_row = self._row
 
         # Add row
         row = EntityTable(parent=parent_entity_row, entity_type_pk=self._entity_type_pk_map[entity_type_name], id=entity_id)
@@ -372,6 +380,15 @@ class Analysis:
     def shuffle_filter(self) -> Any:
         return self.config['shuffle_filter']
 
+    def select_analysis(self, analysis_name: str):
+        query = self.session.query(EntityTable)
+        query = query.join(EntityTypeTable).filter(EntityTypeTable.name == 'Analysis')
+
+        if analysis_name is not None:
+            query = query.filter(EntityTable.id == analysis_name)
+
+        self._row = query.order_by(EntityTable.pk).first()
+
     def open_session(self, pool_size: int = 20):
 
         # Only open if necessary
@@ -400,15 +417,20 @@ class Analysis:
         del self.session
         del self.sql_engine
 
-    def get(self, entity_type: Union[str, Type[Entity]], *filter_expressions, entity_query: Query = None, **equalities) -> EntityCollection:
+    def get(self, entity_type: Union[str, Type[Entity]],
+            *filter_expressions,
+            entity_query: Query = None,
+            **equalities) -> EntityCollection:
 
         self.open_session()
 
         # Get str
-        if isinstance(entity_type, Entity):
+        if issubclass(entity_type, Entity):
             entity_type_name = entity_type.__name__
-        else:
+        elif isinstance(entity_type, str):
             entity_type_name = entity_type
+        else:
+            raise TypeError(f'entity_type has to be type Entity or str, not {type(entity_type)}')
 
         # Add equality filters to filter expressions
         for k, v in equalities.items():
@@ -418,6 +440,8 @@ class Analysis:
         expr = ' AND '.join(filter_expressions)
 
         query = get_entity_query_by_attributes(entity_type_name, self.session, expr, entity_query=entity_query)
+
+        # print(query)
 
         return EntityCollection(entity_type_name, analysis=self, query=query)
 
