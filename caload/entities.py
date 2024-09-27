@@ -13,10 +13,13 @@ from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List, TYPE_CHECKING, Tuple, Type, TypeVar, Union
 
+
+import cloudpickle
 import h5py
 import numpy as np
 import pandas as pd
 from sqlalchemy import case, func, text
+
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.orm import Query, aliased, joinedload
 from tqdm import tqdm
@@ -81,9 +84,8 @@ class Entity:
 
     def __setitem__(self, key: str, value: Any):
 
-        # Find corresponding builtin python scalar type for numpy scalars and shape () arrays
-        if isinstance(value, np.generic) or (isinstance(value, np.ndarray) and np.squeeze(value).shape == ()):
-            # Convert to the corresponding Python built-in type using the item() method
+        # Find corresponding builtin python scalar type for numpy scalars
+        if isinstance(value, np.generic):
             value = value.item()
 
         attribute_row = None
@@ -146,7 +148,6 @@ class Entity:
                     data_path = f'pkl:{self.path}/{key.replace("/", "_")}'
 
             files.write(self.analysis.analysis_path, key, value, data_path)
-            # value = getattr(self, f'_write_{self.analysis.bulk_format}')(key, value, attribute_row.value)
 
         # Reset old value in case it was set to different type before
         if type(attribute_row.data_type) is str and attribute_row.data_type != data_type_str and attribute_row.value is not None:
@@ -549,6 +550,8 @@ class EntityCollection:
                 worker_num = len(self)
         print(f'Start pool with {worker_num} workers')
 
+        print(f'Prepare entities')
+        t = time.perf_counter()
         kwargs = tuple([(k, v) for k, v in kwargs.items()])
         if chunk_size is None:
             worker_args = [(fun, e, kwargs) for e in self]
@@ -557,6 +560,7 @@ class EntityCollection:
             chunk_num = int(np.ceil(len(self) / chunk_size))
             worker_args = [(fun, self[i * chunk_size:(i + 1) * chunk_size], kwargs) for i in range(chunk_num)]
             print(f'Entity chunksize {chunk_size}')
+        print(f'> Preparation finished in {time.perf_counter() - t:.2f}s')
 
         # Close session first
         self.analysis.close_session()
@@ -566,7 +570,8 @@ class EntityCollection:
         start_time = time.time()
         formatted_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time))
         print(f'Start processing at {formatted_time}')
-        with mp.Pool(processes=worker_num) as pool:
+        with (mp.Pool(processes=worker_num) as pool,
+              tqdm(total=len(worker_args), desc='Processing', unit='iter', smoothing=0.) as pbar):
             iterator = pool.imap_unordered(self.worker_wrapper, worker_args)
             for iter_num in range(1, len(self) + 1):
 
@@ -585,13 +590,20 @@ class EntityCollection:
                 time_elapsed = time.time() - start_time
                 time_rest = time_per_entity * (len(self) - iter_num * chunk_size)
 
-                # Print timing info
-                sys.stdout.write('\r'
-                                 f'[{iter_num * chunk_size}/{len(self)}] '
-                                 f'{time_per_entity:.2f}s/iter '
-                                 f'- {timedelta(seconds=int(time_elapsed))}'
-                                 f'/{timedelta(seconds=int(time_elapsed + time_rest))} '
-                                 f'-> {timedelta(seconds=int(time_rest))} remaining ')
+                pbar.update(chunk_size)
+                pbar.set_postfix({
+                    'time_per_iter': f'{time_per_entity:.2f}s',
+                    'elapsed': str(timedelta(seconds=int(time_elapsed))),
+                    'eta': str(timedelta(seconds=int(time_rest))),
+                })
+
+                # # Print timing info
+                # sys.stdout.write('\r'
+                #                  f'[{iter_num * chunk_size}/{len(self)}] '
+                #                  f'{time_per_entity:.2f}s/iter '
+                #                  f'- {timedelta(seconds=int(time_elapsed))}'
+                #                  f'/{timedelta(seconds=int(time_elapsed + time_rest))} '
+                #                  f'-> {timedelta(seconds=int(time_rest))} remaining ')
 
         formatted_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
         print(f'\nFinish processing at {formatted_time}')
@@ -613,10 +625,10 @@ class EntityCollection:
 
         # Re-open session in worker
         if isinstance(entity, list):
-            entity[0].analysis.open_session(pool_size=1)
+            entity[0].analysis.open_session(pool_size=1, echo=False)
             close_session = entity[0].analysis.close_session
         else:
-            entity.analysis.open_session(pool_size=1)
+            entity.analysis.open_session(pool_size=1, echo=False)
             close_session = entity.analysis.close_session
 
         # Run function on entity
@@ -632,289 +644,33 @@ class EntityCollection:
     def save_to(self, filepath: Union[str, os.PathLike]):
         pass
 
-# class Animal(Entity):
-#     entity_table = AnimalTable
-#     attr_value_table = AnimalValueTable
-#
-#     def __init__(self, *args, **kwargs):
-#         Entity.__init__(self, *args, **kwargs)
-#
-#     def __repr__(self):
-#         return f"Animal(id='{self.id}')"
-#
-#     @classmethod
-#     def unique_identifier(cls, row: AnimalTable) -> tuple:
-#         return Animal.__name__, row.id
-#
-#     @staticmethod
-#     def create(animal_id: str, analysis: Analysis):
-#         # Add row
-#         row = AnimalTable(id=animal_id)
-#         analysis.session.add(row)
-#         analysis.session.commit()
-#
-#         # Add entity
-#         entity = Animal(row=row, analysis=analysis)
-#         entity._create_file()
-#         return entity
-#
-#     @property
-#     def parent(self):
-#         return None
-#
-#     @property
-#     def path(self) -> str:
-#         return f'animals/{self.id}'
-#
-#     @property
-#     def id(self) -> str:
-#         return self._row.id
-#
-#     def add_recording(self, *args, **kwargs) -> Recording:
-#         return Recording.create(*args, animal=self, analysis=self.analysis, **kwargs)
-#
-#     @property
-#     def recordings(self) -> RecordingCollection:
-#         return self.analysis.get_recordings_by_id(animal_id=self.id)
-#
-#     @property
-#     def rois(self) -> RoiCollection:
-#         return self.analysis.get_rois_by_id(animal_id=self.id)
-#
-#     @property
-#     def phases(self) -> PhaseCollection:
-#         return self.analysis.get_phases_by_id(animal_id=self.id)
-#
-#
-# class Recording(Entity):
-#     entity_table = RecordingTable
-#     attr_value_table = RecordingValueTable
-#
-#     def __init__(self, *args, **kwargs):
-#         Entity.__init__(self, *args, **kwargs)
-#         self.parents.append(self.row.parent)
-#
-#     def __repr__(self):
-#         return f"Recording(id={self.id}, " \
-#                f"rec_date='{self.rec_date}', " \
-#                f"animal_id='{self.animal_id}')"
-#
-#     @classmethod
-#     def unique_identifier(cls, row: RecordingTable) -> tuple:
-#         return Recording.__name__, row.parent.id, row.date, row.id
-#
-#     @staticmethod
-#     def create(animal: Animal, rec_date: date, rec_id: str, analysis: Analysis):
-#         # Add row
-#         row = RecordingTable(parent=animal.row, date=caload.utils.parse_date(rec_date), id=rec_id)
-#         analysis.session.add(row)
-#         analysis.session.commit()
-#
-#         # Add entity
-#         entity = Recording(row=row, analysis=analysis)
-#         entity._create_file()
-#
-#         return entity
-#
-#     def add_roi(self, *args, **kwargs) -> Roi:
-#         return Roi.create(*args, recording=self, analysis=self.analysis, **kwargs)
-#
-#     def add_phase(self, *args, **kwargs) -> Phase:
-#         return Phase.create(*args, recording=self, analysis=self.analysis, **kwargs)
-#
-#     @property
-#     def rois(self) -> RoiCollection:
-#         return self.analysis.get_rois_by_id(animal_id=self.animal_id, rec_id=self.id, rec_date=self.rec_date)
-#
-#     @property
-#     def phases(self) -> PhaseCollection:
-#         return self.analysis.get_phases_by_id(animal_id=self.animal_id, rec_id=self.id, rec_date=self.rec_date)
-#
-#     @property
-#     def parent(self):
-#         return self.animal
-#
-#     @property
-#     def path(self) -> str:
-#         return f'{self.parent.path}/recordings/{self.rec_date}_{self.id}'
-#
-#     @property
-#     def id(self) -> str:
-#         return self._row.id
-#
-#     @property
-#     def rec_date(self) -> date:
-#         return self._row.date
-#
-#     @property
-#     def animal_id(self) -> str:
-#         return self._row.parent.id
-#
-#     @property
-#     def animal(self) -> Animal:
-#         return Animal(analysis=self.analysis, row=self._row.parent)
-#
-#
-# class Phase(Entity):
-#     entity_table = PhaseTable
-#     attr_value_table = PhaseValueTable
-#
-#     def __init__(self, *args, **kwargs):
-#         Entity.__init__(self, *args, **kwargs)
-#
-#         self.parents.append(self.row.parent)
-#         self.parents.append(self.row.parent.parent)
-#
-#         self.analysis.session.flush()
-#
-#     def __repr__(self):
-#         return f"Phase(id={self.id}, " \
-#                f"rec_date='{self.rec_date}', " \
-#                f"rec_id='{self.rec_id}', " \
-#                f"animal_id='{self.animal_id}')"
-#
-#     @classmethod
-#     def unique_identifier(cls, row: PhaseTable) -> tuple:
-#         return Phase.__name__, row.parent.parent.id, row.parent.id, row.parent.date, row.id
-#
-#     @staticmethod
-#     def create(recording: Recording, phase_id: int, analysis: Analysis):
-#         # Add row
-#         row = PhaseTable(parent=recording.row, id=phase_id)
-#         analysis.session.add(row)
-#         # Immediately commit if not in create mode
-#         if not analysis.is_create_mode:
-#             analysis.session.commit()
-#
-#         # Add entity
-#         entity = Phase(row=row, analysis=analysis)
-#         entity._create_file()
-#
-#         return entity
-#
-#     @property
-#     def parent(self):
-#         return self.recording
-#
-#     @property
-#     def path(self) -> str:
-#         return f'{self.parent.path}/phases/{self.id}'
-#
-#     @property
-#     def id(self) -> int:
-#         return self._row.id
-#
-#     @property
-#     def animal_id(self) -> str:
-#         return self.parent.parent.id
-#
-#     @property
-#     def rec_date(self) -> date:
-#         return self.recording.rec_date
-#
-#     @property
-#     def rec_id(self) -> str:
-#         return self.recording.id
-#
-#     @property
-#     def animal(self) -> Animal:
-#         return Animal(analysis=self.analysis, row=self.row.parent.parent)
-#
-#     @property
-#     def recording(self) -> Recording:
-#         return Recording(analysis=self.analysis, row=self.row.parent)
-#
-#     def export_to(self, f: h5py.File):
-#
-#         with h5py.File(f'{self.analysis.analysis_path}/{self.path}/data.hdf5', 'r') as f2:
-#             f2.copy(source='/', dest=f, name=self.path)
-#
-#         try:
-#             f[self.path].attrs.update(self.scalar_attributes)
-#         except:
-#             for k, v in self.scalar_attributes.items():
-#                 try:
-#                     f[self.path].attrs[k] = v
-#                 except:
-#                     print(f'Failed to export scalar attribute {k} in {self} (type: {type(v)})')
-#
-#
-# class Roi(Entity):
-#     entity_table = RoiTable
-#     attr_value_table = RoiValueTable
-#
-#     def __init__(self, *args, **kwargs):
-#         Entity.__init__(self, *args, **kwargs)
-#
-#         self.parents.append(self.row.parent)
-#         self.parents.append(self.row.parent.parent)
-#
-#         self.analysis.session.flush()
-#
-#     def __repr__(self):
-#         return f"Roi(id={self.id}, " \
-#                f"rec_date='{self.rec_date}', " \
-#                f"rec_id='{self.rec_id}', " \
-#                f"animal_id='{self.animal_id}')"
-#
-#     @staticmethod
-#     def create(recording: Recording, roi_id: int, analysis: Analysis):
-#         # Add row
-#         row = RoiTable(parent=recording.row, id=roi_id)
-#         analysis.session.add(row)
-#         # Immediately commit if not in create mode
-#         if not analysis.is_create_mode:
-#             analysis.session.commit()
-#
-#         # Add entity
-#         entity = Roi(row=row, analysis=analysis)
-#         entity._create_file()
-#
-#         return entity
-#
-#     @property
-#     def path(self) -> str:
-#         return f'{self.parent.path}/rois/{self.id}'
-#
-#     @property
-#     def parent(self):
-#         return self.recording
-#
-#     @property
-#     def id(self) -> int:
-#         return self._row.id
-#
-#     @property
-#     def animal_id(self) -> str:
-#         return self.animal.id
-#
-#     @property
-#     def rec_date(self) -> date:
-#         return self.recording.rec_date
-#
-#     @property
-#     def rec_id(self) -> str:
-#         return self.recording.id
-#
-#     @property
-#     def animal(self) -> Animal:
-#         return Animal(analysis=self.analysis, row=self.row.parent.parent)
-#
-#     @property
-#     def recording(self) -> Recording:
-#         return Recording(analysis=self.analysis, row=self.row.parent)
-#
-#     def export_to(self, f: h5py.File):
-#
-#         with h5py.File(f'{self.analysis.analysis_path}/{self.path}/data.hdf5', 'r') as f2:
-#             f2.copy(source='/', dest=f, name=self.path)
-#
-#         try:
-#             f[self.path].attrs.update(self.scalar_attributes)
-#         except:
-#             for k, v in self.scalar_attributes.items():
-#                 try:
-#                     f[self.path].attrs[k] = v
-#                 except:
-#                     print(f'Failed to export scalar attribute {k} in {self} (type: {type(v)})')
+    def create_task(self, fun: Callable, **kwargs):
+
+        print(f'Create new task for {fun.__name__} with args '
+              f'{[f"{k}:{v}" for k, v in kwargs.items()]} on {len(self)} entities')
+
+        funstr = cloudpickle.dumps(fun)
+        argstr = cloudpickle.dumps(kwargs)
+
+        task_row = TaskTable(target_fun=funstr, target_args=argstr)
+        self.analysis.session.add(task_row)
+        self.analysis.session.commit()
+
+        for entity in self:
+
+            if isinstance(entity, Animal):
+                _id = {'animal_pk': entity.row.pk}
+            elif isinstance(entity, Recording):
+                _id = {'recording_pk': entity.row.pk}
+            elif isinstance(entity, Roi):
+                _id = {'roi_pk': entity.row.pk}
+            elif isinstance(entity, Phase):
+                _id = {'phase_pk': entity.row.pk}
+            else:
+                raise ValueError(f'What is a {entity}?')
+
+            # Add to task
+            self.analysis.session.add(TaskedEntityTable(task_pk=task_row.pk, **_id))
+
+        self.analysis.session.commit()
 

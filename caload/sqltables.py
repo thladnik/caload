@@ -127,10 +127,3 @@ class EntityTaskTable(SQLBase):
 
     status: Mapped[int] = mapped_column(nullable=False, default=0, index=True)  # 0: pending, 1: acquired, 2: finished
 
-
-if __name__ == '__main__':
-
-    engine = create_engine('mysql+pymysql://python_analysis:start123@localhost:3306/python_analysis')
-
-    SQLBase.metadata.create_all(engine)
-
