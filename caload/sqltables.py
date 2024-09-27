@@ -3,11 +3,11 @@ from datetime import date, datetime
 from typing import List
 
 from sqlalchemy import Index, ForeignKey, String, create_engine
-from sqlalchemy.dialects.mysql import MEDIUMBLOB
+from sqlalchemy.dialects.mysql import LONGBLOB, MEDIUMBLOB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 __all__ = ['SQLBase', 'EntityTypeTable', 'EntityTable',
-           'AttributeTable', 'AttributeBlobTable', 'TaskTable', 'EntityTaskTable']
+           'AttributeTable', 'TaskTable', 'EntityTaskTable']
 
 
 class SQLBase(DeclarativeBase):
@@ -15,15 +15,6 @@ class SQLBase(DeclarativeBase):
 
 
 # Entities
-
-# class EntityHierarchyTable(SQLBase):
-#
-#     __tablename__ = 'entity_hierarchy'
-#
-#     child_entity_type_pk: Mapped[int] = mapped_column(ForeignKey('entity_types.pk'), primary_key=True)
-#     child_entity_type: Mapped['EntityTypeTable'] = relationship('EntityTypeTable', back_populates='')
-#     parent_entity_type_pk: Mapped[int] = mapped_column(ForeignKey('entity_types.pk'), primary_key=True)
-
 
 class EntityTypeTable(SQLBase):
     __tablename__ = 'entity_types'
@@ -66,15 +57,12 @@ class EntityTable(SQLBase):
 # Attributes
 
 class AttributeTable(SQLBase):
-    __tablename__ = 'attribute_values'
+    __tablename__ = 'attributes'
 
     entity_pk: Mapped[int] = mapped_column(ForeignKey('entities.pk'), primary_key=True)
     entity: Mapped['EntityTable'] = relationship('EntityTable', back_populates='attributes')
 
     name: Mapped[str] = mapped_column(String(500), primary_key=True, index=True)
-
-    value_blob_pk: Mapped[int] = mapped_column(ForeignKey('attribute_blobs.pk'), nullable=True)
-    value_blob: Mapped['AttributeBlobTable'] = relationship('AttributeBlobTable')
 
     value_str: Mapped[str] = mapped_column(String(500), nullable=True)
     value_int: Mapped[int] = mapped_column(nullable=True)
@@ -82,44 +70,38 @@ class AttributeTable(SQLBase):
     value_bool: Mapped[bool] = mapped_column(nullable=True)
     value_date: Mapped[date] = mapped_column(nullable=True)
     value_datetime: Mapped[datetime] = mapped_column(nullable=True)
+    value_blob: Mapped[bytes] = mapped_column(LONGBLOB, nullable=True)
     value_path: Mapped[str] = mapped_column(String(500), nullable=True)
-    column_str: Mapped[str] = mapped_column(String(500), nullable=True)
+    data_type: Mapped[str] = mapped_column(String(500), nullable=True)
 
     is_persistent: Mapped[bool] = mapped_column(nullable=True)
 
     def __repr__(self):
-        return f"<{self.__class__.__name__}({self.entity}, {self.attribute.name}, {self.value})>"
+        return f"<{self.__class__.__name__}({self.entity}, {self.name}, {self.value})>"
 
     @property
     def value(self):
 
-        if self.column_str is None:
+        if self.data_type is None:
             return None
 
         # If blob, load from associated row in AttributeBlobTable
-        if self.column_str == 'value_blob':
-            return pickle.loads(self.value_blob.value)
+        if self.data_type == 'blob':
+            return pickle.loads(self.value_blob)
 
         # Otherwise load from this row based on column_str
-        return getattr(self, self.column_str)
+        return getattr(self, f'value_{self.data_type}')
 
     @value.setter
     def value(self, value):
 
         # If blob, dump to associated row in AttributeBlobTable
-        if self.column_str == 'value_blob':
-            self.value_blob.value = pickle.dumps(value)
+        if self.data_type == 'blob':
+            self.value_blob = pickle.dumps(value)
             return
 
         # Otherwise write directly
-        setattr(self, self.column_str, value)
-
-
-class AttributeBlobTable(SQLBase):
-    __tablename__ = 'attribute_blobs'
-    pk: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-
-    value: Mapped[bytes] = mapped_column(MEDIUMBLOB, nullable=True)
+        setattr(self, f'value_{self.data_type}', value)
 
 
 # Tasks

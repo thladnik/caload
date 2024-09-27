@@ -224,7 +224,7 @@ def _generate_attribute_filters(entity_type_name: str, session: Session,
             .subquery()
 
     elif operator == 'NOT':
-        return not_(_generate_attribute_filters(session, astree['right_operand']))
+        return not_(_generate_attribute_filters(entity_type_name, session, astree['right_operand']))
 
     # Fallback
     else:

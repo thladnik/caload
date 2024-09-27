@@ -45,22 +45,61 @@ __all__ = ['Animal', 'Recording', 'Roi', 'Phase', 'digest_folder', 'schema']
 
 
 class Animal(Entity):
-    pass
+
+    @property
+    def recordings(self) -> EntityCollection:
+        return self.analysis.get(Recording, animal_id=self.id)
+
+    @property
+    def rois(self) -> EntityCollection:
+        return self.analysis.get(Roi, animal_id=self.id)
+
+    @property
+    def phases(self) -> EntityCollection:
+        return self.analysis.get(Phase, animal_id=self.id)
 
 
 class Recording(Entity):
 
     parent_type = Animal
 
+    @property
+    def animal(self) -> Animal:
+        return Animal(analysis=self.analysis, row=self._row.parent)
+
+    @property
+    def rois(self) -> EntityCollection:
+        return self.analysis.get(Roi, animal_id=self.animal.id, rec_id=self.id)
+
+    @property
+    def phases(self) -> EntityCollection:
+        return self.analysis.get(Phase, animal_id=self.animal.id, rec_id=self.id)
+
 
 class Roi(Entity):
 
     parent_type = Recording
 
+    @property
+    def animal(self) -> Animal:
+        return Animal(analysis=self.analysis, row=self.row.parent.parent)
+
+    @property
+    def recording(self) -> Recording:
+        return Recording(analysis=self.analysis, row=self.row.parent)
+
 
 class Phase(Entity):
 
     parent_type = Recording
+
+    @property
+    def animal(self) -> Animal:
+        return Animal(analysis=self.analysis, row=self.row.parent.parent)
+
+    @property
+    def recording(self) -> Recording:
+        return Recording(analysis=self.analysis, row=self.row.parent)
 
 
 schema = [Animal, Recording, Roi, Phase]
@@ -79,6 +118,7 @@ def digest_folder(analysis: caload.analysis.Analysis):
 
         # Add animal
         animal = get_animal(analysis, recording_path)
+        analysis.session.commit()
 
         recording = get_recording(animal, recording_path)
 

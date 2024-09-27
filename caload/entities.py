@@ -11,19 +11,19 @@ from abc import abstractmethod
 
 from datetime import datetime, date, timedelta
 from pathlib import Path
-from typing import Any, Callable, Dict, List, TYPE_CHECKING, Tuple, Type, Union
+from typing import Any, Callable, Dict, List, TYPE_CHECKING, Tuple, Type, TypeVar, Union
 
 import h5py
 import numpy as np
 import pandas as pd
-from sqlalchemy import text
+from sqlalchemy import case, func, text
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.orm import Query, aliased, joinedload
 from tqdm import tqdm
 
 import caload
 from caload.sqltables import *
-from caload import utils
+from caload import files, utils
 
 if TYPE_CHECKING:
     from caload.analysis import Analysis
@@ -50,7 +50,7 @@ class Entity:
         self._parent_row = row.parent
 
     def __repr__(self):
-        return f"{self.entity_type_name} entity(id='{self.row.id}', parent={self.parent})"
+        return f"{self.__class__.__name__}(id='{self.row.id}', parent={self.parent})"
 
     def __contains__(self, item):
         # subquery = self.analysis.session.query(AttributeTable.pk).filter(AttributeTable.name == item).subquery()
@@ -69,27 +69,15 @@ class Entity:
         # Fetch first (only row)
         value_row = value_query.first()
 
-        column_str = value_row.column_str
+        column_str = value_row.data_type
         value = value_row.value
 
         # Anything that isn't a referenced path gets returned immediately
-        if column_str != 'value_path':
+        if column_str != 'path':
             return value
 
-        # Load and return referenced dataset
-        file_type, *file_info = value.split(':')
-
-        if file_type == 'hdf5':
-            file_path, key = file_info
-            with h5py.File(os.path.join(self.analysis.analysis_path, file_path), 'r') as f:
-                return f[key][:]
-
-        elif file_type == 'pkl':
-            file_path, = file_info
-            with open(os.path.join(self.analysis.analysis_path, file_path), 'rb') as f2:
-                return pickle.load(f2)
-
-        raise KeyError(f'No attribute with name {item} in {self}')
+        # Read from filepath
+        return files.read(self.analysis, value)
 
     def __setitem__(self, key: str, value: Any):
 
@@ -98,25 +86,23 @@ class Entity:
             # Convert to the corresponding Python built-in type using the item() method
             value = value.item()
 
-        value_row = None
+        attribute_row = None
         # Query attribute row if not in create mode
         if not self.analysis.is_create_mode:
             # Build query
-            value_query = (self.analysis.session.query(AttributeTable)
+            attribute_row = (self.analysis.session.query(AttributeTable)
                            .filter(AttributeTable.name == key, AttributeTable.entity_pk == self.row.pk))
 
             # Evaluate
-            if value_query.count() == 1:
-                value_row = value_query.one()
-            elif value_query.count() > 1:
+            if attribute_row.count() == 1:
+                attribute_row = attribute_row.one()
+            elif attribute_row.count() > 1:
                 raise ValueError('Wait a minute...')
 
         # Create row if it doesn't exist yet
-        value_row_is_new = False
-        if value_row is None:
-            value_row = AttributeTable(entity_pk=self.row.pk, name=key, is_persistent=self.analysis.is_create_mode)
-            self.analysis.session.add(value_row)
-            value_row_is_new = True
+        if attribute_row is None:
+            attribute_row = AttributeTable(entity=self.row, name=key, is_persistent=self.analysis.is_create_mode)
+            self.analysis.session.add(attribute_row)
 
         # Set scalars
         if type(value) in (str, float, int, bool, date, datetime):
@@ -131,7 +117,7 @@ class Entity:
                 value_type = 'blob'
 
             # Set column string
-            column_str = f'value_{value_type}'
+            data_type_str = value_type
 
         # NOTE: there is no universal way to get the byte number of objects
         # Builtin object have __sizeof__(), but this only returns the overhead for some numpy.ndarrays
@@ -141,34 +127,42 @@ class Entity:
                 or (isinstance(value, np.ndarray) and value.nbytes < self.analysis.max_blob_size):
 
             # Set value type
-            column_str = 'value_blob'
+            data_type_str = 'blob'
 
         # Set large objects
         else:
 
             # Set value type
-            column_str = 'value_path'
+            data_type_str = 'path'
 
             # Write any non-scalar data that is too large according to specified bulk storage format
-            value = getattr(self, f'_write_{self.analysis.bulk_format}')(key, value, value_row.value)
+            data_path = attribute_row.value
 
-        # Create new blob row
-        if value_row_is_new and column_str == 'value_blob':
-            blob_row = AttributeBlobTable()
-            self.analysis.session.add(blob_row)
-            value_row.value_blob = blob_row
+            # If not data_path is set yet, generate it
+            if data_path is None:
+                if isinstance(value, np.ndarray):
+                    data_path = f'hdf5:{self.path}/data.hdf5:{key}'
+                else:
+                    data_path = f'pkl:{self.path}/{key.replace("/", "_")}'
+
+            files.write(self.analysis.analysis_path, key, value, data_path)
+            # value = getattr(self, f'_write_{self.analysis.bulk_format}')(key, value, attribute_row.value)
 
         # Reset old value in case it was set to different type before
-        if type(value_row.column_str) is str and value_row.column_str != column_str and value_row.value is not None:
-            value_row.value = None
+        if type(attribute_row.data_type) is str and attribute_row.data_type != data_type_str and attribute_row.value is not None:
+            attribute_row.value = None
 
         # Set row type and value
-        value_row.column_str = column_str
-        value_row.value = value
+        attribute_row.data_type = data_type_str
+        attribute_row.value = value
 
         # Commit changes (right away if not in create mode)
         if not self.analysis.is_create_mode:
             self.analysis.session.commit()
+
+    @property
+    def pk(self):
+        return self.row.pk
 
     @property
     def id(self):
@@ -177,81 +171,24 @@ class Entity:
     def add_child_entity(self, entity_type: Union[str, Type[Entity]], entity_id: str):
         return self.analysis.add_entity(entity_type, entity_id, parent_entity=self)
 
-    def _write_hdf5(self, key: str, value: Any, data_path) -> str:
-
-        # If not data_path is provided, generate it
-        if data_path is None:
-            if isinstance(value, np.ndarray):
-                data_path = f'hdf5:{self.path}/data.hdf5:{key}'
-            else:
-                data_path = f'pkl:{self.path}/{key.replace("/", "_")}'
-
-        # Decode data path
-        file_type, *file_info = data_path.split(':')
-        if file_type == 'hdf5':
-            path, key = file_info
-        else:
-            path, = file_info
-
-        # Write data to file
-        if file_type == 'hdf5':
-            pending = True
-            start = time.perf_counter()
-            while pending:
-                try:
-                    with h5py.File(os.path.join(self.analysis.analysis_path, path), 'a') as f:
-                        if key not in f:
-                            f.create_dataset(key, data=value,
-                                             compression=self.analysis.compression,
-                                             compression_opts=self.analysis.compression_opts)
-                        else:
-                            if value.shape != f[key].shape:
-                                del f[key]
-                                f.create_dataset(key, data=value,
-                                                 compression=self.analysis.compression,
-                                                 compression_opts=self.analysis.compression_opts)
-                            else:
-                                f[key][:] = value
-
-                except Exception as _exc:
-                    if (time.perf_counter() - start) > self.analysis.write_timeout:
-                        import traceback
-                        raise TimeoutError(f'Failed to write attribute {key} to {key} '
-                                           f'// Traceback: {traceback.format_exc()}')
-                    else:
-                        time.sleep(10 ** -6)
-                else:
-                    pending = False
-
-        # TODO: alternative to pickle dumps? Writing arbitrary raw binary data to HDF5 seems difficult
-        # Dump all other types as binary strings
-        else:
-            with open(os.path.join(self.analysis.analysis_path, path), 'wb') as f:
-                pickle.dump(value, f)
-
-        return data_path
-
-    def _write_asdf(self, key: str, value: Any, row: AttributeTable = None):
-        pass
-
     @property
     def scalar_attributes(self):
         # Get all
-        query = (self.analysis.session.query(self.attr_value_table)
-                 .filter(self.attr_value_table.entity_pk == self.row.pk)
-                 .filter(self.attr_value_table.column_str.not_in(['value_path', 'value_blob'])))
+        query = (self.analysis.session.query(AttributeTable)
+                 .filter(AttributeTable.entity_pk == self.row.pk)
+                 .filter(AttributeTable.data_type.not_in(['path', 'blob'])))
         return {value_row.name: value_row.value for value_row in query.all()}
 
     @property
     def attributes(self):
         # Get all
-        query = (self.analysis.session.query(self.attr_value_table)
-                 .filter(self.attr_value_table.entity_pk == self.row.pk))
+        query = (self.analysis.session.query(AttributeTable)
+                 .filter(AttributeTable.entity_pk == self.row.pk))
 
         # Update
         attributes = {}
         for value_row in query.all():
-            if value_row.column_str == 'value_path':
+            if value_row.data_type == 'path':
                 attributes[value_row.name] = self[value_row.name]
             else:
                 attributes[value_row.name] = value_row.value
@@ -297,6 +234,9 @@ class Entity:
                 pass
 
 
+E = TypeVar('E')
+
+
 class EntityCollection:
     analysis: Analysis
     _query: Query
@@ -304,13 +244,33 @@ class EntityCollection:
     _iteration_count: int = -1
     _batch_offset: int = 0
     _batch_size: int = 100
-    _batch_results: List[Entity]
+    _batch_results: List[EntityTable]
+    _entity_type: Union[Type[Entity], Type[E]]
+    _entity_type_name: str
 
-    def __init__(self, entity_type_name: str, analysis: Analysis, query: Query):
-        self.entity_type_name = entity_type_name
+    def __init__(self, entity_type: Union[str, Type[E]], analysis: Analysis, query: Query):
+
+        if isinstance(entity_type, str):
+            self._entity_type_name = entity_type
+            self._entity_type = Entity
+        else:
+            if type(entity_type) is not type or not issubclass(entity_type, Entity):
+                raise TypeError('Entity type has to be either str or a subclass of Entity')
+
+            self._entity_type = entity_type
+            self._entity_type_name = self._entity_type.__name__
+
+            # if self.entity_type_name in globals() and issubclass(globals()[self.entity_type_name], Entity):
+            #     self.entity_type = globals()[self.entity_type_name]
+            # else:
+            #     self.entity_type = Entity
+
         self.analysis = analysis
         self._query = query
         self._query_custom_orderby = False
+
+    def __repr__(self):
+        return f'{self._entity_type_name}Collection({len(self)})'
 
     def __len__(self):
         if self._entity_count < 0:
@@ -320,7 +280,7 @@ class EntityCollection:
     def __iter__(self):
         return self
 
-    def __next__(self):
+    def __next__(self) -> Union[Entity, E]:
 
         # Increment count
         self._iteration_count += 1
@@ -338,15 +298,15 @@ class EntityCollection:
             raise StopIteration
 
         # Return single result
-        return self._get_entity(self._batch_results[self._iteration_count % self._batch_size])
+        return self._entity_type(row=self._batch_results[self._iteration_count % self._batch_size], analysis=self.analysis)
 
-    def __getitem__(self, item) -> Union[Entity, List[Entity], pd.DataFrame]:
+    def __getitem__(self, item) -> Union[Entity, E, List[Entity], List[E], pd.DataFrame]:
 
         # Return single entity
         if isinstance(item, (int, np.integer)):
             if item < 0:
                 item = len(self) + item
-            return self._get_entity(self.query.offset(item).limit(1)[0])
+            return self._entity_type(row=self.query.offset(item).limit(1)[0], analysis=self.analysis)
 
         # Return slice
         if isinstance(item, slice):
@@ -355,7 +315,7 @@ class EntityCollection:
                 raise KeyError('Invalid step size 0')
 
             # Get data
-            result = [self._get_entity(row) for row in self.query.offset(start).limit(stop - start)]
+            result = [self._entity_type(row=row, analysis=self.analysis) for row in self.query.offset(start).limit(stop - start)]
 
             # TODO: there should be a way to directly query the n-th row using 'ROW_NUMBER() % n'
             #  but it's not clear how is would work in SQLAlchemy ORM; figure out later
@@ -406,27 +366,26 @@ class EntityCollection:
                 raise TypeError('')
 
             # Rename value column
-            columns_str = f'value_{dtype_str}'
-            df_insert.rename(columns={attr_name: columns_str}, inplace=True)
+            data_type_str = dtype_str
+            df_insert.rename(columns={attr_name: data_type_str}, inplace=True)
 
             # Add PK set
             df_insert['entity_pk'] = df_insert.index
             df_insert['name'] = attr_name
-            df_insert['column_str'] = columns_str
-            df_insert['is_persistent'] = False
+            df_insert['data_type'] = data_type_str
+            df_insert['is_persistent'] = self.analysis.is_create_mode
 
             insert_attr_data = df_insert.to_dict('records')
 
             insert_stmt = mysql_insert(AttributeTable).values(insert_attr_data)
 
-            update_attr_data = {columns_str: getattr(insert_stmt.inserted, columns_str),
+            update_attr_data = {data_type_str: getattr(insert_stmt.inserted, data_type_str),
                                 'is_persistent': insert_stmt.inserted.is_persistent,
-                                'column_str': columns_str}
+                                'data_type': data_type_str}
 
             upsert_stmt = insert_stmt.on_duplicate_key_update(update_attr_data)
             self.analysis.session.execute(upsert_stmt)
             self.analysis.session.commit()
-
 
     @property
     def query(self):
@@ -450,9 +409,6 @@ class EntityCollection:
                        .filter(AttributeTable.name == attribute_name)
                        .filter(AttributeTable.entity_pk.in_(entity_query)))
 
-        if include_blobs:
-            value_query = value_query.options(joinedload(AttributeTable.value_blob))
-
         return value_query.all()
 
     def _dataframe_of(self, attribute_names: List[str] = None,
@@ -461,68 +417,103 @@ class EntityCollection:
         # Add to excluded list
         excluded = []
         if not include_blobs:
-            excluded.append('value_blob')
+            excluded.append('blob')
         if not include_bulk:
-            excluded.append('value_path')
+            excluded.append('path')
 
-        # Iterate through specified attributes
-        cols = []
-        for attr_name in attribute_names:
+        # Query distinct attribute names and their corresponding types
+        attribute_query = self.analysis.session.query(AttributeTable.name, AttributeTable.data_type).join(
+            EntityTable).join(EntityTypeTable).filter(EntityTypeTable.name == self._entity_type_name,
+                                                      AttributeTable.data_type.notin_(excluded))
+        # Filter for user-defined attributes
+        if attribute_names is not None:
+            attribute_query = attribute_query.filter(AttributeTable.name.in_(attribute_names))
 
-            # Fetch rows
-            rows = self._column(attr_name, include_blobs=include_blobs)
+        # Get names and types
+        selected_attribute_names, attribute_types = zip(*attribute_query.distinct().all())
 
-            # Get indices and data
-            idcs = [v.entity_pk for v in rows if v.column_str not in excluded]
-            data = [v.value for v in rows if v.column_str not in excluded]
+        if attribute_names is not None and len(attribute_names) != len(selected_attribute_names):
+            raise Warning(f'Number selected attributes does not match number requested. '
+                          f'{len(attribute_types)} != {len(selected_attribute_names)}. '
+                          f'Some requested attributes may be blob or path and not included')
 
-            # Create series
-            series = pd.Series(index=idcs, data=data, name=attr_name)
+        # Build case for each attribute so query returns correct type field
+        cases = []
+        for attr_name in selected_attribute_names:
+            cases.append(
+                func.max(case(
+                    (AttributeTable.name == attr_name,
+                     case((AttributeTable.data_type == 'int', AttributeTable.value_int),
+                          (AttributeTable.data_type == 'str', AttributeTable.value_str),
+                          (AttributeTable.data_type == 'float', AttributeTable.value_float),
+                          (AttributeTable.data_type == 'date', AttributeTable.value_date),
+                          (AttributeTable.data_type == 'datetime', AttributeTable.value_datetime),
+                          (AttributeTable.data_type == 'blob', AttributeTable.value_blob),
+                          (AttributeTable.data_type == 'path', AttributeTable.value_path),
+                          else_=None)
+                     ),
+                    else_=None)).label(name=attr_name)
+            )
 
-            # Include if not empty
-            if series.count() > 0:
-                cols.append(series)
+        # Create query
+        query = (
+            self.analysis.session.query(
+                EntityTable.pk,
+                EntityTable.id,
+                *cases  # Dynamically added case expressions
+            )
+            .join(AttributeTable, EntityTable.pk == AttributeTable.entity_pk)
+            # .filter(EntityTable.pk.in_([13, 15, 4201]))
+            .filter(EntityTable.pk.in_(self.query.subquery().primary_key))
+            .group_by(EntityTable.pk, EntityTable.id)
+        )
 
-        return pd.concat(cols, axis=1)
+        # Add PK and ID to columns to match query result
+        columns = ('pk', 'entity_id') + selected_attribute_names
+
+        # Create DataFrame from query result
+        df = pd.DataFrame(columns=columns, data=query.all())
+
+        # Convert all types correctly (default result will likely contain bytestring values
+        for attr_name, attr_type in zip(selected_attribute_names, attribute_types):
+            if attr_type == 'int':
+                df[attr_name] = df[attr_name].astype(int)
+            elif attr_type == 'float':
+                df[attr_name] = df[attr_name].astype(float)
+            elif attr_type == 'str':
+                df[attr_name] = df[attr_name].astype(str)
+            elif attr_type == 'date':
+                df[attr_name] = pd.to_datetime(df[attr_name].apply(lambda s: s.decode()), format='%Y-%m-%d')
+            elif attr_type == 'datetime':
+                df[attr_name] = pd.to_datetime(df[attr_name].apply(lambda s: s.decode()), format='%Y-%m-%d %H:%M:%S')
+            elif attr_type == 'blob':
+                df[attr_name] = df[attr_name].apply(lambda s: pickle.loads(s) if s is not None else None)
+            elif attr_type == 'path':
+                df[attr_name] = df[attr_name].apply(lambda s: files.read(self.analysis, s) if s is not None else None)
+
+        # Set row index to PKs
+        df.set_index('pk', drop=True, inplace=True)
+
+        # Return final DataFrame
+        return df
 
     def where(self, *expr) -> EntityCollection:
-        query = caload.filter.get_entity_query_by_attributes(self.entity_type_name, self.analysis.session,
+        query = caload.filter.get_entity_query_by_attributes(self._entity_type_name, self.analysis.session,
                                                              ' AND '.join(expr), entity_query=self.query)
 
-        return EntityCollection(self.entity_type_name, analysis=self.analysis, query=query)
+        return EntityCollection(self._entity_type_name, analysis=self.analysis, query=query)
 
     @property
-    def attribute_rows(self):
-        unique_attr_query = (self.analysis.session.query(self._entity_type.attr_value_table.attribute_pk)
-                             .filter(
-            self._entity_type.attr_value_table.entity_pk.in_(self.query.subquery().primary_key))
-                             .group_by(self._entity_type.attr_value_table.attribute_pk))
-
-        return (self.analysis.session.query(AttributeTable)
-                .filter(AttributeTable.pk.in_(unique_attr_query.subquery().select()))).all()
+    def scalar_attributes(self):
+        """Get a pandas.DataFrame of all entities in this collection (rows) and their attributes
+        """
+        return self._dataframe_of(attribute_names=None, include_blobs=False, include_bulk=False)
 
     @property
-    def dataframe(self):
-
-        attribute_rows = self.attribute_rows
-
-        # Return dataframe of all attributes
-        return self._dataframe_of(attribute_names=[str(row.name) for row in attribute_rows],
-                                  attribute_pks=[int(row.pk) for row in attribute_rows],
-                                  include_blobs=False, include_bulk=False)
-
-    @property
-    def extended_dataframe(self):
-
-        attribute_rows = self.attribute_rows
-
-        # Return dataframe of all attributes
-        return self._dataframe_of(attribute_names=[str(row.name) for row in attribute_rows],
-                                  attribute_pks=[int(row.pk) for row in attribute_rows],
-                                  include_blobs=True, include_bulk=False)
-
-    def _get_entity(self, row: EntityTable) -> Entity:
-        return Entity(row=row, analysis=self.analysis)
+    def attributes(self):
+        """Get a pandas.DataFrame of all entities in this collection (rows) and their attributes, including binary data
+        """
+        return self._dataframe_of(attribute_names=None, include_blobs=True, include_bulk=False)
 
     # def sortby(self, name: str, order: str = 'ASC'):
     #     # TODO: implement sorting
@@ -638,6 +629,8 @@ class EntityCollection:
 
         return elapsed_time
 
+    def save_to(self, filepath: Union[str, os.PathLike]):
+        pass
 
 # class Animal(Entity):
 #     entity_table = AnimalTable

@@ -7,7 +7,7 @@ import sys
 from datetime import date
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Tuple, Type, Union
+from typing import Any, Callable, Dict, List, Tuple, Type, TypeVar, Union
 
 import yaml
 from sqlalchemy import Engine, create_engine, text
@@ -19,6 +19,9 @@ from caload.filter import *
 from caload.sqltables import *
 
 __all__ = ['Analysis', 'Mode', 'open_analysis']
+
+
+E = TypeVar('E')
 
 
 class Mode(Enum):
@@ -264,12 +267,15 @@ class Analysis:
     write_timeout = 3.  # s
     lazy_init: bool
     echo: bool
-    _row: EntityTable
 
+    # Root analysis entity row
+    _row: EntityTable
     # Entity type name -> entity type PK
     _entity_type_pk_map: Dict[str, int]
     # Child entity type -> parent entity type
-    _entity_hierachy_map: Dict[str, Union[str, None]]
+    _entity_type_hierachy_map: Dict[str, Union[str, None]]
+    # # Entity type name -> entity type row
+    _entity_type_row_map: Dict[str, EntityTypeTable]
 
     def __init__(self, path: str, mode: Mode = Mode.analyse, lazy_init: bool = False,
                  echo: bool = False, select_analysis: str = None):
@@ -278,7 +284,8 @@ class Analysis:
         self.mode = mode
         self.is_create_mode = mode is Mode.create
         self._entity_type_pk_map = {}
-        self._entity_hierachy_map = {}
+        self._entity_type_hierachy_map = {}
+        self._entity_type_row_map = {}
 
         # Set path as posix
         self._analysis_path = Path(path).as_posix()
@@ -306,16 +313,17 @@ class Analysis:
         entity_type_rows = self.session.query(EntityTypeTable).order_by(EntityTypeTable.pk).all()
 
         # Create name to pk map
+        self._entity_type_row_map = {str(row.name): row for row in entity_type_rows}
         self._entity_type_pk_map = {str(row.name): int(row.pk) for row in entity_type_rows}
 
         # Create hierarchy map
-        self._entity_hierachy_map = {}
+        self._entity_type_hierachy_map = {}
         for row in entity_type_rows:
             parent = None
             if row.parent is not None:
                 parent = str(row.parent.name)
 
-            self._entity_hierachy_map[str(row.name)] = parent
+            self._entity_type_hierachy_map[str(row.name)] = parent
 
     def __repr__(self):
         return f"Analysis('{self.analysis_path}')"
@@ -335,20 +343,24 @@ class Analysis:
 
         # Check if parent has correct entity type
         if parent_entity is not None:
-            if parent_entity.row.entity_type.name != self._entity_hierachy_map[entity_type_name]:
-                raise ValueError(f'Entity type {entity_type_name} has not parent type {parent_entity.row.entity_type.name}')
+            if parent_entity.row._entity_type.name != self._entity_type_hierachy_map[entity_type_name]:
+                raise ValueError(f'Entity type {entity_type_name} has not parent type {parent_entity.row._entity_type.name}')
 
             parent_entity_row = parent_entity.row
         else:
             # If no parent entity was provided, this should be top level
-            if self._entity_hierachy_map[entity_type_name] != 'Analysis':
+            if self._entity_type_hierachy_map[entity_type_name] != 'Analysis':
                 raise Exception('No parent entity provided, but entity type is not top level')
             parent_entity_row = self._row
 
         # Add row
-        row = EntityTable(parent=parent_entity_row, entity_type_pk=self._entity_type_pk_map[entity_type_name], id=entity_id)
+        # row = EntityTable(parent=parent_entity_row, entity_type_pk=self._entity_type_pk_map[entity_type_name], id=entity_id)
+        row = EntityTable(parent=parent_entity_row, entity_type=self._entity_type_row_map[entity_type_name], id=entity_id)
         self.session.add(row)
-        self.session.commit()
+
+        # Commit
+        if not self.is_create_mode:
+            self.session.commit()
 
         # Add entity
         entity = Entity(row=row, analysis=self)
@@ -417,33 +429,37 @@ class Analysis:
         del self.session
         del self.sql_engine
 
-    def get(self, entity_type: Union[str, Type[Entity]],
-            *filter_expressions,
-            entity_query: Query = None,
-            **equalities) -> EntityCollection:
+    def get(self, entity_type: Union[str, Type[Entity], Type[E]], *filter_expressions: str,
+            entity_query: Query = None, **equalities: Dict[str, Any]) -> EntityCollection:
 
         self.open_session()
 
-        # Get str
-        if issubclass(entity_type, Entity):
-            entity_type_name = entity_type.__name__
-        elif isinstance(entity_type, str):
+        # Get entity name
+        if isinstance(entity_type, str):
             entity_type_name = entity_type
         else:
-            raise TypeError(f'entity_type has to be type Entity or str, not {type(entity_type)}')
+            if type(entity_type) is not type or not issubclass(entity_type, Entity):
+                raise TypeError('Entity type has to be either str or a subclass of Entity')
+
+            entity_type_name = entity_type.__name__
 
         # Add equality filters to filter expressions
         for k, v in equalities.items():
+
+            # Add quotes to string
+            if isinstance(v, str):
+                v = f'"{v}"'
+
             filter_expressions = filter_expressions + (f'{k} == {v}',)
 
         # Concat expression
         expr = ' AND '.join(filter_expressions)
 
+        # Get filter query
         query = get_entity_query_by_attributes(entity_type_name, self.session, expr, entity_query=entity_query)
 
-        # print(query)
-
-        return EntityCollection(entity_type_name, analysis=self, query=query)
+        # Return collection for resulting query
+        return EntityCollection(entity_type, analysis=self, query=query)
 
     def get_temp_path(self, path: str):
         temp_path = os.path.join(self.analysis_path, 'temp', path)
