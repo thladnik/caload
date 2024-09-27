@@ -221,7 +221,7 @@ def digest_folder(analysis: caload.analysis.Analysis):
 
                 # If dataset, write to file
                 if isinstance(member1, h5py.Dataset):
-                    recording[f'display/{key1}'] = member1[:]
+                    recording[f'display/{key1}'] = np.squeeze(member1[:])
                     continue
 
                 # Otherwise it's a group -> keep going
@@ -250,7 +250,7 @@ def digest_folder(analysis: caload.analysis.Analysis):
                     # Write datasets
                     for key2, member2 in member1.items():
                         if isinstance(member2, h5py.Dataset):
-                            phase[key2] = member2[:]
+                            phase[key2] = np.squeeze(member2[:])
 
                 # Add other data
                 else:
@@ -260,7 +260,7 @@ def digest_folder(analysis: caload.analysis.Analysis):
                     # Get datasets
                     for key2, member2 in member1.items():
                         if isinstance(member2, h5py.Dataset):
-                            recording[f'display/{key1}/{key2}'] = member2[:]
+                            recording[f'display/{key1}/{key2}'] = np.squeeze(member2[:])
 
         # Commit phases and display data
         analysis.session.commit()

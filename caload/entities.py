@@ -498,11 +498,13 @@ class EntityCollection:
         # Return final DataFrame
         return df
 
-    def where(self, *expr) -> EntityCollection:
-        query = caload.filter.get_entity_query_by_attributes(self._entity_type_name, self.analysis.session,
-                                                             ' AND '.join(expr), entity_query=self.query)
+    def where(self, *filter_expressions, entity_query: Query = None, **equalities) -> EntityCollection:
+        # query = caload.filter.get_entity_query_by_attributes(self._entity_type_name, self.analysis.session,
+        #                                                      ' AND '.join(expr), entity_query=self.query)
 
-        return EntityCollection(self._entity_type_name, analysis=self.analysis, query=query)
+        return self.analysis.get(self._entity_type, *filter_expressions, entity_query=entity_query, **equalities)
+
+        # return EntityCollection(self._entity_type_name, analysis=self.analysis, query=query)
 
     @property
     def scalar_attributes(self):
