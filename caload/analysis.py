@@ -1,26 +1,20 @@
 from __future__ import annotations
 
+import logging
+import os
 import pprint
-import subprocess
-import time
+import sys
 from datetime import date
 from enum import Enum
 import logging
 import multiprocessing as mp
 import os
 from pathlib import Path
-import sys
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Callable, Dict, List, Tuple, Type, TypeVar, Union
 
-import cloudpickle
-import h5py
-import numpy as np
-import scipy
-import tifffile
 import yaml
 from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.orm import Query, Session
-from tqdm import tqdm
 
 import caload
 from caload.entities import *
@@ -28,6 +22,9 @@ from caload.filter import *
 from caload.sqltables import *
 
 __all__ = ['Analysis', 'Mode', 'open_analysis']
+
+
+E = TypeVar('E')
 
 
 class Mode(Enum):
@@ -38,7 +35,7 @@ class Mode(Enum):
 log = logging.getLogger(__name__)
 
 
-def create_analysis(analysis_path: str, data_root: str,
+def create_analysis(analysis_path: str, data_root: str, digest_fun: Callable, schema: List[Type[Entity]],
                     dbhost: str = None, dbname: str = None, dbuser: str = None, dbpassword: str = None,
                     bulk_format: str = None, compression: str = 'gzip', compression_opts: Any = None,
                     shuffle_filter: bool = True, max_blob_size: int = None,
@@ -78,30 +75,54 @@ def create_analysis(analysis_path: str, data_root: str,
     if max_blob_size is None:
         max_blob_size = caload.default_max_blob_size
 
+    print(f'Create new analysis at {analysis_path}')
+
     # Create schema
+    print(f'> Create database {dbname}')
     engine = create_engine(f'mysql+pymysql://{dbuser}:{dbpassword}@{dbhost}')
     with engine.connect() as connection:
         connection.execute(text(f'CREATE SCHEMA IF NOT EXISTS {dbname}'))
     engine.dispose()
 
     # Create engine for dbname
+    print('> Select database')
     engine = create_engine(f'mysql+pymysql://{dbuser}:{dbpassword}@{dbhost}/{dbname}')
 
     # Create tables
+    print('> Create tables')
     SQLBase.metadata.create_all(engine)
 
-    # # Create procedures
-    # with engine.connect() as connection:
-    #     connection.execute(text(
-    #         """
-    #         CREATE PROCEDURE insert_attribute_name(IN attribute_name VARCHAR(255))
-    #         BEGIN
-    #             IF NOT EXISTS (SELECT 1 FROM attributes WHERE name = attribute_name) THEN
-    #                 INSERT INTO attributes (name) VALUES (attribute_name);
-    #             END IF;
-    #         END;
-    #         """))
+    # Create hierarchy
+    print('>> Set up type hierarchy')
+    hierarchy = parse_hierarchy(schema)
+    print('---')
+    pprint.pprint(hierarchy)
+    print('---')
 
+    with Session(engine) as session:
+
+        # Create type hierarchy
+        def _create_entity_type(_hierarchy: Dict[str,  ...], parent_row: EntityTypeTable):
+            for name, children in _hierarchy.items():
+                row = EntityTypeTable(name=name, parent=parent_row)
+                session.add(row)
+                _create_entity_type(children, row)
+
+        # Add Analysis type
+        analysis_type_row = EntityTypeTable(name='Analysis', parent=None)
+        session.add(analysis_type_row)
+
+        # Add custom types
+        _create_entity_type(hierarchy, analysis_type_row)
+        session.commit()
+
+        # Add root entity
+        analysis_row = EntityTable(entity_type=analysis_type_row, id='analysis_00')
+        session.add(analysis_row)
+        session.commit()
+
+
+    print('> Create analysis folder')
     # Create analysis data folder
     os.mkdir(analysis_path)
 
@@ -122,28 +143,55 @@ def create_analysis(analysis_path: str, data_root: str,
         yaml.safe_dump(config, f)
 
     # Create analysis
-    print(f'Create new analysis at {analysis_path}')
+    print('> Open analysis folder')
     analysis = Analysis(analysis_path, mode=Mode.create, **kwargs)
 
-    # Scan for data folders
-    recording_folders = scan_folder(data_root, [])
-
     # Start digesting recordings
-    digest_folder(recording_folders, analysis)
+    print('> Start data digest')
+    digest_fun(analysis)
 
     return analysis
 
 
-def update_analysis(analysis_path: str, **kwargs):
+def parse_hierarchy(entity_types: List[Type]) -> Dict[str, Dict[str, ...]]:
+
+    # Parse into flat dictionary of child:parent relations between entity types
+    flat = {}
+    for _type in entity_types:
+        parent = getattr(_type, 'parent_type', None)
+        if parent is not None:
+            parent = parent.__name__
+        flat[_type.__name__] = parent
+
+    # Creates nested representation of hierarchy
+    def build_nested_dict(flat):
+        def nest_key(key):
+            nested = {}
+            for k, v in flat.items():
+                if v == key:
+                    nested[k] = nest_key(k)
+            return nested
+
+        nested_dict = {}
+        for key, value in flat.items():
+            if value is None:
+                nested_dict[key] = nest_key(key)
+
+        return nested_dict
+
+    # print(flat)
+    # pprint.pprint(build_nested_dict(flat))
+
+    return build_nested_dict(flat)
+
+
+def update_analysis(analysis_path: str, digest_fun: Callable, **kwargs):
     print(f'Open existing analysis at {analysis_path}')
 
     analysis = open_analysis(analysis_path, mode=Mode.create, **kwargs)
 
-    # Scan for data folders
-    recording_folders = scan_folder(analysis.config['data_root'], [])
-
     # Start digesting recordings
-    digest_folder(recording_folders, analysis)
+    digest_fun(analysis)
 
 
 def delete_analysis(analysis_path: str):
@@ -220,19 +268,28 @@ class Analysis:
     write_timeout = 3.  # s
     lazy_init: bool
     echo: bool
-    entities: Dict[tuple, Union[Animal, Recording, Roi, Phase]]
 
-    def __init__(self, path: str, mode: Mode = Mode.analyse, lazy_init: bool = False, echo: bool = False):
+    # Root analysis entity row
+    _row: EntityTable
+    # Entity type name -> entity type PK
+    _entity_type_pk_map: Dict[str, int]
+    # Child entity type -> parent entity type
+    _entity_type_hierachy_map: Dict[str, Union[str, None]]
+    # # Entity type name -> entity type row
+    _entity_type_row_map: Dict[str, EntityTypeTable]
+
+    def __init__(self, path: str, mode: Mode = Mode.analyse, lazy_init: bool = False,
+                 echo: bool = False, select_analysis: str = None):
 
         # Set mode
         self.mode = mode
         self.is_create_mode = mode is Mode.create
+        self._entity_type_pk_map = {}
+        self._entity_type_hierachy_map = {}
+        self._entity_type_row_map = {}
 
         # Set path as posix
         self._analysis_path = Path(path).as_posix()
-
-        # Set up entity dictionary
-        self.entities = {}
 
         # Load config
         config_path = os.path.join(self.analysis_path, 'caload.yaml')
@@ -247,29 +304,70 @@ class Analysis:
         self.echo = echo
 
         # Open SQL session by default
-        if not lazy_init:
-            self.open_session()
+        # if not lazy_init:
+        self.open_session()
 
-        # else:
-        #     if self.is_create_mode:
-        #         raise Exception('Cannot lazily initialize in create mode')
-        #
-        # # Preload all entities for fast lookup of existing entities during creation
-        # if self.is_create_mode:
-        #     for row in self.session.query(AnimalTable).all():
-        #         Animal(row=row, analysis=self)
-        #
-        #     for row in self.session.query(RecordingTable).all():
-        #         Recording(row=row, analysis=self)
-        #
-        #     for row in self.session.query(RoiTable).all():
-        #         Roi(row=row, analysis=self)
-        #
-        #     for row in self.session.query(PhaseTable).all():
-        #         Phase(row=row, analysis=self)
+        # Select analysis entity row
+        self.select_analysis(select_analysis)
+
+    def _load_entity_hierarchy(self):
+        entity_type_rows = self.session.query(EntityTypeTable).order_by(EntityTypeTable.pk).all()
+
+        # Create name to pk map
+        self._entity_type_row_map = {str(row.name): row for row in entity_type_rows}
+        self._entity_type_pk_map = {str(row.name): int(row.pk) for row in entity_type_rows}
+
+        # Create hierarchy map
+        self._entity_type_hierachy_map = {}
+        for row in entity_type_rows:
+            parent = None
+            if row.parent is not None:
+                parent = str(row.parent.name)
+
+            self._entity_type_hierachy_map[str(row.name)] = parent
 
     def __repr__(self):
         return f"Analysis('{self.analysis_path}')"
+
+    def add_entity(self, entity_type: Type[Entity], entity_id: str, parent_entity: Entity = None):
+
+        self.open_session()
+
+        if not isinstance(entity_type, str):
+            entity_type_name = entity_type.__name__
+        else:
+            entity_type_name = entity_type
+
+        # Check if type is known
+        if entity_type_name not in self._entity_type_pk_map:
+            raise ValueError(f'Entity type {entity_type_name} does not exist')
+
+        # Check if parent has correct entity type
+        if parent_entity is not None:
+            if parent_entity.row._entity_type.name != self._entity_type_hierachy_map[entity_type_name]:
+                raise ValueError(f'Entity type {entity_type_name} has not parent type {parent_entity.row._entity_type.name}')
+
+            parent_entity_row = parent_entity.row
+        else:
+            # If no parent entity was provided, this should be top level
+            if self._entity_type_hierachy_map[entity_type_name] != 'Analysis':
+                raise Exception('No parent entity provided, but entity type is not top level')
+            parent_entity_row = self._row
+
+        # Add row
+        # row = EntityTable(parent=parent_entity_row, entity_type_pk=self._entity_type_pk_map[entity_type_name], id=entity_id)
+        row = EntityTable(parent=parent_entity_row, entity_type=self._entity_type_row_map[entity_type_name], id=entity_id)
+        self.session.add(row)
+
+        # Commit
+        if not self.is_create_mode:
+            self.session.commit()
+
+        # Add entity
+        entity = Entity(row=row, analysis=self)
+        entity.create_file()
+
+        return entity
 
     @property
     def analysis_path(self):
@@ -295,10 +393,20 @@ class Analysis:
     def shuffle_filter(self) -> Any:
         return self.config['shuffle_filter']
 
-    def open_session(self, pool_size: int = 20, echo: bool = None):
+    def select_analysis(self, analysis_name: str):
+        query = self.session.query(EntityTable)
+        query = query.join(EntityTypeTable).filter(EntityTypeTable.name == 'Analysis')
 
-        if echo is None:
-            echo = self.echo
+        if analysis_name is not None:
+            query = query.filter(EntityTable.id == analysis_name)
+
+        self._row = query.order_by(EntityTable.pk).first()
+
+    def open_session(self, pool_size: int = 20):
+
+        # Only open if necessary
+        if hasattr(self, 'session'):
+            return
 
         # Create engine
         connstr = f'{self.config["dbuser"]}:{self.config["dbpassword"]}@{self.config["dbhost"]}/{self.config["dbname"]}'
@@ -307,7 +415,13 @@ class Analysis:
         # Create a session
         self.session = Session(self.sql_engine)
 
+        # Load entity types
+        if len(self._entity_type_pk_map) == 0:
+            self._load_entity_hierarchy()
+
     def close_session(self):
+
+        # TODO: make it so connection errors lead to a call of close_session
         self.session.close()
         self.sql_engine.dispose()
 
@@ -316,128 +430,37 @@ class Analysis:
         del self.session
         del self.sql_engine
 
-    def add_animal(self, animal_id: str) -> Animal:
-        return Animal.create(analysis=self, animal_id=animal_id)
+    def get(self, entity_type: Union[str, Type[Entity], Type[E]], *filter_expressions: str,
+            entity_query: Query = None, **equalities: Dict[str, Any]) -> EntityCollection:
 
-    def animals(self, *filter_expressions, entity_query: Query = None, **equalities) -> AnimalCollection:
+        self.open_session()
+
+        # Get entity name
+        if isinstance(entity_type, str):
+            entity_type_name = entity_type
+        else:
+            if type(entity_type) is not type or not issubclass(entity_type, Entity):
+                raise TypeError('Entity type has to be either str or a subclass of Entity')
+
+            entity_type_name = entity_type.__name__
 
         # Add equality filters to filter expressions
         for k, v in equalities.items():
+
+            # Add quotes to string
+            if isinstance(v, str):
+                v = f'"{v}"'
+
             filter_expressions = filter_expressions + (f'{k} == {v}',)
 
         # Concat expression
         expr = ' AND '.join(filter_expressions)
 
-        print(expr)
+        # Get filter query
+        query = get_entity_query_by_attributes(entity_type_name, self.session, expr, entity_query=entity_query)
 
-        query = get_entity_query_by_attributes(Animal, self.session, expr, entity_query=entity_query)
-
-        return AnimalCollection(analysis=self, query=query)
-
-    def get_animal_by_id(self, animal_id: str = None) -> Union[Animal, None]:
-
-        # Build query
-        query = get_entity_query_by_ids(self, AnimalTable, animal_id=animal_id)
-
-        # Return data
-        if query.count() == 0:
-            return None
-        if query.count() == 1:
-            return Animal(analysis=self, row=query.first())
-        raise Exception('This should not happen')
-
-    def recordings(self, *filter_expressions, entity_query: Query = None, **equalities) -> RecordingCollection:
-
-        # Add equality filters to filter expressions
-        for k, v in equalities.items():
-            filter_expressions = filter_expressions + (f'{k} == {v}',)
-
-        # Concat expression
-        expr = ' AND '.join(filter_expressions)
-
-        query = get_entity_query_by_attributes(Recording, self.session, expr, entity_query=entity_query)
-
-        return RecordingCollection(analysis=self, query=query)
-
-    def get_recordings_by_id(self, rec_id: str = None, rec_date: Union[str, date] = None, animal_id: str = None) \
-            -> Union[Recording, RecordingCollection, None]:
-
-        # Build query
-        query = get_entity_query_by_ids(self, RecordingTable, rec_id=rec_id,
-                                        rec_date=rec_date, animal_id=animal_id)
-
-        # Return data
-        if query.count() == 0:
-            return None
-        if query.count() == 1:
-            return Recording(analysis=self, row=query.first())
-        return RecordingCollection(analysis=self, query=query)
-
-    def rois(self, *filter_expressions, entity_query: Query = None, **equalities) -> RoiCollection:
-
-        # Add equality filters to filter expressions
-        for k, v in equalities.items():
-            filter_expressions = filter_expressions + (f'{k} == {v}',)
-
-        # Concat expression
-        expr = ' AND '.join(filter_expressions)
-
-        query = get_entity_query_by_attributes(Roi, self.session, expr, entity_query=entity_query)
-
-        return RoiCollection(analysis=self, query=query)
-
-    def get_rois_by_id(self,
-                       roi_id: int = None, rec_id: str = None,
-                       rec_date: Union[str, date] = None, animal_id: str = None) \
-            -> Union[Roi, RoiCollection, None]:
-
-        # Build query
-        query = get_entity_query_by_ids(self, RoiTable,
-                                        roi_id=roi_id, rec_id=rec_id,
-                                        rec_date=rec_date, animal_id=animal_id)
-
-        # Return data
-        if query.count() == 0:
-            return None
-        if query.count() == 1:
-            return Roi(analysis=self, row=query.first())
-        return RoiCollection(analysis=self, query=query)
-
-    def phases(self, *filter_expressions, entity_query: Query = None, **equalities) -> PhaseCollection:
-
-        # Add equality filters to filter expressions
-        for k, v in equalities.items():
-            filter_expressions = filter_expressions + (f'{k} == {v}',)
-
-        # Concat expression
-        expr = ' AND '.join(filter_expressions)
-
-        query = get_entity_query_by_attributes(Phase, self.session, expr, entity_query=entity_query)
-
-        return PhaseCollection(analysis=self, query=query)
-
-    def get_phases_by_id(self,
-                         phase_id: int = None, rec_id: str = None,
-                         rec_date: Union[str, date] = None, animal_id: str = None) \
-            -> Union[Phase, PhaseCollection, None]:
-
-        # Build query
-        query = get_entity_query_by_ids(self, PhaseTable,
-                                        phase_id=phase_id, rec_id=rec_id,
-                                        rec_date=rec_date, animal_id=animal_id)
-
-        # Return data
-        if query.count() == 0:
-            return None
-        if query.count() == 1:
-            return Phase(analysis=self, row=query.first())
-        return PhaseCollection(analysis=self, query=query)
-
-    def export(self, path: str):
-        # TODO: add some data export and stuff
-        with h5py.File(path, 'w') as f:
-            for animal in self.animals():
-                animal.export_to(f)
+        # Return collection for resulting query
+        return EntityCollection(entity_type, analysis=self, query=query)
 
     def get_temp_path(self, path: str):
         temp_path = os.path.join(self.analysis_path, 'temp', path)

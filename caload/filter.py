@@ -3,7 +3,7 @@ from __future__ import annotations
 import pprint
 import re
 from datetime import date, datetime
-from typing import Any, TYPE_CHECKING, Tuple, Type, Union
+from typing import Any, Dict, TYPE_CHECKING, Tuple, Type, Union
 
 from sqlalchemy import BinaryExpression, or_, and_, not_
 from sqlalchemy.orm import Query, Session, aliased
@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from caload.analysis import Analysis
     from caload.entities import *
 
-__all__ = ['get_entity_query_by_ids', 'get_entity_query_by_attributes']
+__all__ = ['get_entity_query_by_attributes']
 
 
 def tokenize(expression):
@@ -167,8 +167,8 @@ logical_operators = {
 }
 
 
-def _generate_attribute_filters(entity_type: Type[Union[Animal, Recording, Roi, Phase]], session: Session,
-                                astree: Union[dict, list]) -> Union[and_, or_, not_, BinaryExpression[bool]]:
+def _generate_attribute_filters(entity_type_name: str, session: Session,
+                                astree: Dict[str, Any]) -> Union[and_, or_, not_, BinaryExpression[bool]]:
     """Generate SQLAlchemy ORM filters given a filter syntax tree
     TODO: currently supported operations are nested trees of: AND, OR, IN, EXIST, NOT, <=, <, ==, >, >=
     """
@@ -178,8 +178,8 @@ def _generate_attribute_filters(entity_type: Type[Union[Animal, Recording, Roi, 
     # Handle connectives
     if operator in ('AND', 'OR'):
         op = logical_operators[operator]
-        return op(_generate_attribute_filters(entity_type, session, astree['left_operand']),
-                  _generate_attribute_filters(entity_type, session, astree['right_operand']))
+        return op(_generate_attribute_filters(entity_type_name, session, astree['left_operand']),
+                  _generate_attribute_filters(entity_type_name, session, astree['right_operand']))
 
     # Handle comparisons
     elif operator in ('IN', '<=', '<', '==', '>', '>='):
@@ -191,12 +191,12 @@ def _generate_attribute_filters(entity_type: Type[Union[Animal, Recording, Roi, 
             if not isinstance(value, list):
                 raise ValueError('Operand after IN statement should be a list of values')
 
-            attribute_value_col = getattr(entity_type.attr_value_table, f'value_{value[0].__class__.__name__}')
+            attribute_value_col = getattr(AttributeTable, f'value_{value[0].__class__.__name__}')
 
             comparison = attribute_value_col.in_(value)
         else:
             # Determine the correct column based on value type
-            attribute_value_col = getattr(entity_type.attr_value_table, f'value_{value.__class__.__name__}')
+            attribute_value_col = getattr(AttributeTable, f'value_{value.__class__.__name__}')
 
             # Build the comparison expression
             if operator == '<':
@@ -213,18 +213,18 @@ def _generate_attribute_filters(entity_type: Type[Union[Animal, Recording, Roi, 
                 raise ValueError(f"Unsupported comparator: {operator}")
 
         # Build the subquery to filter entities matching the comparison
-        subquery = (session.query(entity_type.attr_value_table.entity_pk)
-                    .filter(entity_type.attr_value_table.name == name, comparison)
+        subquery = (session.query(AttributeTable.entity_pk).filter(AttributeTable.name == name, comparison).join(EntityTable)
+                    .join(EntityTypeTable).filter(EntityTypeTable.name == entity_type_name)
                     .subquery())
 
     # Handle unary operators
     elif operator == 'EXIST':
-        subquery = session.query(entity_type.attr_value_table.entity_pk) \
-            .filter(entity_type.attr_value_table.name == astree['right_operand']) \
+        subquery = session.query(AttributeTable.entity_pk) \
+            .filter(AttributeTable.name == astree['right_operand']) \
             .subquery()
 
     elif operator == 'NOT':
-        return not_(_generate_attribute_filters(entity_type, session, astree['right_operand']))
+        return not_(_generate_attribute_filters(entity_type_name, session, astree['right_operand']))
 
     # Fallback
     else:
@@ -232,7 +232,7 @@ def _generate_attribute_filters(entity_type: Type[Union[Animal, Recording, Roi, 
         raise ValueError('Unexpected operator in the expression tree')
 
     # Return the `IN` filter to apply to the main query
-    return entity_type.entity_table.pk.in_(session.query(subquery.c.entity_pk))
+    return EntityTable.pk.in_(session.query(subquery.c.entity_pk))
 
 
 def parse_boolean_expression(expression):
@@ -240,49 +240,14 @@ def parse_boolean_expression(expression):
     return parse_expression(tokens)
 
 
-def get_entity_query_by_ids(analysis: Analysis,
-                            base_table: Type[AnimalTable, RecordingTable, RoiTable, PhaseTable],
-                            animal_id: str = None,
-                            rec_date: Union[str, date, datetime] = None,
-                            rec_id: str = None,
-                            roi_id: int = None,
-                            phase_id: int = None) -> Query:
-    # Convert date
-    rec_date = utils.parse_date(rec_date)
-
-    # Create query
-    query = analysis.session.query(base_table)
-
-    # Join parents and filter by ID
-    if base_table in (RoiTable, PhaseTable):
-        if rec_date is not None or rec_id is not None:
-            query = query.join(RecordingTable)
-
-        if rec_date is not None:
-            query = query.filter(RecordingTable.date == rec_date)
-        if rec_id is not None:
-            query = query.filter(RecordingTable.id == rec_id)
-
-    if base_table in (RecordingTable, RoiTable, PhaseTable) and animal_id is not None:
-        query = query.join(AnimalTable).filter(AnimalTable.id == animal_id)
-
-    # Filter bottom entities
-    if base_table == RoiTable and roi_id is not None:
-        query = query.filter(RoiTable.id == roi_id)
-    if base_table == PhaseTable and phase_id is not None:
-        query = query.filter(PhaseTable.id == phase_id)
-
-    return query
-
-
-def get_entity_query_by_attributes(entity_type: Type[Union[Animal, Recording, Roi, Phase]], session: Session,
+def get_entity_query_by_attributes(entity_type_name: str, session: Session,
                                    expr: str, entity_query: Query = None) -> Query:
     # Create base query
-    query = session.query(entity_type.entity_table)
+    query = session.query(EntityTable).join(EntityTypeTable).filter(EntityTypeTable.name == entity_type_name)
 
     # Filter for entities, if entity_query is provided
     if entity_query is not None:
-        query = query.filter(entity_type.entity_table.pk.in_(entity_query.subquery().primary_key))
+        query = query.filter(EntityTable.pk.in_(entity_query.subquery().primary_key))
 
     # Parse expression
     if expr != '':
@@ -291,7 +256,7 @@ def get_entity_query_by_attributes(entity_type: Type[Union[Animal, Recording, Ro
         # pprint.pprint(astree)
 
         # Apply filters generated from the abstract syntax tree (AST)
-        filters = _generate_attribute_filters(entity_type, session, astree)
+        filters = _generate_attribute_filters(entity_type_name, session, astree)
         query = query.filter(filters)
 
     return query
