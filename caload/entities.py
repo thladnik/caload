@@ -147,7 +147,11 @@ class Entity:
                 else:
                     data_path = f'pkl:{self.path}/{key.replace("/", "_")}'
 
-            files.write(self.analysis.analysis_path, key, value, data_path)
+            # Write to file
+            files.write(self.analysis, key, value, data_path)
+
+            # Set value to data_path to write to database
+            value = data_path
 
         # Reset old value in case it was set to different type before
         if type(attribute_row.data_type) is str and attribute_row.data_type != data_type_str and attribute_row.value is not None:
@@ -646,33 +650,32 @@ class EntityCollection:
     def save_to(self, filepath: Union[str, os.PathLike]):
         pass
 
-    def create_task(self, fun: Callable, **kwargs):
-
-        print(f'Create new task for {fun.__name__} with args '
-              f'{[f"{k}:{v}" for k, v in kwargs.items()]} on {len(self)} entities')
-
-        funstr = cloudpickle.dumps(fun)
-        argstr = cloudpickle.dumps(kwargs)
-
-        task_row = TaskTable(target_fun=funstr, target_args=argstr)
-        self.analysis.session.add(task_row)
-        self.analysis.session.commit()
-
-        for entity in self:
-
-            if isinstance(entity, Animal):
-                _id = {'animal_pk': entity.row.pk}
-            elif isinstance(entity, Recording):
-                _id = {'recording_pk': entity.row.pk}
-            elif isinstance(entity, Roi):
-                _id = {'roi_pk': entity.row.pk}
-            elif isinstance(entity, Phase):
-                _id = {'phase_pk': entity.row.pk}
-            else:
-                raise ValueError(f'What is a {entity}?')
-
-            # Add to task
-            self.analysis.session.add(TaskedEntityTable(task_pk=task_row.pk, **_id))
-
-        self.analysis.session.commit()
-
+    # def create_task(self, fun: Callable, **kwargs):
+    #
+    #     print(f'Create new task for {fun.__name__} with args '
+    #           f'{[f"{k}:{v}" for k, v in kwargs.items()]} on {len(self)} entities')
+    #
+    #     funstr = cloudpickle.dumps(fun)
+    #     argstr = cloudpickle.dumps(kwargs)
+    #
+    #     task_row = TaskTable(target_fun=funstr, target_args=argstr)
+    #     self.analysis.session.add(task_row)
+    #     self.analysis.session.commit()
+    #
+    #     for entity in self:
+    #
+    #         if isinstance(entity, Animal):
+    #             _id = {'animal_pk': entity.row.pk}
+    #         elif isinstance(entity, Recording):
+    #             _id = {'recording_pk': entity.row.pk}
+    #         elif isinstance(entity, Roi):
+    #             _id = {'roi_pk': entity.row.pk}
+    #         elif isinstance(entity, Phase):
+    #             _id = {'phase_pk': entity.row.pk}
+    #         else:
+    #             raise ValueError(f'What is a {entity}?')
+    #
+    #         # Add to task
+    #         self.analysis.session.add(TaskedEntityTable(task_pk=task_row.pk, **_id))
+    #
+    #     self.analysis.session.commit()
