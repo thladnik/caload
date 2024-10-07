@@ -18,6 +18,7 @@ import cloudpickle
 import h5py
 import numpy as np
 import pandas as pd
+import sqlalchemy.exc
 from sqlalchemy import case, func, text
 
 from sqlalchemy.dialects.mysql import insert as mysql_insert
@@ -622,11 +623,15 @@ class EntityCollection:
             iterator = pool.imap_unordered(self.worker_wrapper, worker_args)
             for iter_num in range(1, len(self) + 1):
 
-                # Iterate while looking out for exceptions
+                # Next iteration
                 try:
                     exec_time = next(iterator)
+
+                # Catch
                 except StopIteration:
                     pass
+
+                # Re-raise any exception raised by worker wrapper
                 except Exception as _exc:
                     raise _exc
 
@@ -679,7 +684,8 @@ class EntityCollection:
                 # Merge
                 e.load_row()
                 # Run
-                _ = fun(e, **kwargs)
+                # _ = fun(e, **kwargs)
+                EntityCollection.worker_call(fun, e, **kwargs)
             # Close
             entity[0].analysis.close_session()
 
@@ -689,13 +695,40 @@ class EntityCollection:
             # Merge
             entity.load_row()
             # Run
-            _ = fun(entity, **kwargs)
+            # _ = fun(entity, **kwargs)
+            EntityCollection.worker_call(fun, entity, **kwargs)
             # Close
             entity.analysis.close_session()
 
         elapsed_time = time.perf_counter() - start_time
 
         return elapsed_time
+
+    @staticmethod
+    def worker_call(fun, entity, **kwargs):
+        retry_counter = 0
+
+        while True:
+            # Iterate while looking out for exceptions
+            try:
+                _ = fun(entity, **kwargs)
+
+            # Catch operational errors
+            except sqlalchemy.exc.OperationalError as _exc:
+                retry_counter += 1
+                if retry_counter > 3:
+                    print('Connection lost repeatedly')
+                    raise _exc
+                print(f'WARNING: lost connection. Retry no {retry_counter}')
+
+                # Try reconnect
+                entity.analysis.close_session()
+                entity.analysis.open_session(pool_size=1)
+            # Raise other relevant exceptions
+            except Exception as _exc:
+                raise _exc
+            else:
+                break
 
     # def save_to(self, filepath: Union[str, os.PathLike]):
     #     pass
