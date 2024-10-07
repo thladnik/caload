@@ -21,7 +21,7 @@ import pandas as pd
 from sqlalchemy import case, func, text
 
 from sqlalchemy.dialects.mysql import insert as mysql_insert
-from sqlalchemy.orm import Query, aliased, joinedload
+from sqlalchemy.orm import Query, aliased, joinedload, make_transient
 from tqdm import tqdm
 
 import caload
@@ -35,25 +35,44 @@ __all__ = ['Entity', 'EntityCollection']
 
 
 class Entity:
-    _type: Type[Entity]
     _analysis: Analysis
-    _row: EntityTable
-    entity_type_name: str
-    _attribute_name_pk_map: Dict[str, int] = {}
+    _row_pk: Union[int, None] = None
+    _row: Union[EntityTable, None] = None
 
     # Keep references to parent table instances,
     # to avoid cold references during multiprocessing,
     # caused by lazy loading
-    _parent_row: EntityTable
+    _parent: Union[Entity, None] = None
 
     def __init__(self, row: EntityTable, analysis: Analysis):
         self._analysis = analysis
         self._row = row
-        self.entity_type_name = row.entity_type.name
-        self._parent_row = row.parent
+
+        # self.analysis.entities.append(self)
+
+        self.load()
+
+    # def __hash__(self):
+    #     if self.parent is not None:
+    #         return f'{self.parent.__hash__()}_{self.id}'
+    #     return self.id
+    #
+    # def __new__(cls, row: EntityTable, analysis: Analysis):
+    # TODO: find a way to do this with processing.
+    #  Implementing __new__ leads to all kinds of weird stuff when pickling during multiprocess fork
+    #
+    #     # Return existing instance
+    #     if row.pk in analysis.entities:
+    #         return analysis.entities[row.pk]
+    #
+    #     # Create instance
+    #     entity = super(Entity, cls).__new__(cls)
+    #     analysis.entities[row.pk] = entity
+    #
+    #     return entity
 
     def __repr__(self):
-        return f"{self.__class__.__name__}(id='{self.row.id}', parent={self.parent})"
+        return f"{self.row.entity_type.name}(id='{self.row.id}', parent={self.parent})"
 
     def __contains__(self, item):
         # subquery = self.analysis.session.query(AttributeTable.pk).filter(AttributeTable.name == item).subquery()
@@ -92,18 +111,28 @@ class Entity:
         # Query attribute row if not in create mode
         if not self.analysis.is_create_mode:
             # Build query
-            attribute_row = (self.analysis.session.query(AttributeTable)
-                           .filter(AttributeTable.name == key, AttributeTable.entity_pk == self.row.pk))
+            attribute_query = (self.analysis.session.query(AttributeTable)
+                               .filter(AttributeTable.name == key, AttributeTable.entity_pk == self.row.pk))
 
             # Evaluate
-            if attribute_row.count() == 1:
-                attribute_row = attribute_row.one()
-            elif attribute_row.count() > 1:
+            if attribute_query.count() == 1:
+                attribute_row = attribute_query.one()
+            elif attribute_query.count() > 1:
                 raise ValueError('Wait a minute...')
 
         # Create row if it doesn't exist yet
         if attribute_row is None:
+            # Add attributes based on whether create mode is on.
+            #  This is important, bc in create mode the entity PK may not exist yet,
+            #  however: when using map_async the entity row object gets detached from the session, which raises errors, when
+            #  trying to add new attributes with a reference to the detached entity
+            # if self.analysis.is_create_mode:
+            #     attribute_row = AttributeTable(entity=self.row, name=key, is_persistent=self.analysis.is_create_mode)
+            # else:
+            #     attribute_row = AttributeTable(entity_pk=self.row.pk, name=key, is_persistent=self.analysis.is_create_mode)
+
             attribute_row = AttributeTable(entity=self.row, name=key, is_persistent=self.analysis.is_create_mode)
+            # print(attribute_row)
             self.analysis.session.add(attribute_row)
 
         # Set scalars
@@ -173,7 +202,27 @@ class Entity:
     def id(self):
         return self.row.id
 
-    def add_child_entity(self, entity_type: Union[str, Type[Entity]], entity_id: str):
+    def unload_row(self):
+
+        # Save primary key of row
+        self._row_pk = self.row.pk
+
+        # Propagate
+        if self.parent is not None:
+            self.parent.unload_row()
+
+        # Set row to None
+        self._row = None
+
+    def load_row(self):
+
+        self._row = self.analysis.session.query(EntityTable).get(self._row_pk)
+
+    def load(self):
+        """To be implemented in Entity subclass. Is called after Entity.__init__
+        """
+
+    def add_child_entity(self, entity_type: Union[str, Type[Entity]], entity_id: Union[str, List[str]]):
         return self.analysis.add_entity(entity_type, entity_id, parent_entity=self)
 
     @property
@@ -206,16 +255,14 @@ class Entity:
             self[key] = value
 
     @property
-    def parent(self):
-        if self._parent_row is None:
-            return None
-        return Entity(row=self._parent_row, analysis=self.analysis)
+    def parent(self) -> Union[Entity, None]:
+        if self._parent is None and self.row.parent is not None:
+            self._parent = Entity(row=self.row.parent, analysis=self.analysis)
+        return self._parent
 
     @property
     def path(self) -> str:
-        if self.parent is not None:
-            return Path(os.path.join(self.parent.path, self.entity_type_name.lower(), self.id)).as_posix()
-        return Path(os.path.join('entities', self.entity_type_name.lower(), self.id)).as_posix()
+        return Path(os.path.join('entities', self.row.entity_type.name.lower(), f'{self.row.pk}_{self.id}')).as_posix()
 
     @property
     def row(self):
@@ -264,11 +311,6 @@ class EntityCollection:
 
             self._entity_type = entity_type
             self._entity_type_name = self._entity_type.__name__
-
-            # if self.entity_type_name in globals() and issubclass(globals()[self.entity_type_name], Entity):
-            #     self.entity_type = globals()[self.entity_type_name]
-            # else:
-            #     self.entity_type = Entity
 
         self.analysis = analysis
         self._query = query
@@ -404,18 +446,6 @@ class EntityCollection:
 
         return self._query
 
-    def _column(self, attribute_name: str, include_blobs: bool = False):
-
-        # Subquery on entity primary keys
-        entity_query = self.query.subquery().primary_key
-
-        # Query attribute values
-        value_query = (self.analysis.session.query(AttributeTable)
-                       .filter(AttributeTable.name == attribute_name)
-                       .filter(AttributeTable.entity_pk.in_(entity_query)))
-
-        return value_query.all()
-
     def _dataframe_of(self, attribute_names: List[str] = None,
                       include_blobs: bool = False, include_bulk: bool = False) -> pd.DataFrame:
 
@@ -468,7 +498,6 @@ class EntityCollection:
                 *cases  # Dynamically added case expressions
             )
             .join(AttributeTable, EntityTable.pk == AttributeTable.entity_pk)
-            # .filter(EntityTable.pk.in_([13, 15, 4201]))
             .filter(EntityTable.pk.in_(self.query.subquery().primary_key))
             .group_by(EntityTable.pk, EntityTable.id)
         )
@@ -546,7 +575,7 @@ class EntityCollection:
         """
 
         print(f'Run function {fun.__name__} on {self} with args '
-              f'{[f"{k}:{v}" for k, v in kwargs.items()]} on {len(self)} entities')
+              f'{[f"{k}:{v}" for k, v in kwargs.items()]} on {len(self)} {self._entity_type_name} entities')
 
         # Prepare pool and entities
         import multiprocessing as mp
@@ -556,16 +585,29 @@ class EntityCollection:
                 worker_num = len(self)
         print(f'Start pool with {worker_num} workers')
 
+        # Package entities together with their mapped function and arguments
+        #  and make the entity table instances transient
         print(f'Prepare entities')
         t = time.perf_counter()
         kwargs = tuple([(k, v) for k, v in kwargs.items()])
         if chunk_size is None:
-            worker_args = [(fun, e, kwargs) for e in self]
+            worker_args = []
             chunk_size = 1
+            for entity in self:
+                entity.unload_row()
+                worker_args.append((fun, entity, kwargs))
         else:
             chunk_num = int(np.ceil(len(self) / chunk_size))
-            worker_args = [(fun, self[i * chunk_size:(i + 1) * chunk_size], kwargs) for i in range(chunk_num)]
-            print(f'Entity chunksize {chunk_size}')
+            worker_args = []
+            for i in range(chunk_num):
+                entities = []
+                for entity in self[i * chunk_size:(i + 1) * chunk_size]:
+                    entity.unload_row()
+                    entities.append((fun, entity, kwargs))
+                worker_args.append(entities)
+
+            print(f'Entity chunk_size {chunk_size}')
+
         print(f'> Preparation finished in {time.perf_counter() - t:.2f}s')
 
         # Close session first
@@ -576,8 +618,7 @@ class EntityCollection:
         start_time = time.time()
         formatted_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time))
         print(f'Start processing at {formatted_time}')
-        with (mp.Pool(processes=worker_num) as pool,
-              tqdm(total=len(worker_args), desc='Processing', unit='iter', smoothing=0.) as pbar):
+        with (mp.Pool(processes=worker_num) as pool, tqdm(total=len(worker_args), desc='Processing', unit='entities', smoothing=0.) as pbar):
             iterator = pool.imap_unordered(self.worker_wrapper, worker_args)
             for iter_num in range(1, len(self) + 1):
 
@@ -624,31 +665,40 @@ class EntityCollection:
         """
 
         start_time = time.perf_counter()
+
         # Unpack args
         fun: Callable = args[0]
-        entity: Union[Entity, EntityCollection, List[Entity]] = args[1]
+        entity: Union[Entity, List[Entity]] = args[1]
         kwargs = {k: v for k, v in args[2]}
 
-        # Re-open session in worker
+        # Re-open session in worker and merge instances and run function
         if isinstance(entity, list):
+            # Open
             entity[0].analysis.open_session(pool_size=1, echo=False)
-            close_session = entity[0].analysis.close_session
+            for e in entity:
+                # Merge
+                e.load_row()
+                # Run
+                _ = fun(e, **kwargs)
+            # Close
+            entity[0].analysis.close_session()
+
         else:
+            # Open
             entity.analysis.open_session(pool_size=1, echo=False)
-            close_session = entity.analysis.close_session
-
-        # Run function on entity
-        res = fun(entity, **kwargs)
-
-        # Close session again
-        close_session()
+            # Merge
+            entity.load_row()
+            # Run
+            _ = fun(entity, **kwargs)
+            # Close
+            entity.analysis.close_session()
 
         elapsed_time = time.perf_counter() - start_time
 
         return elapsed_time
 
-    def save_to(self, filepath: Union[str, os.PathLike]):
-        pass
+    # def save_to(self, filepath: Union[str, os.PathLike]):
+    #     pass
 
     # def create_task(self, fun: Callable, **kwargs):
     #

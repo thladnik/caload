@@ -62,10 +62,14 @@ class Animal(Entity):
 class Recording(Entity):
 
     parent_type = Animal
+    animal: Animal
 
-    @property
-    def animal(self) -> Animal:
-        return Animal(analysis=self.analysis, row=self._row.parent)
+    def load(self):
+        self.animal = Animal(analysis=self.analysis, row=self.row.parent)
+
+    # @property
+    # def animal(self) -> Animal:
+    #     return Animal(analysis=self.analysis, row=self._row.parent)
 
     @property
     def rois(self) -> EntityCollection:
@@ -79,27 +83,39 @@ class Recording(Entity):
 class Roi(Entity):
 
     parent_type = Recording
+    animal: Animal
+    recording: Recording
 
-    @property
-    def animal(self) -> Animal:
-        return Animal(analysis=self.analysis, row=self.row.parent.parent)
+    def load(self):
+        self.recording = Recording(analysis=self.analysis, row=self.row.parent)
+        self.animal = Animal(analysis=self.analysis, row=self.row.parent.parent)
 
-    @property
-    def recording(self) -> Recording:
-        return Recording(analysis=self.analysis, row=self.row.parent)
+    # @property
+    # def animal(self) -> Animal:
+    #     return Animal(analysis=self.analysis, row=self.row.parent.parent)
+
+    # @property
+    # def recording(self) -> Recording:
+    #     return Recording(analysis=self.analysis, row=self.row.parent)
 
 
 class Phase(Entity):
 
     parent_type = Recording
+    animal: Animal
+    recording: Recording
 
-    @property
-    def animal(self) -> Animal:
-        return Animal(analysis=self.analysis, row=self.row.parent.parent)
+    def load(self):
+        self.recording = Recording(analysis=self.analysis, row=self.row.parent)
+        self.animal = Animal(analysis=self.analysis, row=self.row.parent.parent)
 
-    @property
-    def recording(self) -> Recording:
-        return Recording(analysis=self.analysis, row=self.row.parent)
+    # @property
+    # def animal(self) -> Animal:
+    #     return Animal(analysis=self.analysis, row=self.row.parent.parent)
+    #
+    # @property
+    # def recording(self) -> Recording:
+    #     return Recording(analysis=self.analysis, row=self.row.parent)
 
 
 schema = [Animal, Recording, Roi, Phase]
@@ -186,9 +202,10 @@ def digest_folder(analysis: caload.analysis.Analysis):
 
         # Add suite2p's analysis ROI stats
         print('Add ROI stats and signals')
-        for roi_id in tqdm(range(fluorescence.shape[0])):
+        rois = recording.add_child_entity(Roi, entity_id=[f'roi_{roi_id}' for roi_id in range(fluorescence.shape[0])])
+        for roi_id, roi in tqdm(enumerate(rois)):
             # Create ROI
-            roi = recording.add_child_entity(Roi, entity_id=f'roi_{roi_id}')
+            # roi = recording.add_child_entity(Roi, entity_id=f'roi_{roi_id}')
             roi['animal_id'] = animal.id
             roi['rec_id'] = recording.id
             roi['roi_id'] = roi_id

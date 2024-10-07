@@ -212,7 +212,7 @@ def delete_analysis(analysis_path: str):
     print('-----\nCAUTION - DANGER ZONE\n-----')
     print(f'Are you sure you want to delete the analysis {analysis_path}?')
     print('This means that all data for this analysis will be lost!')
-    print('If you are sure, type the databse schema name ("dbname" in caload.yaml) to verify')
+    print('If you are sure, type the database schema name ("dbname" in caload.yaml) to verify')
 
     print('-----\nCAUTION - DANGER ZONE\n-----')
     verification_str = input('Schema name: ')
@@ -269,6 +269,8 @@ class Analysis:
     lazy_init: bool
     echo: bool
 
+    # List of entities to keep row bound to session
+    entities: List[Entity]  # Dict[int, Entity]
     # Root analysis entity row
     _row: EntityTable
     # Entity type name -> entity type PK
@@ -287,6 +289,7 @@ class Analysis:
         self._entity_type_pk_map = {}
         self._entity_type_hierachy_map = {}
         self._entity_type_row_map = {}
+        self.entities = []
 
         # Set path as posix
         self._analysis_path = Path(path).as_posix()
@@ -329,7 +332,8 @@ class Analysis:
     def __repr__(self):
         return f"Analysis('{self.analysis_path}')"
 
-    def add_entity(self, entity_type: Type[Entity], entity_id: str, parent_entity: Entity = None):
+    def add_entity(self, entity_type: Type[Entity], entity_id: Union[str, List[str]],
+                   parent_entity: Entity = None) -> Union[Entity, List[Entity]]:
 
         self.open_session()
 
@@ -355,19 +359,28 @@ class Analysis:
             parent_entity_row = self._row
 
         # Add row
-        # row = EntityTable(parent=parent_entity_row, entity_type_pk=self._entity_type_pk_map[entity_type_name], id=entity_id)
-        row = EntityTable(parent=parent_entity_row, entity_type=self._entity_type_row_map[entity_type_name], id=entity_id)
-        self.session.add(row)
-
+        if not isinstance(entity_id, list):
+            entity_id = [entity_id]
+        rows = []
+        for _id in entity_id:
+            row = EntityTable(parent=parent_entity_row, entity_type=self._entity_type_row_map[entity_type_name], id=_id)
+            rows.append(row)
+        self.session.add_all(rows)
         # Commit
-        if not self.is_create_mode:
-            self.session.commit()
+        # if not self.is_create_mode:
+        self.session.commit()
 
         # Add entity
-        entity = Entity(row=row, analysis=self)
-        entity.create_file()
+        entities = []
+        for row in rows:
+            entity = Entity(row=row, analysis=self)
+            entity.create_file()
+            entities.append(entity)
 
-        return entity
+        if len(rows) == 1:
+            return entities[0]
+
+        return entities
 
     @property
     def analysis_path(self):

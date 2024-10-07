@@ -51,7 +51,7 @@ class EntityTable(SQLBase):
     )
 
     def __repr__(self):
-        return f"<Entity {self.entity_type.name}(id={self.id}, animal={self.parent}, date={self.date})>"
+        return f"<{self.entity_type.name}(id={self.id}, parent={self.parent})>"
 
 
 # Attributes
@@ -77,7 +77,7 @@ class AttributeTable(SQLBase):
     is_persistent: Mapped[bool] = mapped_column(nullable=True)
 
     def __repr__(self):
-        return f"<{self.__class__.__name__}({self.entity}, {self.name}, {self.value})>"
+        return f"<Attribute({self.name}, {self.value}, {self.entity})>"
 
     @property
     def value(self):
