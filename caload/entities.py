@@ -216,8 +216,8 @@ class Entity:
         self._row = None
 
     def load_row(self):
-
-        self._row = self.analysis.session.query(EntityTable).get(self._row_pk)
+        self._row = self.analysis.session.query(EntityTable).filter(EntityTable.pk == self._row_pk).first()
+        print(f'LOAD ROW {self.row}')
 
     def load(self):
         """To be implemented in Entity subclass. Is called after Entity.__init__
@@ -267,6 +267,10 @@ class Entity:
 
     @property
     def row(self):
+        if self._row is None:
+            if self._row_pk is None:
+                raise Exception('Missing primary key to retrieve table row')
+            self._row = self.analysis.session.query(EntityTable).filter(EntityTable.pk == self._row_pk).first()
         return self._row
 
     @property
@@ -405,17 +409,16 @@ class EntityCollection:
             # Determine data type
             dtype = str(df_insert[attr_name].dtype).lower()
             if 'int' in dtype:
-                dtype_str = 'int'
+                data_type_str = 'int'
             elif 'float' in dtype:
-                dtype_str = 'float'
+                data_type_str = 'float'
             elif 'object' in dtype:
-                dtype_str = 'str'
+                data_type_str = 'str'
             else:
                 raise TypeError('')
 
             # Rename value column
-            data_type_str = dtype_str
-            df_insert.rename(columns={attr_name: data_type_str}, inplace=True)
+            df_insert.rename(columns={attr_name: f'value_{data_type_str}'}, inplace=True)
 
             # Add PK set
             df_insert['entity_pk'] = df_insert.index
@@ -427,7 +430,7 @@ class EntityCollection:
 
             insert_stmt = mysql_insert(AttributeTable).values(insert_attr_data)
 
-            update_attr_data = {data_type_str: getattr(insert_stmt.inserted, data_type_str),
+            update_attr_data = {f'value_{data_type_str}': getattr(insert_stmt.inserted, f'value_{data_type_str}'),
                                 'is_persistent': insert_stmt.inserted.is_persistent,
                                 'data_type': data_type_str}
 
@@ -461,6 +464,7 @@ class EntityCollection:
         attribute_query = self.analysis.session.query(AttributeTable.name, AttributeTable.data_type).join(
             EntityTable).join(EntityTypeTable).filter(EntityTypeTable.name == self._entity_type_name,
                                                       AttributeTable.data_type.notin_(excluded))
+
         # Filter for user-defined attributes
         if attribute_names is not None:
             attribute_query = attribute_query.filter(AttributeTable.name.in_(attribute_names))
@@ -473,20 +477,27 @@ class EntityCollection:
                           f'{len(attribute_types)} != {len(selected_attribute_names)}. '
                           f'Some requested attributes may be blob or path and not included')
 
+        # Create case templates
+        _cases = [(AttributeTable.data_type == 'int', AttributeTable.value_int),
+                  (AttributeTable.data_type == 'str', AttributeTable.value_str),
+                  (AttributeTable.data_type == 'float', AttributeTable.value_float),
+                  (AttributeTable.data_type == 'bool', AttributeTable.value_bool),
+                  (AttributeTable.data_type == 'date', AttributeTable.value_date),
+                  (AttributeTable.data_type == 'datetime', AttributeTable.value_datetime)]
+        # Only incclude blobs and bulk storage references if necessary (decrease read load on DB)
+        if include_blobs:
+            _cases.append((AttributeTable.data_type == 'blob', AttributeTable.value_blob))
+        if include_bulk:
+            _cases.append((AttributeTable.data_type == 'path', AttributeTable.value_path))
+
         # Build case for each attribute so query returns correct type field
-        cases = []
+        attr_cases = []
         for attr_name in selected_attribute_names:
-            cases.append(
+
+            attr_cases.append(
                 func.max(case(
                     (AttributeTable.name == attr_name,
-                     case((AttributeTable.data_type == 'int', AttributeTable.value_int),
-                          (AttributeTable.data_type == 'str', AttributeTable.value_str),
-                          (AttributeTable.data_type == 'float', AttributeTable.value_float),
-                          (AttributeTable.data_type == 'date', AttributeTable.value_date),
-                          (AttributeTable.data_type == 'datetime', AttributeTable.value_datetime),
-                          (AttributeTable.data_type == 'blob', AttributeTable.value_blob),
-                          (AttributeTable.data_type == 'path', AttributeTable.value_path),
-                          else_=None)
+                     case(*_cases, else_=None)
                      ),
                     else_=None)).label(name=attr_name)
             )
@@ -496,7 +507,7 @@ class EntityCollection:
             self.analysis.session.query(
                 EntityTable.pk,
                 EntityTable.id,
-                *cases  # Dynamically added case expressions
+                *attr_cases  # Dynamically added case expressions
             )
             .join(AttributeTable, EntityTable.pk == AttributeTable.entity_pk)
             .filter(EntityTable.pk.in_(self.query.subquery().primary_key))
@@ -517,6 +528,8 @@ class EntityCollection:
                 df[attr_name] = df[attr_name].astype(float)
             elif attr_type == 'str':
                 df[attr_name] = df[attr_name].astype(str)
+            elif attr_type == 'bool':
+                df[attr_name] = df[attr_name].astype(bool)
             elif attr_type == 'date':
                 df[attr_name] = pd.to_datetime(df[attr_name].apply(lambda s: s.decode()), format='%Y-%m-%d')
             elif attr_type == 'datetime':
@@ -681,10 +694,7 @@ class EntityCollection:
             # Open
             entity[0].analysis.open_session(pool_size=1, echo=False)
             for e in entity:
-                # Merge
-                e.load_row()
                 # Run
-                # _ = fun(e, **kwargs)
                 EntityCollection.worker_call(fun, e, **kwargs)
             # Close
             entity[0].analysis.close_session()
@@ -692,10 +702,7 @@ class EntityCollection:
         else:
             # Open
             entity.analysis.open_session(pool_size=1, echo=False)
-            # Merge
-            entity.load_row()
             # Run
-            # _ = fun(entity, **kwargs)
             EntityCollection.worker_call(fun, entity, **kwargs)
             # Close
             entity.analysis.close_session()
@@ -706,6 +713,7 @@ class EntityCollection:
 
     @staticmethod
     def worker_call(fun, entity, **kwargs):
+
         retry_counter = 0
 
         while True:
@@ -713,8 +721,9 @@ class EntityCollection:
             try:
                 _ = fun(entity, **kwargs)
 
-            # Catch operational errors
+            # Catch SQL operational errors
             except sqlalchemy.exc.OperationalError as _exc:
+
                 retry_counter += 1
                 if retry_counter > 3:
                     print('Connection lost repeatedly')
@@ -724,6 +733,7 @@ class EntityCollection:
                 # Try reconnect
                 entity.analysis.close_session()
                 entity.analysis.open_session(pool_size=1)
+
             # Raise other relevant exceptions
             except Exception as _exc:
                 raise _exc

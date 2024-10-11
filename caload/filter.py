@@ -25,8 +25,8 @@ def tokenize(expression):
         |(?P<STRING_DOUBLE>"[^"]*")                              # Strings in double quotes
         |(?P<DATETIME>\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\b)    # ISO 8601 datetime (YYYY-MM-DDTHH:MM:SS)
         |(?P<DATE>\b\d{4}-\d{2}-\d{2}\b)                         # Date (YYYY-MM-DD)
-        |(?P<FLOAT>\b\d+\.\d+\b)                                 # Float numbers
-        |(?P<INTEGER>\b\d+\b)                                    # Integer numbers
+        |(?P<FLOAT>-?\d+\.\d+)                                   # Float numbers
+        |(?P<INTEGER>-?\d+)                                      # Integer numbers
         |(?P<BOOLEAN>\bTrue\b|\bFalse\b)                         # Boolean values
         |(?P<IDENTIFIER>\b[\w/]+\b)                              # Identifiers (like signal1 or name1/subname1)
         |(?P<EXIST>\bEXIST\b)                                    # EXIST operator
@@ -266,12 +266,16 @@ if __name__ == '__main__':
     # expression = "(signal1 == 2024-09-06 AND signal2 > 2024-09-06T14:30:00 OR signal3 == '2024-08-02_fish1')"
     # expression = "(animal_id == 2024-08-02_fish1)"
     # expression = 'rec_id == "rec2" AND rec_date == 2024-07-07 AND animal_id == "2024-08-02_fish1"'
-    expression_string = ("name IN (1.2, 10, 'Charlie') "
-                         "AND "
-                         "(EXIST signal1) "
-                         "AND rec_id == 'rec2' "
-                         "AND NOT (rec_date == 2024-07-07 OR animal_id == '2024-08-02_fish1')")
+    # expression_string = ("name IN (1.2, 10, 'Charlie') "
+    #                      "AND "
+    #                      "(EXIST signal1) "
+    #                      "AND rec_id == 'rec2' "
+    #                      "AND NOT (rec_date == 2024-07-07 OR animal_id == '2024-08-02_fish1')")
 
+    expression_string = 'bla < -5'
     parsed_expression = parse_boolean_expression(expression_string)
+    pprint.pprint(parsed_expression)
 
+    expression_string = 'bla < 5'
+    parsed_expression = parse_boolean_expression(expression_string)
     pprint.pprint(parsed_expression)
