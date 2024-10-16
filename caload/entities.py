@@ -382,7 +382,7 @@ class EntityCollection:
             if isinstance(item, str):
                 item = [item]
 
-            df = self.dataframe_of(attribute_names=item, include_bulk=True, include_blobs=True)
+            df = self.dataframe_of(attribute_names=item)
 
             # For single column, return pd.Series
             if len(df.columns) == 1:
@@ -406,6 +406,8 @@ class EntityCollection:
 
     def update(self, df: pd.DataFrame):  # , overwrite: bool = False):
 
+        _dtypes = ['str', 'float', 'int', 'date', 'datetime', 'bool', 'blob', 'path']
+
         # Do an upsert for each attribute to be updated
         for attr_name in df.columns:
 
@@ -418,10 +420,20 @@ class EntityCollection:
                 data_type_str = 'int'
             elif 'float' in dtype:
                 data_type_str = 'float'
+            elif 'bool' in dtype:
+                data_type_str = 'bool'
             elif 'object' in dtype:
-                data_type_str = 'str'
+                _dt = type(df_insert[attr_name].head(1).values[0])
+                if _dt is str:
+                    data_type_str = 'str'
+                elif _dt is date:
+                    data_type_str = 'date'
+                elif _dt is datetime:
+                    data_type_str = 'datetime'
+                else:
+                    data_type_str = 'blob'
             else:
-                raise TypeError('')
+                data_type_str = 'blob'
 
             # Rename value column
             df_insert.rename(columns={attr_name: f'value_{data_type_str}'}, inplace=True)
@@ -437,6 +449,8 @@ class EntityCollection:
             insert_stmt = mysql_insert(AttributeTable).values(insert_attr_data)
 
             update_attr_data = {f'value_{data_type_str}': getattr(insert_stmt.inserted, f'value_{data_type_str}'),
+                                # On update, reset all other value fields to None:
+                                **{f'value_{dt}': None for dt in list(set(_dtypes) - {data_type_str})},
                                 'is_persistent': insert_stmt.inserted.is_persistent,
                                 'data_type': data_type_str}
 
@@ -583,7 +597,7 @@ class EntityCollection:
             elif attr_type == 'path':
                 df_new[attr_name] = df_new[attr_name].apply(lambda s: files.read(self.analysis, s) if s is not None else None)
 
-        # Set row index to PKs
+        # Set row index to primary key
         df_new.set_index('pk', drop=True, inplace=True)
 
         # Update cache
@@ -815,7 +829,7 @@ class SyncedDataFrame(pd.DataFrame):
 
         # Set stuff
         object.__setattr__(self, '_entity_collection', entity_collection)
-        object.__setattr__(self, '_updated_columns', [])
+        object.__setattr__(self, '_pending_columns', [])
         object.__setattr__(self, '_loaded_columns', [])
 
         # Get attribute data shape
@@ -833,12 +847,8 @@ class SyncedDataFrame(pd.DataFrame):
         return object.__getattribute__(self, '_entity_collection')
 
     @property
-    def updated_columns(self) -> List[str]:
-        return object.__getattribute__(self, '_updated_columns')
-
-    # @updated_columns.setter
-    # def updated_columns(self, value):
-    #     object.__setattr__(self, '_updated_columns', value)
+    def pending_columns(self) -> List[str]:
+        return object.__getattribute__(self, '_pending_columns')
 
     @property
     def loaded_columns(self) -> List[str]:
@@ -847,7 +857,7 @@ class SyncedDataFrame(pd.DataFrame):
     def load_columns(self, column_names: List[str]):
 
         # Compile list of attributes to fetch (attributes which are not loaded and weren't newly added)
-        attributes_to_fetch = list(set(column_names) - set(self.loaded_columns) - set(self.updated_columns))
+        attributes_to_fetch = list(set(column_names) - set(self.loaded_columns) - set(self.pending_columns))
 
         # Load missing columns
         if len(attributes_to_fetch) > 0:
@@ -859,19 +869,16 @@ class SyncedDataFrame(pd.DataFrame):
             # Add to loaded columns
             self.loaded_columns.extend(attributes_to_fetch)
 
-            # The implicit call to __setitem__ above causes newly loaded columns to be set as updated_columns,
-            #  so we remove them here
-            _new_updated_columns = list(set(self.updated_columns) - set(attributes_to_fetch))
-            object.__setattr__(self, '_updated_columns', _new_updated_columns)
+            # The implicit call to __setitem__ above causes newly loaded columns
+            #  to be set as updated_columns, so we remove them here
+            _new_updated_columns = list(set(self.pending_columns) - set(attributes_to_fetch))
+            object.__setattr__(self, '_pending_columns', _new_updated_columns)
 
     def __getitem__(self, item):
 
-        required = item
-        if isinstance(required, str):
-            required = [required]
-
-        if isinstance(required, list):
-            self.load_columns(required)
+        # Make sure all required columns are loaded from database
+        if isinstance(item, (list, str)):
+            self.load_columns(item if isinstance(item, list) else [item])
 
         # Pass original call to parent
         return pd.DataFrame.__getitem__(self, item)
@@ -884,17 +891,22 @@ class SyncedDataFrame(pd.DataFrame):
 
         if isinstance(_key, list):
             # Eliminate duplicates
-            _new = list(set(_key) - set(self.updated_columns))
+            _new = list(set(_key) - set(self.pending_columns))
 
             # Add newly added ones to list
-            self.updated_columns.extend(_new)
+            self.pending_columns.extend(_new)
 
         # Pass original call to parent
         pd.DataFrame.__setitem__(self, key, value)
 
     def commit(self):
-        # Call entity collection's update method with updated columns
-        self.entity_collection.update(self[self.updated_columns])
+        """Save all pending changes to the database
+        """
 
-        self.loaded_columns.extend(self.updated_columns)
-        self.updated_columns.clear()
+        # Call entity collection's update method with updated columns
+        self.entity_collection.update(self[self.pending_columns])
+
+        # Add changed columns to list of loaded one
+        self.loaded_columns.extend(self.pending_columns)
+        # Clear all pending columns since the changes are in database now
+        self.pending_columns.clear()
