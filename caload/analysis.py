@@ -4,6 +4,7 @@ import logging
 import os
 import pprint
 import sys
+import time
 from datetime import date
 from enum import Enum
 import logging
@@ -268,6 +269,7 @@ class Analysis:
     write_timeout = 3.  # s
     lazy_init: bool
     echo: bool
+    debug: bool
 
     # List of entities to keep row bound to session
     entities: List[Entity]  # Dict[int, Entity]
@@ -281,7 +283,7 @@ class Analysis:
     _entity_type_row_map: Dict[str, EntityTypeTable]
 
     def __init__(self, path: str, mode: Mode = Mode.analyse, lazy_init: bool = False,
-                 echo: bool = False, select_analysis: str = None):
+                 echo: bool = False, debug: bool = False, select_analysis: str = None):
 
         # Set mode
         self.mode = mode
@@ -305,6 +307,7 @@ class Analysis:
         # Set optionals
         self.lazy_init = lazy_init
         self.echo = echo
+        self.debug = debug
 
         # Open SQL session by default
         # if not lazy_init:
@@ -426,7 +429,11 @@ class Analysis:
 
         # Create engine
         connstr = f'{self.config["dbuser"]}:{self.config["dbpassword"]}@{self.config["dbhost"]}/{self.config["dbname"]}'
-        self.sql_engine = create_engine(f'mysql+pymysql://{connstr}', echo=echo, pool_size=pool_size)
+        self.sql_engine = create_engine(f'mysql+pymysql://{connstr}',
+                                        echo=echo,
+                                        pool_size=pool_size,
+                                        pool_recycle=600,
+                                        pool_pre_ping=True)
 
         # Create a session
         self.session = Session(self.sql_engine)

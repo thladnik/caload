@@ -13,12 +13,12 @@ from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List, TYPE_CHECKING, Tuple, Type, TypeVar, Union
 
-
 import cloudpickle
 import h5py
 import numpy as np
 import pandas as pd
 import sqlalchemy.exc
+from pandas.core.indexing import _iLocIndexer
 from sqlalchemy import case, func, text
 
 from sqlalchemy.dialects.mysql import insert as mysql_insert
@@ -215,10 +215,6 @@ class Entity:
         # Set row to None
         self._row = None
 
-    def load_row(self):
-        self._row = self.analysis.session.query(EntityTable).filter(EntityTable.pk == self._row_pk).first()
-        print(f'LOAD ROW {self.row}')
-
     def load(self):
         """To be implemented in Entity subclass. Is called after Entity.__init__
         """
@@ -304,6 +300,7 @@ class EntityCollection:
     _batch_results: List[EntityTable]
     _entity_type: Union[Type[Entity], Type[E]]
     _entity_type_name: str
+    _synced_dataframe: SyncedDataFrame = None
 
     def __init__(self, entity_type: Union[str, Type[E]], analysis: Analysis, query: Query):
 
@@ -320,6 +317,8 @@ class EntityCollection:
         self.analysis = analysis
         self._query = query
         self._query_custom_orderby = False
+        self._cache = pd.DataFrame()
+        self._pending_changes: Dict[str, List[int]] = {}
 
     def __repr__(self):
         return f'{self._entity_type_name}Collection({len(self)})'
@@ -350,7 +349,8 @@ class EntityCollection:
             raise StopIteration
 
         # Return single result
-        return self._entity_type(row=self._batch_results[self._iteration_count % self._batch_size], analysis=self.analysis)
+        return self._entity_type(row=self._batch_results[self._iteration_count % self._batch_size],
+                                 analysis=self.analysis)
 
     def __getitem__(self, item) -> Union[Entity, E, List[Entity], List[E], pd.DataFrame]:
 
@@ -367,7 +367,8 @@ class EntityCollection:
                 raise KeyError('Invalid step size 0')
 
             # Get data
-            result = [self._entity_type(row=row, analysis=self.analysis) for row in self.query.offset(start).limit(stop - start)]
+            result = [self._entity_type(row=row, analysis=self.analysis) for row in
+                      self.query.offset(start).limit(stop - start)]
 
             # TODO: there should be a way to directly query the n-th row using 'ROW_NUMBER() % n'
             #  but it's not clear how is would work in SQLAlchemy ORM; figure out later
@@ -381,7 +382,7 @@ class EntityCollection:
             if isinstance(item, str):
                 item = [item]
 
-            df = self._dataframe_of(attribute_names=item, include_bulk=True, include_blobs=True)
+            df = self.dataframe_of(attribute_names=item, include_bulk=True, include_blobs=True)
 
             # For single column, return pd.Series
             if len(df.columns) == 1:
@@ -401,6 +402,11 @@ class EntityCollection:
                 raise ValueError(f'Invalid value of type {type(df)}. Needs to be pandas.Series or pandas.DataFrame')
             df = pd.DataFrame(df)
 
+        self.update(df)
+
+    def update(self, df: pd.DataFrame):  # , overwrite: bool = False):
+
+        # Do an upsert for each attribute to be updated
         for attr_name in df.columns:
 
             # Create df for insert
@@ -438,6 +444,9 @@ class EntityCollection:
             self.analysis.session.execute(upsert_stmt)
             self.analysis.session.commit()
 
+            # Update cache
+            self._cache[df.columns] = df
+
     @property
     def query(self):
         """Property which should be used *exclusively* to access the Query object.
@@ -450,64 +459,92 @@ class EntityCollection:
 
         return self._query
 
-    def _dataframe_of(self, attribute_names: List[str] = None,
-                      include_blobs: bool = False, include_bulk: bool = False) -> pd.DataFrame:
+    @property
+    def dataframe(self):
+        if self._synced_dataframe is None:
+            self._synced_dataframe = SyncedDataFrame(entity_collection=self)
+        return self._synced_dataframe
 
-        # Add to excluded list
-        excluded = []
-        if not include_blobs:
-            excluded.append('blob')
-        if not include_bulk:
-            excluded.append('path')
+    @property
+    def attribute_rows(self) -> List[Tuple[str, str]]:
+        attr_query = (self.analysis.session.query(AttributeTable.name, AttributeTable.data_type)
+                      .join(EntityTable).join(EntityTypeTable)
+                      .filter(EntityTypeTable.name == self._entity_type_name)
+                      .distinct())
+        return [(row.name, row.data_type) for row in attr_query.all()]
 
-        # Query distinct attribute names and their corresponding types
-        attribute_query = self.analysis.session.query(AttributeTable.name, AttributeTable.data_type).join(
-            EntityTable).join(EntityTypeTable).filter(EntityTypeTable.name == self._entity_type_name,
-                                                      AttributeTable.data_type.notin_(excluded))
+    def info(self):
 
-        # Filter for user-defined attributes
-        if attribute_names is not None:
-            attribute_query = attribute_query.filter(AttributeTable.name.in_(attribute_names))
+        _info = {
+            'Entity type: ': self._entity_type,
+            'Entity count': len(self),
+            'Attributes': {name: data_type for name, data_type in self.attribute_rows}
+        }
+
+        pprint.pprint(_info, sort_dicts=False, width=120)
+
+    def dataframe_of(self, attribute_names: List[str] = None, reload_cached: bool = False) -> pd.DataFrame:
+
+        # If all attributes are in cache, return cached result
+        if not reload_cached and len(set(attribute_names) & set(self._cache.columns)) == len(attribute_names):
+            return self._cache[attribute_names].copy()
+
+        # Check which attributes to load
+        if not reload_cached:
+            _attributes_cached = list(set(attribute_names) & set(self._cache.columns.tolist()))
+            _attributes_to_fetch = list(set(attribute_names) - set(self._cache.columns.tolist()))
+        else:
+            _attributes_cached = []
+            _attributes_to_fetch = attribute_names
+
+        if self.analysis.debug:
+            print('Cached attributes:', _attributes_cached)
+            print('Attributes to fetch: ', _attributes_to_fetch)
+
+        # Load attributes from database
+        self._load_attributes(_attributes_to_fetch)
+
+        # Return final DataFrame
+        return self._cache[attribute_names].copy()
+
+    def _load_attributes(self, attribute_names: List[str]):
 
         # Get names and types
-        selected_attribute_names, attribute_types = zip(*attribute_query.distinct().all())
+        all_attribute_names, _attribute_types = zip(*self.attribute_rows)
 
-        if attribute_names is not None and len(attribute_names) != len(selected_attribute_names):
-            raise Warning(f'Number selected attributes does not match number requested. '
-                          f'{len(attribute_types)} != {len(selected_attribute_names)}. '
-                          f'Some requested attributes may be blob or path and not included')
+        selected_attribute_names = list(set(all_attribute_names) & set(attribute_names))
+        attribute_types = {name: data_type for name, data_type in zip(all_attribute_names, _attribute_types)}
 
-        # Create case templates
-        _cases = [(AttributeTable.data_type == 'int', AttributeTable.value_int),
-                  (AttributeTable.data_type == 'str', AttributeTable.value_str),
-                  (AttributeTable.data_type == 'float', AttributeTable.value_float),
-                  (AttributeTable.data_type == 'bool', AttributeTable.value_bool),
-                  (AttributeTable.data_type == 'date', AttributeTable.value_date),
-                  (AttributeTable.data_type == 'datetime', AttributeTable.value_datetime)]
-        # Only incclude blobs and bulk storage references if necessary (decrease read load on DB)
-        if include_blobs:
-            _cases.append((AttributeTable.data_type == 'blob', AttributeTable.value_blob))
-        if include_bulk:
-            _cases.append((AttributeTable.data_type == 'path', AttributeTable.value_path))
+        if len(set(selected_attribute_names)) != len(selected_attribute_names):
+            raise Warning(f'Attribute list contains duplicates. '
+                          f'This most likely means that some attribute names in collection have different data types')
 
-        # Build case for each attribute so query returns correct type field
-        attr_cases = []
+        if len(selected_attribute_names) < len(attribute_names):
+            raise KeyError(f'Failed to load attributes: {list(set(attribute_names) - set(selected_attribute_names))}')
+
+        # Build cases which return correct value field based on attr_name's data_type
+        cases = []
         for attr_name in selected_attribute_names:
 
-            attr_cases.append(
+            # Get data type
+            data_type = attribute_types[attr_name]
+
+            if self.analysis.debug:
+                print(f'> Fetch {attr_name} of type {data_type} from DB')
+
+            # Use the appropriate column for the data_type
+            cases.append(
                 func.max(case(
-                    (AttributeTable.name == attr_name,
-                     case(*_cases, else_=None)
-                     ),
-                    else_=None)).label(name=attr_name)
+                    (AttributeTable.name == attr_name, getattr(AttributeTable, f'value_{data_type}')),
+                    else_=None)).label(attr_name)
             )
 
-        # Create query
+        # Construct query
         query = (
             self.analysis.session.query(
                 EntityTable.pk,
-                EntityTable.id,
-                *attr_cases  # Dynamically added case expressions
+                # EntityTable.id,
+                *cases
             )
             .join(AttributeTable, EntityTable.pk == AttributeTable.entity_pk)
             .filter(EntityTable.pk.in_(self.query.subquery().primary_key))
@@ -515,59 +552,56 @@ class EntityCollection:
         )
 
         # Add PK and ID to columns to match query result
-        columns = ('pk', 'entity_id') + selected_attribute_names
+        columns = ['pk', *selected_attribute_names]
 
         # Create DataFrame from query result
-        df = pd.DataFrame(columns=columns, data=query.all())
+        df_new = pd.DataFrame(columns=columns, data=query.all())
 
         # Convert all types correctly (default result will likely contain bytestring values
-        for attr_name, attr_type in zip(selected_attribute_names, attribute_types):
+        for attr_name in selected_attribute_names:
+
+            # Get type
+            attr_type = attribute_types[attr_name]
+
+            # Cast to type
             if attr_type == 'int':
-                df[attr_name] = df[attr_name].astype(int)
+                df_new[attr_name] = df_new[attr_name].astype(int)
             elif attr_type == 'float':
-                df[attr_name] = df[attr_name].astype(float)
+                df_new[attr_name] = df_new[attr_name].astype(float)
             elif attr_type == 'str':
-                df[attr_name] = df[attr_name].astype(str)
+                df_new[attr_name] = df_new[attr_name].astype(str)
             elif attr_type == 'bool':
-                df[attr_name] = df[attr_name].astype(bool)
+                df_new[attr_name] = df_new[attr_name].astype(bool)
             elif attr_type == 'date':
-                df[attr_name] = pd.to_datetime(df[attr_name].apply(lambda s: s.decode()), format='%Y-%m-%d')
+                df_new[attr_name] = pd.to_datetime(df_new[attr_name].apply(lambda s: s.decode()), format='%Y-%m-%d')
             elif attr_type == 'datetime':
-                df[attr_name] = pd.to_datetime(df[attr_name].apply(lambda s: s.decode()), format='%Y-%m-%d %H:%M:%S')
+                df_new[attr_name] = pd.to_datetime(df_new[attr_name].apply(lambda s: s.decode()), format='%Y-%m-%d %H:%M:%S')
+            # Load blobs
             elif attr_type == 'blob':
-                df[attr_name] = df[attr_name].apply(lambda s: pickle.loads(s) if s is not None else None)
+                df_new[attr_name] = df_new[attr_name].apply(lambda s: pickle.loads(s) if s is not None else None)
+            # Load data from path
             elif attr_type == 'path':
-                df[attr_name] = df[attr_name].apply(lambda s: files.read(self.analysis, s) if s is not None else None)
+                df_new[attr_name] = df_new[attr_name].apply(lambda s: files.read(self.analysis, s) if s is not None else None)
 
         # Set row index to PKs
-        df.set_index('pk', drop=True, inplace=True)
+        df_new.set_index('pk', drop=True, inplace=True)
 
-        # Return final DataFrame
-        return df
+        # Update cache
+        self._cache[df_new.columns] = df_new
 
     def where(self, *filter_expressions, entity_query: Query = None, **equalities) -> EntityCollection:
-        # query = caload.filter.get_entity_query_by_attributes(self._entity_type_name, self.analysis.session,
-        #                                                      ' AND '.join(expr), entity_query=self.query)
-
         return self.analysis.get(self._entity_type, *filter_expressions, entity_query=entity_query, **equalities)
-
-        # return EntityCollection(self._entity_type_name, analysis=self.analysis, query=query)
-
-    @property
-    def scalar_attributes(self):
-        """Get a pandas.DataFrame of all entities in this collection (rows) and their attributes
-        """
-        return self._dataframe_of(attribute_names=None, include_blobs=False, include_bulk=False)
 
     @property
     def attributes(self):
-        """Get a pandas.DataFrame of all entities in this collection (rows) and their attributes, including binary data
+        """Get a SyncedDataFrame of all entities in this collection (rows) with their scalar attributes preloaded
         """
-        return self._dataframe_of(attribute_names=None, include_blobs=True, include_bulk=False)
 
-    # def sortby(self, name: str, order: str = 'ASC'):
-    #     # TODO: implement sorting
-    #     pass
+        # Preload scalar attributes
+        self.dataframe.load_columns([n for n, dtype in self.attribute_rows if dtype not in ['path', 'blob']])
+
+        # Return whole synced dataframe
+        return self.dataframe
 
     def map(self, fun: Callable, **kwargs) -> Any:
         """Sequentially apply a function to each Entity of the collection (kwargs are passed onto the function)
@@ -632,7 +666,8 @@ class EntityCollection:
         start_time = time.time()
         formatted_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time))
         print(f'Start processing at {formatted_time}')
-        with (mp.Pool(processes=worker_num) as pool, tqdm(total=len(worker_args), desc='Processing', unit='entities', smoothing=0.) as pbar):
+        with (mp.Pool(processes=worker_num) as pool, tqdm(total=len(worker_args), desc='Processing', unit='entities',
+                                                          smoothing=0.) as pbar):
             iterator = pool.imap_unordered(self.worker_wrapper, worker_args)
             for iter_num in range(1, len(self) + 1):
 
@@ -772,3 +807,94 @@ class EntityCollection:
     #         self.analysis.session.add(TaskedEntityTable(task_pk=task_row.pk, **_id))
     #
     #     self.analysis.session.commit()
+
+
+class SyncedDataFrame(pd.DataFrame):
+
+    def __init__(self, entity_collection: EntityCollection, *args, **kwargs):
+
+        # Set stuff
+        object.__setattr__(self, '_entity_collection', entity_collection)
+        object.__setattr__(self, '_updated_columns', [])
+        object.__setattr__(self, '_loaded_columns', [])
+
+        # Get attribute data shape
+        row_indices = [row.pk for row in entity_collection.query.all()]
+        attr_rows = entity_collection.attribute_rows
+
+        # Set up empty dataframe with placeholder values
+        _data = {name: [f'<{data_type}>'] * len(row_indices) for name, data_type in attr_rows}
+
+        # Call DataFrame init to set up DataFrame structure, but without the data yet
+        super().__init__(*args, data=_data, index=row_indices, **kwargs)
+
+    @property
+    def entity_collection(self) -> EntityCollection:
+        return object.__getattribute__(self, '_entity_collection')
+
+    @property
+    def updated_columns(self) -> List[str]:
+        return object.__getattribute__(self, '_updated_columns')
+
+    # @updated_columns.setter
+    # def updated_columns(self, value):
+    #     object.__setattr__(self, '_updated_columns', value)
+
+    @property
+    def loaded_columns(self) -> List[str]:
+        return object.__getattribute__(self, '_loaded_columns')
+
+    def load_columns(self, column_names: List[str]):
+
+        # Compile list of attributes to fetch (attributes which are not loaded and weren't newly added)
+        attributes_to_fetch = list(set(column_names) - set(self.loaded_columns) - set(self.updated_columns))
+
+        # Load missing columns
+        if len(attributes_to_fetch) > 0:
+            df = self.entity_collection.dataframe_of(attribute_names=attributes_to_fetch)
+
+            # Set newly loaded items
+            self[df.columns] = df
+
+            # Add to loaded columns
+            self.loaded_columns.extend(attributes_to_fetch)
+
+            # The implicit call to __setitem__ above causes newly loaded columns to be set as updated_columns,
+            #  so we remove them here
+            _new_updated_columns = list(set(self.updated_columns) - set(attributes_to_fetch))
+            object.__setattr__(self, '_updated_columns', _new_updated_columns)
+
+    def __getitem__(self, item):
+
+        required = item
+        if isinstance(required, str):
+            required = [required]
+
+        if isinstance(required, list):
+            self.load_columns(required)
+
+        # Pass original call to parent
+        return pd.DataFrame.__getitem__(self, item)
+
+    def __setitem__(self, key, value):
+
+        _key = key
+        if isinstance(_key, str):
+            _key = [_key]
+
+        if isinstance(_key, list):
+            # Eliminate duplicates
+            _new = list(set(_key) - set(self.updated_columns))
+
+            # Add newly added ones to list
+            self.updated_columns.extend(_new)
+
+        # Pass original call to parent
+        pd.DataFrame.__setitem__(self, key, value)
+
+    def commit(self):
+        # Call entity collection's update method with updated columns
+        self.entity_collection.update(self[self.updated_columns])
+
+        self.loaded_columns.extend(self.updated_columns)
+        self.updated_columns.clear()
