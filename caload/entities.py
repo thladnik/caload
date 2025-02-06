@@ -4,6 +4,7 @@ import math
 import os
 import pickle
 import pprint
+import shutil
 
 import sys
 import time
@@ -104,11 +105,13 @@ class Entity:
 
     def __setitem__(self, key: str, value: Any):
 
-        # Find corresponding builtin python scalar type for numpy scalars
+        attribute_row = None
+        pre_data_type_str = ''
+
+        # Get corresponding builtin python scalar type for numpy scalars
         if isinstance(value, np.generic):
             value = value.item()
 
-        attribute_row = None
         # Query attribute row if not in create mode
         if not self.analysis.is_create_mode:
             # Build query
@@ -118,25 +121,19 @@ class Entity:
             # Evaluate
             if attribute_query.count() == 1:
                 attribute_row = attribute_query.one()
+                pre_data_type_str = attribute_row.data_type
+
             elif attribute_query.count() > 1:
                 raise ValueError('Wait a minute...')
 
         # Create row if it doesn't exist yet
         if attribute_row is None:
-            # Add attributes based on whether create mode is on.
-            #  This is important, bc in create mode the entity PK may not exist yet,
-            #  however: when using map_async the entity row object gets detached from the session, which raises errors, when
-            #  trying to add new attributes with a reference to the detached entity
-            # if self.analysis.is_create_mode:
-            #     attribute_row = AttributeTable(entity=self.row, name=key, is_persistent=self.analysis.is_create_mode)
-            # else:
-            #     attribute_row = AttributeTable(entity_pk=self.row.pk, name=key, is_persistent=self.analysis.is_create_mode)
-
             attribute_row = AttributeTable(entity=self.row, name=key, is_persistent=self.analysis.is_create_mode)
-            # print(attribute_row)
             self.analysis.session.add(attribute_row)
 
-        # Set scalars
+        # Determine data type of new value
+
+        # Scalars
         if type(value) in (str, float, int, bool, date, datetime):
 
             # Set value type
@@ -149,28 +146,38 @@ class Entity:
                 value_type = 'blob'
 
             # Set column string
-            data_type_str = value_type
+            new_data_type_str = value_type
 
+        # Small objects
         # NOTE: there is no universal way to get the byte number of objects
         # Builtin object have __sizeof__(), but this only returns the overhead for some numpy.ndarrays
         # For numpy arrays it's numpy.ndarray.nbytes
-        # Set small objects
         elif (not isinstance(value, np.ndarray) and value.__sizeof__() < self.analysis.max_blob_size) \
                 or (isinstance(value, np.ndarray) and value.nbytes < self.analysis.max_blob_size):
 
-            # Set value type
-            data_type_str = 'blob'
+            new_data_type_str = 'blob'
 
-        # Set large objects
+        # Large objects or object of unkown type
         else:
+            new_data_type_str = 'path'
 
-            # Set value type
-            data_type_str = 'path'
+        # Handle deletion of old values
+        if new_data_type_str != pre_data_type_str:
 
-            # Write any non-scalar data that is too large according to specified bulk storage format
+            # Delete old files
+            if pre_data_type_str == 'path':
+                files.delete(attribute_row.value)
+
+            # Set old value to None
+            attribute_row.value = None
+
+        # Handle path types
+        if new_data_type_str == 'path':
+
+            # Get previous path (if available)
             data_path = attribute_row.value
 
-            # If not data_path is set yet, generate it
+            # If no data_path is set yet, generate it
             if data_path is None:
                 if isinstance(value, np.ndarray):
                     data_path = f'hdf5:{self.path}/data.hdf5:{key}'
@@ -183,12 +190,8 @@ class Entity:
             # Set value to data_path to write to database
             value = data_path
 
-        # Reset old value in case it was set to different type before
-        if type(attribute_row.data_type) is str and attribute_row.data_type != data_type_str and attribute_row.value is not None:
-            attribute_row.value = None
-
         # Set row type and value
-        attribute_row.data_type = data_type_str
+        attribute_row.data_type = new_data_type_str
         attribute_row.value = value
 
         # Commit changes (right away if not in create mode)
@@ -273,18 +276,39 @@ class Entity:
     def analysis(self) -> Analysis:
         return self._analysis
 
-    def create_file(self):
-        entity_abs_path = os.path.join(self.analysis.analysis_path, self.path)
+    # def create_file(self):
+    #     entity_abs_path = os.path.join(self.analysis.analysis_path, self.path)
+    #
+    #     # Create directoty of necessary
+    #     if not os.path.exists(entity_abs_path):
+    #         os.makedirs(entity_abs_path)
+    #
+    #     # Create data file
+    #     path = os.path.join(entity_abs_path, 'data.hdf5')
+    #     if not os.path.exists(path):
+    #         with h5py.File(path, 'w') as _:
+    #             pass
 
-        # Create directoty of necessary
-        if not os.path.exists(entity_abs_path):
-            os.makedirs(entity_abs_path)
+    def dump_file(self, src_path: str, name: str) -> str:
+        """Copy arbitrary files to a dump subfolder for entity"""
 
-        # Create data file
-        path = os.path.join(entity_abs_path, 'data.hdf5')
-        if not os.path.exists(path):
-            with h5py.File(path, 'w') as _:
-                pass
+        # Get original source filename
+        fn = Path(src_path).as_posix().split('/')[-1]
+
+        # Set destination path
+        dest_path = os.path.join(self.path, 'dump', fn)
+
+        # Copy file
+        shutil.copy(src_path, dest_path)
+
+        # Save relative path
+        self[f'__dump_path_{name}'] = dest_path
+
+    def get_rel_dump_path(self, name: str):
+        return self[f'__dump_path_{name}']
+
+    def get_abs_dump_path(self, name: str):
+        return os.path.join(self.analysis.analysis_path, name)
 
 
 E = TypeVar('E')

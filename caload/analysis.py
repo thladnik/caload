@@ -432,7 +432,7 @@ class Analysis:
         self.sql_engine = create_engine(f'mysql+pymysql://{connstr}',
                                         echo=echo,
                                         pool_size=pool_size,
-                                        pool_recycle=600,
+                                        pool_recycle=60,
                                         pool_pre_ping=True)
 
         # Create a session

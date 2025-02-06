@@ -70,3 +70,6 @@ def read(analysis, data_path: str) -> Any:
 
     else:
         raise Exception(f'Unknown file type {file_type} for path {data_path}')
+
+def delete(*args):
+    pass
