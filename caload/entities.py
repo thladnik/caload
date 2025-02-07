@@ -353,6 +353,8 @@ class EntityCollection:
         return self._entity_count
 
     def __iter__(self):
+        self._iteration_count = -1
+        self._batch_offset = 0
         return self
 
     def __next__(self) -> Union[Entity, E]:
