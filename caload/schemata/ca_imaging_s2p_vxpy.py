@@ -33,6 +33,7 @@ from typing import List, Tuple, Type, Union
 
 import h5py
 import numpy as np
+import pandas as pd
 import scipy
 import yaml
 from tifffile import tifffile
@@ -59,6 +60,10 @@ class Animal(Entity):
         return self.analysis.get(Phase, animal_id=self.id)
 
 
+class AnimalCollection(EntityCollection):
+    pass
+
+
 class Recording(Entity):
 
     parent_type = Animal
@@ -80,6 +85,10 @@ class Recording(Entity):
         return self.analysis.get(Phase, animal_id=self.animal.id, rec_id=self.id)
 
 
+class RecordingCollection(EntityCollection):
+    pass
+
+
 class Roi(Entity):
 
     parent_type = Recording
@@ -99,6 +108,10 @@ class Roi(Entity):
     #     return Recording(analysis=self.analysis, row=self.row.parent)
 
 
+class RoiCollection(EntityCollection):
+    pass
+
+
 class Phase(Entity):
 
     parent_type = Recording
@@ -116,6 +129,10 @@ class Phase(Entity):
     # @property
     # def recording(self) -> Recording:
     #     return Recording(analysis=self.analysis, row=self.row.parent)
+
+
+class PhaseCollection(EntityCollection):
+    pass
 
 
 schema = [Animal, Recording, Roi, Phase]
@@ -200,6 +217,21 @@ def digest_folder(analysis: caload.analysis.Analysis):
         # Commit recording
         analysis.session.commit()
 
+        print('Load anatomical registration data')
+        roi_coordinates = None
+        if 'ants_registration' in os.listdir(recording_path) and 'suite2p' in os.listdir(os.path.join(recording_path, 'ants_registration')):
+            for fld in os.listdir(os.path.join(recording_path, 'ants_registration', 'suite2p')):
+                registration_path = os.path.join(recording_path, 'ants_registration', 'suite2p', fld)
+
+                if 'mapped_points.h5' in os.listdir(registration_path):
+                    roi_coordinates = pd.read_hdf(os.path.join(registration_path, 'mapped_points.h5'), key='coordinates')
+
+                    print(f'Found ANTs registration data for  ROI coordinates: {registration_path}')
+                    break
+
+        if roi_coordinates is None:
+            print('WARNING: no ANTs registration data found')
+
         # Add suite2p's analysis ROI stats
         print('Add ROI stats and signals')
         rois = recording.add_child_entity(Roi, entity_id=[f'roi_{roi_id}' for roi_id in range(fluorescence.shape[0])])
@@ -214,6 +246,11 @@ def digest_folder(analysis: caload.analysis.Analysis):
 
             # Write ROI stats
             roi.update({f's2p/{k}': v for k, v in roi_stats.items()})
+
+            # Write ROI coordinates
+            if roi_coordinates is not None:
+                coords = roi_coordinates.iloc[roi_id]
+                roi.update({'ants/x': float(coords.x), 'ants/y': float(coords.y), 'ants/z': float(coords.z)})
 
             # Write data
             fluores = fluorescence[roi_id]

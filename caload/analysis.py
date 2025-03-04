@@ -15,6 +15,7 @@ from typing import Any, Callable, Dict, List, Tuple, Type, TypeVar, Union
 
 import yaml
 from sqlalchemy import Engine, create_engine, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Query, Session
 
 import caload
@@ -444,6 +445,9 @@ class Analysis:
 
     def close_session(self):
 
+        if not hasattr(self, 'session'):
+            return
+
         # TODO: make it so connection errors lead to a call of close_session
         self.session.close()
         self.sql_engine.dispose()
@@ -452,6 +456,16 @@ class Analysis:
         #  during multiprocess' pickling, because it contains weakrefs
         del self.session
         del self.sql_engine
+
+    def restart_session(self):
+
+        try:
+            self.session.close()
+        except OperationalError as _:
+            pass
+
+        self.open_session()
+        self.session.rollback()
 
     def get(self, entity_type: Union[str, Type[Entity], Type[E]], *filter_expressions: str,
             entity_query: Query = None, **equalities: Dict[str, Any]) -> EntityCollection:

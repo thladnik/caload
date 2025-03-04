@@ -340,7 +340,7 @@ class EntityCollection:
 
         self.analysis = analysis
         self._query = query
-        self._query_custom_orderby = False
+        self._query_custom_orderby = None
         self._cache = pd.DataFrame()
         self._pending_changes: Dict[str, List[int]] = {}
 
@@ -494,7 +494,7 @@ class EntityCollection:
         This means that repeated iterations over the EntityCollection instance
         may return differently ordered results.
         """
-        if not self._query_custom_orderby:
+        if self._query_custom_orderby is None:
             self._query = self._query.order_by(None).order_by('pk')
 
         return self._query
@@ -508,7 +508,9 @@ class EntityCollection:
     @property
     def attribute_rows(self) -> List[Tuple[str, str]]:
         attr_query = (self.analysis.session.query(AttributeTable.name, AttributeTable.data_type)
-                      .join(EntityTable).join(EntityTypeTable)
+                      .join(EntityTable)
+                      .filter(EntityTable.pk.in_(self.query.subquery().primary_key))
+                      .join(EntityTypeTable)
                       .filter(EntityTypeTable.name == self._entity_type_name)
                       .distinct())
         return [(row.name, row.data_type) for row in attr_query.all()]
@@ -629,8 +631,8 @@ class EntityCollection:
         # Update cache
         self._cache[df_new.columns] = df_new
 
-    def where(self, *filter_expressions, entity_query: Query = None, **equalities) -> EntityCollection:
-        return self.analysis.get(self._entity_type, *filter_expressions, entity_query=entity_query, **equalities)
+    def where(self, *filter_expressions, **equalities) -> EntityCollection:
+        return self.analysis.get(self._entity_type, *filter_expressions, entity_query=self.query, **equalities)
 
     @property
     def attributes(self):
