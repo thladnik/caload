@@ -264,7 +264,6 @@ def open_analysis(analysis_path: str, **kwargs) -> Analysis:
 
 class Analysis:
     mode: Mode
-    analysis_path: str
     sql_engine: Engine
     session: Session
     write_timeout = 3.  # s
@@ -378,7 +377,6 @@ class Analysis:
         entities = []
         for row in rows:
             entity = Entity(row=row, analysis=self)
-            entity.create_file()
             entities.append(entity)
 
         if len(rows) == 1:
@@ -387,7 +385,7 @@ class Analysis:
         return entities
 
     @property
-    def analysis_path(self):
+    def analysis_path(self) -> str:
         return self._analysis_path
 
     @property

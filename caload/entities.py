@@ -276,19 +276,6 @@ class Entity:
     def analysis(self) -> Analysis:
         return self._analysis
 
-    # def create_file(self):
-    #     entity_abs_path = os.path.join(self.analysis.analysis_path, self.path)
-    #
-    #     # Create directoty of necessary
-    #     if not os.path.exists(entity_abs_path):
-    #         os.makedirs(entity_abs_path)
-    #
-    #     # Create data file
-    #     path = os.path.join(entity_abs_path, 'data.hdf5')
-    #     if not os.path.exists(path):
-    #         with h5py.File(path, 'w') as _:
-    #             pass
-
     def dump_file(self, src_path: str, name: str) -> str:
         """Copy arbitrary files to a dump subfolder for entity"""
 

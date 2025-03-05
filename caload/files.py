@@ -11,9 +11,13 @@ def write(analysis, key: str, value: Any, data_path: str):
     # Decode data path
     file_type, *file_info = data_path.split(':')
     if file_type == 'hdf5':
-        path, key = file_info
+        file_path, key = file_info
     else:
-        path, = file_info
+        file_path, = file_info
+
+    # Make sure folder exists
+    path_parts = file_path.split('/')
+    os.makedirs(os.path.join(analysis.analysis_path, *path_parts[:-1]), exist_ok=True)
 
     # Write data to file
     if file_type == 'hdf5':
@@ -21,7 +25,7 @@ def write(analysis, key: str, value: Any, data_path: str):
         start = time.perf_counter()
         while pending:
             try:
-                with h5py.File(os.path.join(analysis.analysis_path, path), 'a') as f:
+                with h5py.File(os.path.join(analysis.analysis_path, file_path), 'a') as f:
                     if key not in f:
                         f.create_dataset(key, data=value,
                                          compression=analysis.compression,
@@ -49,7 +53,7 @@ def write(analysis, key: str, value: Any, data_path: str):
     # TODO: alternative to pickle dumps? Writing arbitrary raw binary data to HDF5 seems difficult
     # Dump all other types as binary strings
     else:
-        with open(os.path.join(analysis.analysis_path, path), 'wb') as f:
+        with open(os.path.join(analysis.analysis_path, file_path), 'wb') as f:
             pickle.dump(value, f)
 
 
