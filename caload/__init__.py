@@ -11,7 +11,7 @@ __maintainer__ = 'Tim Hladnik'
 __email__ = 'tim.github@hladnik.de'
 __status__ = 'Development'
 
-__all__ = ['sqltables', 'entities', 'analysis', 'filter', 'open_analysis', 'utils', 's2p_autorun', 'ca_imaging_s2p_vxpy']
+__all__ = ['sqltables', 'entities', 'analysis', 'filter', 'files', 'open_analysis', 's2p_autorun', 'ca_imaging_s2p_vxpy']
 
 default_bulk_format = 'hdf5'
 default_max_blob_size = 2 ** 20  # 2^20 ~ 1MB

@@ -19,8 +19,8 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Query, Session
 
 import caload
+import caload.filter
 from caload.entities import *
-from caload.filter import *
 from caload.sqltables import *
 
 __all__ = ['Analysis', 'Mode', 'open_analysis']
@@ -122,7 +122,6 @@ def create_analysis(analysis_path: str, data_root: str, digest_fun: Callable, sc
         analysis_row = EntityTable(entity_type=analysis_type_row, id='analysis_00')
         session.add(analysis_row)
         session.commit()
-
 
     print('> Create analysis folder')
     # Create analysis data folder
@@ -455,14 +454,14 @@ class Analysis:
         del self.session
         del self.sql_engine
 
-    def restart_session(self):
+    def restart_session(self, *args, **kwargs):
 
         try:
             self.session.close()
         except OperationalError as _:
             pass
 
-        self.open_session()
+        self.open_session(*args, **kwargs)
         self.session.rollback()
 
     def get(self, entity_type: Union[str, Type[Entity], Type[E]], *filter_expressions: str,
@@ -492,7 +491,7 @@ class Analysis:
         expr = ' AND '.join(filter_expressions)
 
         # Get filter query
-        query = get_entity_query_by_attributes(entity_type_name, self.session, expr, entity_query=entity_query)
+        query = caload.filter.get_entity_query_by_attributes(entity_type_name, self.session, expr, entity_query=entity_query)
 
         # Return collection for resulting query
         return EntityCollection(entity_type, analysis=self, query=query)

@@ -27,8 +27,10 @@ from sqlalchemy.orm import Query, aliased, joinedload, make_transient
 from tqdm import tqdm
 
 import caload
+import caload.filter
+import caload.files
+from caload.handling import retry_on_operational_failure
 from caload.sqltables import *
-from caload import files, utils
 
 if TYPE_CHECKING:
     from caload.analysis import Analysis
@@ -50,38 +52,19 @@ class Entity:
         self._analysis = analysis
         self._row = row
 
-        # self.analysis.entities.append(self)
-
         self.load()
-
-    # def __hash__(self):
-    #     if self.parent is not None:
-    #         return f'{self.parent.__hash__()}_{self.id}'
-    #     return self.id
-    #
-    # def __new__(cls, row: EntityTable, analysis: Analysis):
-    # TODO: find a way to do this with processing.
-    #  Implementing __new__ leads to all kinds of weird stuff when pickling during multiprocess fork
-    #
-    #     # Return existing instance
-    #     if row.pk in analysis.entities:
-    #         return analysis.entities[row.pk]
-    #
-    #     # Create instance
-    #     entity = super(Entity, cls).__new__(cls)
-    #     analysis.entities[row.pk] = entity
-    #
-    #     return entity
 
     def __repr__(self):
         return f"{self.row.entity_type.name}(id='{self.row.id}', parent={self.parent})"
 
+    @retry_on_operational_failure
     def __contains__(self, item):
         # subquery = self.analysis.session.query(AttributeTable.pk).filter(AttributeTable.name == item).subquery()
         value_query = (self.analysis.session.query(AttributeTable)
                        .filter(AttributeTable.name == item, AttributeTable.entity_pk == self.row.pk))
         return value_query.count() > 0
 
+    @retry_on_operational_failure
     def __getitem__(self, item: str):
 
         value_query = (self.analysis.session.query(AttributeTable)
@@ -101,8 +84,9 @@ class Entity:
             return value
 
         # Read from filepath
-        return files.read(self.analysis, value)
+        return caload.files.read(self.analysis, value)
 
+    @retry_on_operational_failure
     def __setitem__(self, key: str, value: Any):
 
         attribute_row = None
@@ -166,7 +150,7 @@ class Entity:
 
             # Delete old files
             if pre_data_type_str == 'path':
-                files.delete(attribute_row.value)
+                caload.files.delete(attribute_row.value)
 
             # Set old value to None
             attribute_row.value = None
@@ -185,7 +169,7 @@ class Entity:
                     data_path = f'pkl:{self.path}/{key.replace("/", "_")}'
 
             # Write to file
-            files.write(self.analysis, key, value, data_path)
+            caload.files.write(self.analysis, key, value, data_path)
 
             # Set value to data_path to write to database
             value = data_path
@@ -197,6 +181,17 @@ class Entity:
         # Commit changes (right away if not in create mode)
         if not self.analysis.is_create_mode:
             self.analysis.session.commit()
+
+    def __delitem__(self, key):
+
+        query = (self.analysis.session.query(AttributeTable)
+                 .filter(AttributeTable.name == key)
+                 .filter(AttributeTable.entity_pk == self.row.pk))
+        query.delete()
+        self.analysis.session.commit()
+
+    def restart_session(self, *args, **kwargs):
+        self.analysis.restart_session(*args, **kwargs)
 
     @property
     def pk(self):
@@ -226,6 +221,7 @@ class Entity:
         return self.analysis.add_entity(entity_type, entity_id, parent_entity=self)
 
     @property
+    @retry_on_operational_failure
     def scalar_attributes(self):
         # Get all
         query = (self.analysis.session.query(AttributeTable)
@@ -234,6 +230,7 @@ class Entity:
         return {value_row.name: value_row.value for value_row in query.all()}
 
     @property
+    @retry_on_operational_failure
     def attributes(self):
         # Get all
         query = (self.analysis.session.query(AttributeTable)
@@ -245,7 +242,11 @@ class Entity:
             if value_row.data_type == 'path':
                 attributes[value_row.name] = self[value_row.name]
             else:
-                attributes[value_row.name] = value_row.value
+                try:
+                    attributes[value_row.name] = value_row.value
+                except Exception as e:
+                    print(f'Failed to load attribute with name {value_row.name}')
+                    raise e
 
         return attributes
 
@@ -265,6 +266,7 @@ class Entity:
         return Path(os.path.join('entities', self.row.entity_type.name.lower(), f'{self.row.pk}_{self.id}')).as_posix()
 
     @property
+    @retry_on_operational_failure
     def row(self):
         if self._row is None:
             if self._row_pk is None:
@@ -334,6 +336,7 @@ class EntityCollection:
     def __repr__(self):
         return f'{self._entity_type_name}Collection({len(self)})'
 
+    @retry_on_operational_failure
     def __len__(self):
         if self._entity_count < 0:
             self._entity_count = self.query.count()
@@ -344,6 +347,7 @@ class EntityCollection:
         self._batch_offset = 0
         return self
 
+    @retry_on_operational_failure
     def __next__(self) -> Union[Entity, E]:
 
         # Increment count
@@ -365,6 +369,7 @@ class EntityCollection:
         return self._entity_type(row=self._batch_results[self._iteration_count % self._batch_size],
                                  analysis=self.analysis)
 
+    @retry_on_operational_failure
     def __getitem__(self, item) -> Union[Entity, E, List[Entity], List[E], pd.DataFrame]:
 
         # Return single entity
@@ -405,6 +410,7 @@ class EntityCollection:
 
         raise KeyError(f'Invalid key {item}')
 
+    @retry_on_operational_failure
     def __setitem__(self, key, df):
         """Set attributes on individual entities in collection
         """
@@ -417,6 +423,18 @@ class EntityCollection:
 
         self.update(df)
 
+    def __delitem__(self, key):
+
+        query = (self.analysis.session.query(AttributeTable)
+                 .filter(AttributeTable.name == key)
+                 .filter(AttributeTable.entity_pk.in_(self.query.subquery().primary_key)))
+        query.delete()
+        self.analysis.session.commit()
+
+    def restart_session(self, *args, **kwargs):
+        self.analysis.restart_session(*args, **kwargs)
+
+    @retry_on_operational_failure
     def update(self, df: pd.DataFrame):  # , overwrite: bool = False):
 
         _dtypes = ['str', 'float', 'int', 'date', 'datetime', 'bool', 'blob', 'path']
@@ -457,16 +475,14 @@ class EntityCollection:
             df_insert['data_type'] = data_type_str
             df_insert['is_persistent'] = self.analysis.is_create_mode
 
+            # Perform upsert
             insert_attr_data = df_insert.to_dict('records')
-
             insert_stmt = mysql_insert(AttributeTable).values(insert_attr_data)
-
             update_attr_data = {f'value_{data_type_str}': getattr(insert_stmt.inserted, f'value_{data_type_str}'),
                                 # On update, reset all other value fields to None:
                                 **{f'value_{dt}': None for dt in list(set(_dtypes) - {data_type_str})},
                                 'is_persistent': insert_stmt.inserted.is_persistent,
                                 'data_type': data_type_str}
-
             upsert_stmt = insert_stmt.on_duplicate_key_update(update_attr_data)
             self.analysis.session.execute(upsert_stmt)
             self.analysis.session.commit()
@@ -493,6 +509,7 @@ class EntityCollection:
         return self._synced_dataframe
 
     @property
+    @retry_on_operational_failure
     def attribute_rows(self) -> List[Tuple[str, str]]:
         attr_query = (self.analysis.session.query(AttributeTable.name, AttributeTable.data_type)
                       .join(EntityTable)
@@ -536,6 +553,7 @@ class EntityCollection:
         # Return final DataFrame
         return self._cache[attribute_names].copy()
 
+    @retry_on_operational_failure
     def _load_attributes(self, attribute_names: List[str]):
 
         # Get names and types
@@ -610,7 +628,7 @@ class EntityCollection:
                 df_new[attr_name] = df_new[attr_name].apply(lambda s: pickle.loads(s) if s is not None else None)
             # Load data from path
             elif attr_type == 'path':
-                df_new[attr_name] = df_new[attr_name].apply(lambda s: files.read(self.analysis, s) if s is not None else None)
+                df_new[attr_name] = df_new[attr_name].apply(lambda s: caload.files.read(self.analysis, s) if s is not None else None)
 
         # Set row index to primary key
         df_new.set_index('pk', drop=True, inplace=True)
@@ -795,8 +813,9 @@ class EntityCollection:
                 print(f'WARNING: lost connection. Retry no {retry_counter}')
 
                 # Try reconnect
-                entity.analysis.close_session()
-                entity.analysis.open_session(pool_size=1)
+                entity.restart_session(pool_size=1)
+                # entity.analysis.close_session()
+                # entity.analysis.open_session(pool_size=1)
 
             # Raise other relevant exceptions
             except Exception as _exc:

@@ -8,7 +8,6 @@ from typing import Any, Dict, TYPE_CHECKING, Tuple, Type, Union
 from sqlalchemy import BinaryExpression, or_, and_, not_
 from sqlalchemy.orm import Query, Session, aliased
 
-from caload import utils
 from caload.sqltables import *
 
 if TYPE_CHECKING:
