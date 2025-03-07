@@ -3,20 +3,26 @@
 Expected raw data folder/file structure:
 
 data_root
+|
 |   + animal_id_01
 |   +-- zstack_for_animal_id_01.tif (optional)
 |   +-- recording_id_01
-|   |   +-- rec_file_01.tif
+|   |   +-- suite2p/
+|   |   +-- ants_registration/ (optional)
 |   ...
 |   +-- recording_id_n
-|   |   +-- rec_file_n.tif
+|   |   +-- suite2p/
+|   |   +-- ants_registration/ (optional)
+|
 |   + animal_id_02
 |   +-- zstack_for_animal_id_02.tif (optional)
 |   +-- recording_id_01
-|   |   +-- rec_file_01.tif
+|   |   +-- suite2p/
+|   |   +-- ants_registration/ (optional)
 |   ...
 |   +-- recording_id_n
-|   |   +-- rec_file_n.tif
+|   |   +-- suite2p/
+|   |   +-- ants_registration/ (optional)
 ...
 
 Output data hierarchy:
@@ -27,6 +33,7 @@ Animal
     +-- Phase
 
 """
+from __future__ import annotations
 import os
 from pathlib import Path
 from typing import List, Tuple, Type, Union
@@ -45,26 +52,40 @@ from caload.entities import *
 __all__ = ['Animal', 'Recording', 'Roi', 'Phase', 'digest_folder', 'schema']
 
 
-class Animal(Entity):
-
-    @property
-    def recordings(self) -> EntityCollection:
-        return self.analysis.get(Recording, animal_id=self.id)
-
-    @property
-    def rois(self) -> EntityCollection:
-        return self.analysis.get(Roi, animal_id=self.id)
-
-    @property
-    def phases(self) -> EntityCollection:
-        return self.analysis.get(Phase, animal_id=self.id)
-
-
 class AnimalCollection(EntityCollection):
     pass
 
 
+class RecordingCollection(EntityCollection):
+    pass
+
+
+class RoiCollection(EntityCollection):
+    pass
+
+
+class PhaseCollection(EntityCollection):
+    pass
+
+
+class Animal(Entity):
+    collection_type = AnimalCollection
+
+    @property
+    def recordings(self) -> RecordingCollection:
+        return self.analysis.get(Recording, animal_id=self.id)
+
+    @property
+    def rois(self) -> RoiCollection:
+        return self.analysis.get(Roi, animal_id=self.id)
+
+    @property
+    def phases(self) -> PhaseCollection:
+        return self.analysis.get(Phase, animal_id=self.id)
+
+
 class Recording(Entity):
+    collection_type = RecordingCollection
 
     parent_type = Animal
     animal: Animal
@@ -72,24 +93,17 @@ class Recording(Entity):
     def load(self):
         self.animal = Animal(analysis=self.analysis, row=self.row.parent)
 
-    # @property
-    # def animal(self) -> Animal:
-    #     return Animal(analysis=self.analysis, row=self._row.parent)
-
     @property
-    def rois(self) -> EntityCollection:
+    def rois(self) -> RoiCollection:
         return self.analysis.get(Roi, animal_id=self.animal.id, rec_id=self.id)
 
     @property
-    def phases(self) -> EntityCollection:
+    def phases(self) -> PhaseCollection:
         return self.analysis.get(Phase, animal_id=self.animal.id, rec_id=self.id)
 
 
-class RecordingCollection(EntityCollection):
-    pass
-
-
 class Roi(Entity):
+    collection_type = RoiCollection
 
     parent_type = Recording
     animal: Animal
@@ -98,21 +112,10 @@ class Roi(Entity):
     def load(self):
         self.recording = Recording(analysis=self.analysis, row=self.row.parent)
         self.animal = Animal(analysis=self.analysis, row=self.row.parent.parent)
-
-    # @property
-    # def animal(self) -> Animal:
-    #     return Animal(analysis=self.analysis, row=self.row.parent.parent)
-
-    # @property
-    # def recording(self) -> Recording:
-    #     return Recording(analysis=self.analysis, row=self.row.parent)
-
-
-class RoiCollection(EntityCollection):
-    pass
 
 
 class Phase(Entity):
+    collection_type = PhaseCollection
 
     parent_type = Recording
     animal: Animal
@@ -121,27 +124,15 @@ class Phase(Entity):
     def load(self):
         self.recording = Recording(analysis=self.analysis, row=self.row.parent)
         self.animal = Animal(analysis=self.analysis, row=self.row.parent.parent)
-
-    # @property
-    # def animal(self) -> Animal:
-    #     return Animal(analysis=self.analysis, row=self.row.parent.parent)
-    #
-    # @property
-    # def recording(self) -> Recording:
-    #     return Recording(analysis=self.analysis, row=self.row.parent)
-
-
-class PhaseCollection(EntityCollection):
-    pass
 
 
 schema = [Animal, Recording, Roi, Phase]
 
 
-def digest_folder(analysis: caload.analysis.Analysis):
+def digest_folder(analysis: caload.analysis.Analysis, data_root_path: Union[str, os.PathLike]):
 
     # Scan for data folders
-    folder_list = scan_folder(analysis.config['data_root'], [])
+    folder_list = scan_folder(data_root_path, [])
 
     print(f'Process folders: {folder_list}')
     for recording_path in folder_list:
@@ -154,6 +145,10 @@ def digest_folder(analysis: caload.analysis.Analysis):
         analysis.session.commit()
 
         recording = get_recording(animal, recording_path)
+
+        if len(recording.rois) > 0:
+            print(f'Recording already exists with {len(recording.rois)} ROIs. Skipping')
+            continue
 
         # Load s2p processed data
         s2p_path = os.path.join(recording_path, 'suite2p', 'plane0')
@@ -342,7 +337,7 @@ def scan_folder(root_path: str, recording_list: List[str]) -> List[str]:
     return recording_list
 
 
-def get_animal(analysis: caload.analysis.Analysis, path: str) -> Entity:
+def get_animal(analysis: caload.analysis.Analysis, path: str) -> Animal:
 
     # Create animal
     animal_id = Path(path).as_posix().split('/')[-2]
@@ -389,7 +384,7 @@ def get_animal(analysis: caload.analysis.Analysis, path: str) -> Entity:
     return animal
 
 
-def get_recording(animal: Entity, path: str) -> Entity:
+def get_recording(animal: Animal, path: str) -> Recording:
     # Create debug folder
     debug_folder_path = os.path.join(path, 'debug')
     if not os.path.exists(debug_folder_path):
@@ -417,7 +412,7 @@ def get_recording(animal: Entity, path: str) -> Entity:
     return recording
 
 
-def add_metadata(entity: caload.entities.Entity, folder_path: str):
+def add_metadata(entity: Entity, folder_path: str):
     """Function searches for and returns metadata on a given folder path
 
     Function scans the `folder_path` for metadata yaml files (ending in `meta.yaml`)

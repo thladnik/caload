@@ -4,6 +4,9 @@ from sqlalchemy.exc import OperationalError
 
 
 def retry_on_operational_failure(fun: Callable, retry_num: int = 1) -> Callable:
+    """Decorator for catching sqlalchemy.exc.OperationalError,
+    which is typically emitted when a connection has been disconnected by the host.
+    """
 
     assert retry_num > 0, 'Need at least one retry'
 

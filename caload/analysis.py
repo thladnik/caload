@@ -23,10 +23,10 @@ import caload.filter
 from caload.entities import *
 from caload.sqltables import *
 
-__all__ = ['Analysis', 'Mode', 'open_analysis']
+__all__ = ['Analysis', 'Mode', 'create_analysis', 'delete_analysis', 'digest_data', 'open_analysis']
 
 
-E = TypeVar('E')
+EntityType = TypeVar('EntityType', bound=Entity)
 
 
 class Mode(Enum):
@@ -37,10 +37,10 @@ class Mode(Enum):
 log = logging.getLogger(__name__)
 
 
-def create_analysis(analysis_path: str, data_root: str, digest_fun: Callable, schema: List[Type[Entity]],
+def create_analysis(analysis_path: str, data_root_path: str, schema: List[Type[Entity]],
                     dbhost: str = None, dbname: str = None, dbuser: str = None, dbpassword: str = None,
                     bulk_format: str = None, compression: str = 'gzip', compression_opts: Any = None,
-                    shuffle_filter: bool = True, max_blob_size: int = None,
+                    shuffle_filter: bool = True, max_blob_size: int = None, digest_fun: Callable = None,
                     **kwargs) -> Analysis:
     analysis_path = Path(analysis_path).as_posix()
 
@@ -128,7 +128,7 @@ def create_analysis(analysis_path: str, data_root: str, digest_fun: Callable, sc
     os.mkdir(analysis_path)
 
     # Set config data
-    config = {'data_root': data_root,
+    config = {'data_root': data_root_path,
               'dbhost': dbhost,
               'dbname': dbname,
               'dbuser': dbuser,
@@ -147,9 +147,10 @@ def create_analysis(analysis_path: str, data_root: str, digest_fun: Callable, sc
     print('> Open analysis folder')
     analysis = Analysis(analysis_path, mode=Mode.create, **kwargs)
 
-    # Start digesting recordings
-    print('> Start data digest')
-    digest_fun(analysis)
+    if digest_fun is not None:
+        # Start digesting recordings
+        print('> Start data digest')
+        digest_data(analysis, digest_fun, data_root_path)
 
     return analysis
 
@@ -254,6 +255,12 @@ def delete_analysis(analysis_path: str):
     print(f'Successfully deleted analysis {analysis_path}')
 
 
+def digest_data(analysis: Analysis, digest_fun: Callable, data_root_path: Union[str, os.PathLike]):
+    analysis.mode = Mode.create
+    digest_fun(analysis, data_root_path)
+    analysis.mode = Mode.analyse
+
+
 def open_analysis(analysis_path: str, **kwargs) -> Analysis:
     print(f'Open analysis {analysis_path}')
     summary = Analysis(analysis_path, **kwargs)
@@ -270,10 +277,8 @@ class Analysis:
     echo: bool
     debug: bool
 
-    # List of entities to keep row bound to session
-    entities: List[Entity]  # Dict[int, Entity]
     # Root analysis entity row
-    _row: EntityTable
+    root_entity: Entity
     # Entity type name -> entity type PK
     _entity_type_pk_map: Dict[str, int]
     # Child entity type -> parent entity type
@@ -286,11 +291,9 @@ class Analysis:
 
         # Set mode
         self.mode = mode
-        self.is_create_mode = mode is Mode.create
         self._entity_type_pk_map = {}
         self._entity_type_hierachy_map = {}
         self._entity_type_row_map = {}
-        self.entities = []
 
         # Set path as posix
         self._analysis_path = Path(path).as_posix()
@@ -315,6 +318,21 @@ class Analysis:
         # Select analysis entity row
         self.select_analysis(select_analysis)
 
+    def __repr__(self):
+        return f"Analysis('{self.analysis_path}')"
+
+    def __contains__(self, item):
+        self.root_entity.__contains__(item)
+
+    def __delitem__(self, key):
+        self.root_entity.__delitem__(key)
+
+    def __getitem__(self, item):
+        self.root_entity.__getitem__(item)
+
+    def __setitem__(self, key, value):
+        self.root_entity.__setitem__(key, value)
+
     def _load_entity_hierarchy(self):
         entity_type_rows = self.session.query(EntityTypeTable).order_by(EntityTypeTable.pk).all()
 
@@ -331,18 +349,12 @@ class Analysis:
 
             self._entity_type_hierachy_map[str(row.name)] = parent
 
-    def __repr__(self):
-        return f"Analysis('{self.analysis_path}')"
-
     def add_entity(self, entity_type: Type[Entity], entity_id: Union[str, List[str]],
                    parent_entity: Entity = None) -> Union[Entity, List[Entity]]:
 
         self.open_session()
 
-        if not isinstance(entity_type, str):
-            entity_type_name = entity_type.__name__
-        else:
-            entity_type_name = entity_type
+        entity_type_name = entity_type.__name__
 
         # Check if type is known
         if entity_type_name not in self._entity_type_pk_map:
@@ -358,7 +370,7 @@ class Analysis:
             # If no parent entity was provided, this should be top level
             if self._entity_type_hierachy_map[entity_type_name] != 'Analysis':
                 raise Exception('No parent entity provided, but entity type is not top level')
-            parent_entity_row = self._row
+            parent_entity_row = self.root_entity.row
 
         # Add row
         if not isinstance(entity_id, list):
@@ -375,13 +387,17 @@ class Analysis:
         # Add entity
         entities = []
         for row in rows:
-            entity = Entity(row=row, analysis=self)
+            entity = entity_type(row=row, analysis=self)
             entities.append(entity)
 
         if len(rows) == 1:
             return entities[0]
 
         return entities
+
+    @property
+    def is_create_mode(self) -> bool:
+        return self.mode is Mode.create
 
     @property
     def analysis_path(self) -> str:
@@ -414,7 +430,7 @@ class Analysis:
         if analysis_name is not None:
             query = query.filter(EntityTable.id == analysis_name)
 
-        self._row = query.order_by(EntityTable.pk).first()
+        self.root_entity = Entity(row=query.order_by(EntityTable.pk).first(), analysis=self)
 
     def open_session(self, pool_size: int = 20, echo: bool = None):
 
@@ -464,13 +480,14 @@ class Analysis:
         self.open_session(*args, **kwargs)
         self.session.rollback()
 
-    def get(self, entity_type: Union[str, Type[Entity], Type[E]], *filter_expressions: str,
-            entity_query: Query = None, **equalities: Dict[str, Any]) -> EntityCollection:
+    def get(self, entity_type: Union[str, Type[EntityType]], *filter_expressions: str,
+            entity_query: Query = None, **equalities: Dict[str, Any]) -> EntityType.collection_type:
 
         self.open_session()
 
         # Get entity name
         if isinstance(entity_type, str):
+            entity_type = Entity
             entity_type_name = entity_type
         else:
             if type(entity_type) is not type or not issubclass(entity_type, Entity):
@@ -494,7 +511,7 @@ class Analysis:
         query = caload.filter.get_entity_query_by_attributes(entity_type_name, self.session, expr, entity_query=entity_query)
 
         # Return collection for resulting query
-        return EntityCollection(entity_type, analysis=self, query=query)
+        return entity_type.collection_type(entity_type, analysis=self, query=query)
 
     def get_temp_path(self, path: str):
         temp_path = os.path.join(self.analysis_path, 'temp', path)

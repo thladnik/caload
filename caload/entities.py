@@ -1,29 +1,20 @@
 from __future__ import annotations
-
+from datetime import datetime, date, timedelta
 import math
 import os
+from pathlib import Path
 import pickle
 import pprint
 import shutil
-
-import sys
 import time
-from abc import abstractmethod
-
-from datetime import datetime, date, timedelta
-from pathlib import Path
 from typing import Any, Callable, Dict, List, TYPE_CHECKING, Tuple, Type, TypeVar, Union
 
-import cloudpickle
-import h5py
 import numpy as np
 import pandas as pd
 import sqlalchemy.exc
-from pandas.core.indexing import _iLocIndexer
-from sqlalchemy import case, func, text
-
+from sqlalchemy import case, func
 from sqlalchemy.dialects.mysql import insert as mysql_insert
-from sqlalchemy.orm import Query, aliased, joinedload, make_transient
+from sqlalchemy.orm import Query
 from tqdm import tqdm
 
 import caload
@@ -36,271 +27,6 @@ if TYPE_CHECKING:
     from caload.analysis import Analysis
 
 __all__ = ['Entity', 'EntityCollection']
-
-
-class Entity:
-    _analysis: Analysis
-    _row_pk: Union[int, None] = None
-    _row: Union[EntityTable, None] = None
-
-    # Keep references to parent table instances,
-    # to avoid cold references during multiprocessing,
-    # caused by lazy loading
-    _parent: Union[Entity, None] = None
-
-    def __init__(self, row: EntityTable, analysis: Analysis):
-        self._analysis = analysis
-        self._row = row
-
-        self.load()
-
-    def __repr__(self):
-        return f"{self.row.entity_type.name}(id='{self.row.id}', parent={self.parent})"
-
-    @retry_on_operational_failure
-    def __contains__(self, item):
-        # subquery = self.analysis.session.query(AttributeTable.pk).filter(AttributeTable.name == item).subquery()
-        value_query = (self.analysis.session.query(AttributeTable)
-                       .filter(AttributeTable.name == item, AttributeTable.entity_pk == self.row.pk))
-        return value_query.count() > 0
-
-    @retry_on_operational_failure
-    def __getitem__(self, item: str):
-
-        value_query = (self.analysis.session.query(AttributeTable)
-                       .filter(AttributeTable.name == item, AttributeTable.entity_pk == self.row.pk))
-
-        if value_query.count() == 0:
-            raise KeyError(f'Attribute {item} not found for entity {self}')
-
-        # Fetch first (only row)
-        value_row = value_query.first()
-
-        column_str = value_row.data_type
-        value = value_row.value
-
-        # Anything that isn't a referenced path gets returned immediately
-        if column_str != 'path':
-            return value
-
-        # Read from filepath
-        return caload.files.read(self.analysis, value)
-
-    @retry_on_operational_failure
-    def __setitem__(self, key: str, value: Any):
-
-        attribute_row = None
-        pre_data_type_str = ''
-
-        # Get corresponding builtin python scalar type for numpy scalars
-        if isinstance(value, np.generic):
-            value = value.item()
-
-        # Query attribute row if not in create mode
-        if not self.analysis.is_create_mode:
-            # Build query
-            attribute_query = (self.analysis.session.query(AttributeTable)
-                               .filter(AttributeTable.name == key, AttributeTable.entity_pk == self.row.pk))
-
-            # Evaluate
-            if attribute_query.count() == 1:
-                attribute_row = attribute_query.one()
-                pre_data_type_str = attribute_row.data_type
-
-            elif attribute_query.count() > 1:
-                raise ValueError('Wait a minute...')
-
-        # Create row if it doesn't exist yet
-        if attribute_row is None:
-            attribute_row = AttributeTable(entity=self.row, name=key, is_persistent=self.analysis.is_create_mode)
-            self.analysis.session.add(attribute_row)
-
-        # Determine data type of new value
-
-        # Scalars
-        if type(value) in (str, float, int, bool, date, datetime):
-
-            # Set value type
-            value_type_map = {str: 'str', float: 'float', int: 'int',
-                              bool: 'bool', date: 'date', datetime: 'datetime'}
-            value_type = value_type_map.get(type(value))
-
-            # Some SQL dialects don't support inf float values
-            if value_type == 'float' and math.isinf(value):
-                value_type = 'blob'
-
-            # Set column string
-            new_data_type_str = value_type
-
-        # Small objects
-        # NOTE: there is no universal way to get the byte number of objects
-        # Builtin object have __sizeof__(), but this only returns the overhead for some numpy.ndarrays
-        # For numpy arrays it's numpy.ndarray.nbytes
-        elif (not isinstance(value, np.ndarray) and value.__sizeof__() < self.analysis.max_blob_size) \
-                or (isinstance(value, np.ndarray) and value.nbytes < self.analysis.max_blob_size):
-
-            new_data_type_str = 'blob'
-
-        # Large objects or object of unkown type
-        else:
-            new_data_type_str = 'path'
-
-        # Handle deletion of old values
-        if new_data_type_str != pre_data_type_str:
-
-            # Delete old files
-            if pre_data_type_str == 'path':
-                caload.files.delete(attribute_row.value)
-
-            # Set old value to None
-            attribute_row.value = None
-
-        # Handle path types
-        if new_data_type_str == 'path':
-
-            # Get previous path (if available)
-            data_path = attribute_row.value
-
-            # If no data_path is set yet, generate it
-            if data_path is None:
-                if isinstance(value, np.ndarray):
-                    data_path = f'hdf5:{self.path}/data.hdf5:{key}'
-                else:
-                    data_path = f'pkl:{self.path}/{key.replace("/", "_")}'
-
-            # Write to file
-            caload.files.write(self.analysis, key, value, data_path)
-
-            # Set value to data_path to write to database
-            value = data_path
-
-        # Set row type and value
-        attribute_row.data_type = new_data_type_str
-        attribute_row.value = value
-
-        # Commit changes (right away if not in create mode)
-        if not self.analysis.is_create_mode:
-            self.analysis.session.commit()
-
-    def __delitem__(self, key):
-
-        query = (self.analysis.session.query(AttributeTable)
-                 .filter(AttributeTable.name == key)
-                 .filter(AttributeTable.entity_pk == self.row.pk))
-        query.delete()
-        self.analysis.session.commit()
-
-    def restart_session(self, *args, **kwargs):
-        self.analysis.restart_session(*args, **kwargs)
-
-    @property
-    def pk(self):
-        return self.row.pk
-
-    @property
-    def id(self):
-        return self.row.id
-
-    def unload_row(self):
-
-        # Save primary key of row
-        self._row_pk = self.row.pk
-
-        # Propagate
-        if self.parent is not None:
-            self.parent.unload_row()
-
-        # Set row to None
-        self._row = None
-
-    def load(self):
-        """To be implemented in Entity subclass. Is called after Entity.__init__
-        """
-
-    def add_child_entity(self, entity_type: Union[str, Type[Entity]], entity_id: Union[str, List[str]]):
-        return self.analysis.add_entity(entity_type, entity_id, parent_entity=self)
-
-    @property
-    @retry_on_operational_failure
-    def scalar_attributes(self):
-        # Get all
-        query = (self.analysis.session.query(AttributeTable)
-                 .filter(AttributeTable.entity_pk == self.row.pk)
-                 .filter(AttributeTable.data_type.not_in(['path', 'blob'])))
-        return {value_row.name: value_row.value for value_row in query.all()}
-
-    @property
-    @retry_on_operational_failure
-    def attributes(self):
-        # Get all
-        query = (self.analysis.session.query(AttributeTable)
-                 .filter(AttributeTable.entity_pk == self.row.pk))
-
-        # Update
-        attributes = {}
-        for value_row in query.all():
-            if value_row.data_type == 'path':
-                attributes[value_row.name] = self[value_row.name]
-            else:
-                try:
-                    attributes[value_row.name] = value_row.value
-                except Exception as e:
-                    print(f'Failed to load attribute with name {value_row.name}')
-                    raise e
-
-        return attributes
-
-    def update(self, data: Dict[str, Any]):
-        """Implement update method for usage like in dict.update"""
-        for key, value in data.items():
-            self[key] = value
-
-    @property
-    def parent(self) -> Union[Entity, None]:
-        if self._parent is None and self.row.parent is not None:
-            self._parent = Entity(row=self.row.parent, analysis=self.analysis)
-        return self._parent
-
-    @property
-    def path(self) -> str:
-        return Path(os.path.join('entities', self.row.entity_type.name.lower(), f'{self.row.pk}_{self.id}')).as_posix()
-
-    @property
-    @retry_on_operational_failure
-    def row(self):
-        if self._row is None:
-            if self._row_pk is None:
-                raise Exception('Missing primary key to retrieve table row')
-            self._row = self.analysis.session.query(EntityTable).filter(EntityTable.pk == self._row_pk).first()
-        return self._row
-
-    @property
-    def analysis(self) -> Analysis:
-        return self._analysis
-
-    def dump_file(self, src_path: str, name: str) -> str:
-        """Copy arbitrary files to a dump subfolder for entity"""
-
-        # Get original source filename
-        fn = Path(src_path).as_posix().split('/')[-1]
-
-        # Set destination path
-        dest_path = os.path.join(self.path, 'dump', fn)
-
-        # Copy file
-        shutil.copy(src_path, dest_path)
-
-        # Save relative path
-        self[f'__dump_path_{name}'] = dest_path
-
-    def get_rel_dump_path(self, name: str):
-        return self[f'__dump_path_{name}']
-
-    def get_abs_dump_path(self, name: str):
-        return os.path.join(self.analysis.analysis_path, name)
-
-
-E = TypeVar('E')
 
 
 class EntityCollection:
@@ -317,12 +43,13 @@ class EntityCollection:
 
     def __init__(self, entity_type: Union[str, Type[E]], analysis: Analysis, query: Query):
 
+        # If entity type is only provided as string, set tyoe to Entity base class
         if isinstance(entity_type, str):
             self._entity_type_name = entity_type
             self._entity_type = Entity
         else:
             if type(entity_type) is not type or not issubclass(entity_type, Entity):
-                raise TypeError('Entity type has to be either str or a subclass of Entity')
+                raise TypeError('Entity type has to be either str or subtype of Entity')
 
             self._entity_type = entity_type
             self._entity_type_name = self._entity_type.__name__
@@ -334,7 +61,7 @@ class EntityCollection:
         self._pending_changes: Dict[str, List[int]] = {}
 
     def __repr__(self):
-        return f'{self._entity_type_name}Collection({len(self)})'
+        return f'{self.__class__.__name__}({len(self)})'
 
     @retry_on_operational_failure
     def __len__(self):
@@ -855,6 +582,274 @@ class EntityCollection:
     #         self.analysis.session.add(TaskedEntityTable(task_pk=task_row.pk, **_id))
     #
     #     self.analysis.session.commit()
+
+
+class Entity:
+    collection_type: Type[EntityCollection] = EntityCollection
+    _analysis: Analysis
+    _row_pk: Union[int, None] = None
+    _row: Union[EntityTable, None] = None
+
+    # Keep references to parent table instances,
+    # to avoid cold references during multiprocessing,
+    # caused by lazy loading
+    _parent: Union[Entity, None] = None
+
+    def __init__(self, row: EntityTable, analysis: Analysis):
+        self._analysis = analysis
+        self._row = row
+
+        self.load()
+
+    def __repr__(self):
+        return f"{self.row.entity_type.name}(id='{self.row.id}', parent={self.parent})"
+
+    @retry_on_operational_failure
+    def __contains__(self, item):
+        # subquery = self.analysis.session.query(AttributeTable.pk).filter(AttributeTable.name == item).subquery()
+        value_query = (self.analysis.session.query(AttributeTable)
+                       .filter(AttributeTable.name == item, AttributeTable.entity_pk == self.row.pk))
+        return value_query.count() > 0
+
+    def __delitem__(self, key):
+
+        query = (self.analysis.session.query(AttributeTable)
+                 .filter(AttributeTable.name == key)
+                 .filter(AttributeTable.entity_pk == self.row.pk))
+        query.delete()
+        self.analysis.session.commit()
+
+    @retry_on_operational_failure
+    def __getitem__(self, item: str):
+
+        value_query = (self.analysis.session.query(AttributeTable)
+                       .filter(AttributeTable.name == item)
+                       .filter(AttributeTable.entity_pk == self.row.pk))
+
+        if value_query.count() == 0:
+            raise KeyError(f'Attribute {item} not found for entity {self}')
+
+        # Fetch first (only row)
+        value_row = value_query.first()
+
+        column_str = value_row.data_type
+        value = value_row.value
+
+        # Anything that isn't a referenced path gets returned immediately
+        if column_str != 'path':
+            return value
+
+        # Read from filepath
+        return caload.files.read(self.analysis, value)
+
+    @retry_on_operational_failure
+    def __setitem__(self, key: str, value: Any):
+
+        attribute_row = None
+        pre_data_type_str = ''
+
+        # Get corresponding builtin python scalar type for numpy scalars
+        if isinstance(value, np.generic):
+            value = value.item()
+
+        # Query attribute row if not in create mode
+        if not self.analysis.is_create_mode:
+            # Build query
+            attribute_query = (self.analysis.session.query(AttributeTable)
+                               .filter(AttributeTable.name == key)
+                               .filter(AttributeTable.entity_pk == self.row.pk))
+
+            # Evaluate
+            if attribute_query.count() == 1:
+                attribute_row = attribute_query.one()
+                pre_data_type_str = attribute_row.data_type
+
+            elif attribute_query.count() > 1:
+                raise ValueError('Wait a minute...')
+
+        # Create row if it doesn't exist yet
+        if attribute_row is None:
+            attribute_row = AttributeTable(entity=self.row, name=key, is_persistent=self.analysis.is_create_mode)
+            self.analysis.session.add(attribute_row)
+
+        # Determine data type of new value
+
+        # Scalars
+        if type(value) in (str, float, int, bool, date, datetime):
+
+            # Set value type
+            value_type_map = {str: 'str', float: 'float', int: 'int',
+                              bool: 'bool', date: 'date', datetime: 'datetime'}
+            value_type = value_type_map.get(type(value))
+
+            # Some SQL dialects don't support inf float values
+            if value_type == 'float' and math.isinf(value):
+                value_type = 'blob'
+
+            # Set column string
+            new_data_type_str = value_type
+
+        # Small objects
+        # NOTE: there is no universal way to get the byte number of objects
+        # Builtin object have __sizeof__(), but this only returns the overhead for some numpy.ndarrays
+        # For numpy arrays it's numpy.ndarray.nbytes
+        elif (not isinstance(value, np.ndarray) and value.__sizeof__() < self.analysis.max_blob_size) \
+                or (isinstance(value, np.ndarray) and value.nbytes < self.analysis.max_blob_size):
+
+            new_data_type_str = 'blob'
+
+        # Large objects or object of unkown type
+        else:
+            new_data_type_str = 'path'
+
+        # Handle deletion of old values
+        if new_data_type_str != pre_data_type_str:
+
+            # Delete old files
+            if pre_data_type_str == 'path':
+                caload.files.delete(attribute_row.value)
+
+            # Set old value to None
+            attribute_row.value = None
+
+        # Handle path types
+        if new_data_type_str == 'path':
+
+            # Get previous path (if available)
+            data_path = attribute_row.value
+
+            # If no data_path is set yet, generate it
+            if data_path is None:
+                if isinstance(value, np.ndarray):
+                    data_path = f'hdf5:{self.path}/data.hdf5:{key}'
+                else:
+                    data_path = f'pkl:{self.path}/{key.replace("/", "_")}'
+
+            # Write to file
+            caload.files.write(self.analysis, key, value, data_path)
+
+            # Set value to data_path to write to database
+            value = data_path
+
+        # Set row type and value
+        attribute_row.data_type = new_data_type_str
+        attribute_row.value = value
+
+        # Commit changes (right away if not in create mode)
+        if not self.analysis.is_create_mode:
+            self.analysis.session.commit()
+
+    def restart_session(self, *args, **kwargs):
+        self.analysis.restart_session(*args, **kwargs)
+
+    @property
+    def pk(self):
+        return self.row.pk
+
+    @property
+    def id(self):
+        return self.row.id
+
+    def unload_row(self):
+
+        # Save primary key of row
+        self._row_pk = self.row.pk
+
+        # Propagate
+        if self.parent is not None:
+            self.parent.unload_row()
+
+        # Set row to None
+        self._row = None
+
+    def load(self):
+        """To be implemented in Entity subclass. Is called after Entity.__init__
+        """
+
+    def add_child_entity(self, entity_type: Union[str, Type[Entity]], entity_id: Union[str, List[str]]):
+        return self.analysis.add_entity(entity_type, entity_id, parent_entity=self)
+
+    @property
+    @retry_on_operational_failure
+    def scalar_attributes(self):
+        # Get all
+        query = (self.analysis.session.query(AttributeTable)
+                 .filter(AttributeTable.entity_pk == self.row.pk)
+                 .filter(AttributeTable.data_type.not_in(['path', 'blob'])))
+        return {value_row.name: value_row.value for value_row in query.all()}
+
+    @property
+    @retry_on_operational_failure
+    def attributes(self):
+        # Get all
+        query = (self.analysis.session.query(AttributeTable)
+                 .filter(AttributeTable.entity_pk == self.row.pk))
+
+        # Update
+        attributes = {}
+        for value_row in query.all():
+            if value_row.data_type == 'path':
+                attributes[value_row.name] = self[value_row.name]
+            else:
+                try:
+                    attributes[value_row.name] = value_row.value
+                except Exception as e:
+                    print(f'Failed to load attribute with name {value_row.name}')
+                    raise e
+
+        return attributes
+
+    def update(self, data: Dict[str, Any]):
+        """Implement update method for usage like in dict.update"""
+        for key, value in data.items():
+            self[key] = value
+
+    @property
+    def parent(self) -> Union[Entity, None]:
+        if self._parent is None and self.row.parent is not None:
+            self._parent = Entity(row=self.row.parent, analysis=self.analysis)
+        return self._parent
+
+    @property
+    def path(self) -> str:
+        return Path(os.path.join('entities', self.row.entity_type.name.lower(), f'{self.row.pk}_{self.id}')).as_posix()
+
+    @property
+    @retry_on_operational_failure
+    def row(self):
+        if self._row is None:
+            if self._row_pk is None:
+                raise Exception('Missing primary key to retrieve table row')
+            self._row = self.analysis.session.query(EntityTable).filter(EntityTable.pk == self._row_pk).first()
+        return self._row
+
+    @property
+    def analysis(self) -> Analysis:
+        return self._analysis
+
+    def dump_file(self, src_path: str, name: str) -> str:
+        """Copy arbitrary files to a dump subfolder for entity"""
+
+        # Get original source filename
+        fn = Path(src_path).as_posix().split('/')[-1]
+
+        # Set destination path
+        dest_path = os.path.join(self.path, 'dump', fn)
+
+        # Copy file
+        shutil.copy(src_path, dest_path)
+
+        # Save relative path
+        self[f'__dump_path_{name}'] = dest_path
+
+    def get_rel_dump_path(self, name: str):
+        return self[f'__dump_path_{name}']
+
+    def get_abs_dump_path(self, name: str):
+        return os.path.join(self.analysis.analysis_path, name)
+
+
+E = TypeVar('E')
 
 
 class SyncedDataFrame(pd.DataFrame):
