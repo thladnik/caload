@@ -399,6 +399,10 @@ class EntityCollection:
         print(f'Run function {fun.__name__} on {self} with args '
               f'{[f"{k}:{v}" for k, v in kwargs.items()]} on {len(self)} {self._entity_type_name} entities')
 
+        if len(self) == 0:
+            print('No entities to operate on in collection')
+            return
+
         # Prepare pool and entities
         import multiprocessing as mp
         if worker_num is None:
