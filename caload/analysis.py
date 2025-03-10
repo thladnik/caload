@@ -37,10 +37,11 @@ class Mode(Enum):
 log = logging.getLogger(__name__)
 
 
-def create_analysis(analysis_path: str, data_root_path: str, schema: List[Type[Entity]],
+def create_analysis(analysis_path: str, schema: List[Type[Entity]],
                     dbhost: str = None, dbname: str = None, dbuser: str = None, dbpassword: str = None,
                     bulk_format: str = None, compression: str = 'gzip', compression_opts: Any = None,
-                    shuffle_filter: bool = True, max_blob_size: int = None, digest_fun: Callable = None,
+                    shuffle_filter: bool = True, max_blob_size: int = None,
+                    digest_fun: Callable = None, data_root_path: str = None,
                     **kwargs) -> Analysis:
     analysis_path = Path(analysis_path).as_posix()
 
@@ -128,8 +129,7 @@ def create_analysis(analysis_path: str, data_root_path: str, schema: List[Type[E
     os.mkdir(analysis_path)
 
     # Set config data
-    config = {'data_root': data_root_path,
-              'dbhost': dbhost,
+    config = {'dbhost': dbhost,
               'dbname': dbname,
               'dbuser': dbuser,
               'dbpassword': dbpassword,
@@ -147,7 +147,7 @@ def create_analysis(analysis_path: str, data_root_path: str, schema: List[Type[E
     print('> Open analysis folder')
     analysis = Analysis(analysis_path, mode=Mode.create, **kwargs)
 
-    if digest_fun is not None:
+    if digest_fun is not None and data_root_path is not None:
         # Start digesting recordings
         print('> Start data digest')
         digest_data(analysis, digest_fun, data_root_path)

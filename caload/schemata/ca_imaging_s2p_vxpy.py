@@ -340,7 +340,8 @@ def scan_folder(root_path: str, recording_list: List[str]) -> List[str]:
 def get_animal(analysis: caload.analysis.Analysis, path: str) -> Animal:
 
     # Create animal
-    animal_id = Path(path).as_posix().split('/')[-2]
+    path_parts = Path(path).as_posix().split('/')
+    animal_id = path_parts[-2]
 
     animal_collection = analysis.get(Animal, f'animal_id == "{animal_id}"')
 
@@ -350,6 +351,8 @@ def get_animal(analysis: caload.analysis.Analysis, path: str) -> Animal:
 
         return animal_collection[0]
 
+    # Create new animal entity
+    print(f'Create new entity for animal {animal_id}')
     animal = analysis.add_entity(Animal, animal_id)
     animal['animal_id'] = animal_id
 
@@ -366,6 +369,7 @@ def get_animal(analysis: caload.analysis.Analysis, path: str) -> Animal:
             if fn.lower().endswith(('.tif', '.tiff')):
                 zstack_names.append(fn)
 
+    # Add first stack that was detected
     if len(zstack_names) > 0:
         if len(zstack_names) > 1:
             print(f'WARNING: multiple zstacks detected, using {zstack_names[0]}')
@@ -377,6 +381,24 @@ def get_animal(analysis: caload.analysis.Analysis, path: str) -> Animal:
 
     # Add metadata
     add_metadata(animal, animal_path)
+
+    # Search for valid registration path in animal folder
+    valid_reg_path = None
+    if 'ants_registration' in os.listdir(animal_path):
+        for mov_folder in os.listdir(os.path.join(animal_path, 'ants_registration')):
+            for ref_folder in os.listdir(os.path.join(animal_path, 'ants_registration', mov_folder)):
+                reg_path = os.path.join(animal_path, 'ants_registration', mov_folder, ref_folder)
+
+                # If there is a transform file, we'll take it
+                if 'Composite.h5' in os.listdir(reg_path):
+                    valid_reg_path = reg_path
+                    break
+
+    # Write registration metadata to animal entity
+    if valid_reg_path is not None:
+        print(f'Loading ANTs registration metadata at {valid_reg_path}')
+        ants_metadata = yaml.safe_load(open(os.path.join(valid_reg_path, 'metadata.yaml'), 'r'))
+        animal.update({f'ants/{n}': v for n, v in ants_metadata.items()})
 
     # Commit animal
     analysis.session.commit()
