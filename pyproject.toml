@@ -48,3 +48,6 @@ dev = ['pip-tools', 'pytest', 'build', 'twine']
 
 [project.urls]
 Homepage = 'https://github.com/thladnik/caload'
+
+[project.scripts]
+caload = 'caload.__init__:run'

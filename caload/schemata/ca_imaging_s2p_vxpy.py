@@ -8,20 +8,32 @@ data_root
 |   +-- zstack_for_animal_id_01.tif (optional)
 |   +-- recording_id_01
 |   |   +-- suite2p/
+|   |   +-- Camera.hdf5
+|   |   +-- ...
+|   |   +-- Worker.hdf5
 |   |   +-- ants_registration/ (optional)
 |   ...
 |   +-- recording_id_n
 |   |   +-- suite2p/
+|   |   +-- Camera.hdf5
+|   |   +-- ...
+|   |   +-- Worker.hdf5
 |   |   +-- ants_registration/ (optional)
 |
 |   + animal_id_02
 |   +-- zstack_for_animal_id_02.tif (optional)
 |   +-- recording_id_01
 |   |   +-- suite2p/
+|   |   +-- Camera.hdf5
+|   |   +-- ...
+|   |   +-- Worker.hdf5
 |   |   +-- ants_registration/ (optional)
 |   ...
 |   +-- recording_id_n
 |   |   +-- suite2p/
+|   |   +-- Camera.hdf5
+|   |   +-- ...
+|   |   +-- Worker.hdf5
 |   |   +-- ants_registration/ (optional)
 ...
 
@@ -49,7 +61,7 @@ from tqdm import tqdm
 import caload
 from caload.entities import *
 
-__all__ = ['Animal', 'Recording', 'Roi', 'Phase', 'digest_folder', 'schema']
+__all__ = ['Animal', 'Recording', 'Roi', 'Phase', 'digest', 'schema']
 
 
 class AnimalCollection(EntityCollection):
@@ -129,10 +141,10 @@ class Phase(Entity):
 schema = [Animal, Recording, Roi, Phase]
 
 
-def digest_folder(analysis: caload.analysis.Analysis, data_root_path: Union[str, os.PathLike]):
+def digest(analysis: caload.analysis.Analysis, data_path: Union[str, os.PathLike]):
 
     # Scan for data folders
-    folder_list = scan_folder(data_root_path, [])
+    folder_list = scan_folder(data_path, [])
 
     print(f'Process folders: {folder_list}')
     for recording_path in folder_list:

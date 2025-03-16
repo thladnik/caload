@@ -37,19 +37,18 @@ class Mode(Enum):
 log = logging.getLogger(__name__)
 
 
-def create_analysis(analysis_path: str, schema: List[Type[Entity]],
+def create_analysis(analysis_path: str, entity_schema: Union[List[Type[Entity]], str],
                     dbhost: str = None, dbname: str = None, dbuser: str = None, dbpassword: str = None,
-                    bulk_format: str = None, compression: str = 'gzip', compression_opts: Any = None,
+                    bulk_format: str = None, compression: str = None, compression_opts: Any = None,
                     shuffle_filter: bool = True, max_blob_size: int = None,
                     digest_fun: Callable = None, data_root_path: str = None,
                     **kwargs) -> Analysis:
     analysis_path = Path(analysis_path).as_posix()
 
-    if os.path.exists(analysis_path):
-        raise FileExistsError(f'Analysis path {analysis_path} already exists')
+    if os.path.exists(analysis_path) and len(os.listdir(analysis_path)) > 0:
+        raise FileExistsError(f'Analysis path {analysis_path} already exists and is not empty')
 
     # Get connection parameters
-
     if dbhost is None:
         dbname = input(f'MySQL host name [default: "localhost"]: ')
         if dbname == '':
@@ -57,12 +56,12 @@ def create_analysis(analysis_path: str, schema: List[Type[Entity]],
 
     if dbname is None:
         default_dbname = analysis_path.split('/')[-1]
-        dbname = input(f'New schema name on host "{dbhost}" [default: "{default_dbname}"]: ')
+        dbname = input(f'New database schema name on host "{dbhost}" [default: "{default_dbname}"]: ')
         if dbname == '':
             dbname = default_dbname
 
     if dbuser is None:
-        dbuser = input(f'User name for schema "{dbname}" [default: caload_user]: ')
+        dbuser = input(f'User name for database schema "{dbname}" [default: caload_user]: ')
         if dbuser == '':
             dbuser = 'caload_user'
 
@@ -77,6 +76,9 @@ def create_analysis(analysis_path: str, schema: List[Type[Entity]],
     # Set max blob size
     if max_blob_size is None:
         max_blob_size = caload.default_max_blob_size
+
+    if compression is None:
+        compression = 'gzip'
 
     print(f'Create new analysis at {analysis_path}')
 
@@ -96,15 +98,25 @@ def create_analysis(analysis_path: str, schema: List[Type[Entity]],
     SQLBase.metadata.create_all(engine)
 
     # Create hierarchy
-    print('>> Set up type hierarchy')
-    hierarchy = parse_hierarchy(schema)
+    print('>> Parse entity type hierarchy')
+    # Import schema based on import path, if argument is string
+    if isinstance(entity_schema, str):
+        try:
+
+            import importlib
+            entity_schema = getattr(importlib.import_module(entity_schema), 'schema')
+        except ImportError:
+            raise AttributeError(f'Invalid import path {entity_schema} for entity schema')
+
+    hierarchy = parse_hierarchy(entity_schema)
     print('---')
+    print('Entity type hierarchy:')
     pprint.pprint(hierarchy)
     print('---')
 
+    # Create type hierarchy
     with Session(engine) as session:
 
-        # Create type hierarchy
         def _create_entity_type(_hierarchy: Dict[str,  ...], parent_row: EntityTypeTable):
             for name, children in _hierarchy.items():
                 row = EntityTypeTable(name=name, parent=parent_row)
@@ -133,6 +145,7 @@ def create_analysis(analysis_path: str, schema: List[Type[Entity]],
               'dbname': dbname,
               'dbuser': dbuser,
               'dbpassword': dbpassword,
+              'default_data_path': data_root_path,
               'bulk_format': bulk_format,
               'max_blob_size': max_blob_size,
               'compression': compression,
@@ -196,7 +209,11 @@ def update_analysis(analysis_path: str, digest_fun: Callable, **kwargs):
     digest_fun(analysis)
 
 
-def delete_analysis(analysis_path: str):
+def delete_analysis(analysis_path: str = None):
+
+    if analysis_path is None:
+        analysis_path = os.getcwd()
+
     # Convert
     analysis_path = Path(analysis_path).as_posix()
 
