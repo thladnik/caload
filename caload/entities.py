@@ -26,7 +26,7 @@ from caload.sqltables import *
 if TYPE_CHECKING:
     from caload.analysis import Analysis
 
-__all__ = ['Entity', 'EntityCollection']
+__all__ = ['AnalysisEntity', 'Entity', 'EntityCollection']
 
 
 class EntityCollection:
@@ -615,6 +615,7 @@ class Entity:
                        .filter(AttributeTable.name == item, AttributeTable.entity_pk == self.row.pk))
         return value_query.count() > 0
 
+    @retry_on_operational_failure
     def __delitem__(self, key):
 
         query = (self.analysis.session.query(AttributeTable)
@@ -743,6 +744,9 @@ class Entity:
         if not self.analysis.is_create_mode:
             self.analysis.session.commit()
 
+    def __matmul__(self, other):
+        return LinkEntity(linker=self, linkee=other, analysis=self.analysis)
+
     def restart_session(self, *args, **kwargs):
         self.analysis.restart_session(*args, **kwargs)
 
@@ -851,6 +855,48 @@ class Entity:
 
     def get_abs_dump_path(self, name: str):
         return os.path.join(self.analysis.analysis_path, name)
+
+
+class AnalysisEntity(Entity):
+    pass
+
+
+class LinkEntity(Entity):
+    _link_row: LinkTable = None
+    linker: Entity = None
+    linkee: Entity = None
+
+    def __init__(self,
+                 analysis: Analysis,
+                 linker: Entity = None, linkee: Entity = None,
+                 link_row: LinkTable = None):
+
+        # If link
+        row = None
+        if link_row is None:
+            assert linker is not None and linkee is not None, ('If link_row is not provided, '
+                                                               'linker and linkee are required')
+
+            if not analysis.is_create_mode:
+                link_row = (self.analysis.session.query(LinkTable)
+                            .filter(LinkTable.linker == linker.pk)
+                            .filter(LinkTable.linkee == linkee.pk).first())
+
+            # Create new link row and corresponding link entity
+            if link_row is None:
+                row = EntityTable(entity_type=analysis.entity_type_row_map['Link'])
+                link_row = LinkTable(linker=self.linker.row, linkee=self.linkee.row, entity=row)
+
+        assert link_row is not None, 'No link_row provided'
+
+        if row is None:
+            row = link_row.entity
+
+        if linker is None or linkee is None:
+            self.linker = link_row.linker
+            self.linkee = link_row.linkee
+
+        Entity.__init__(self, row=row, analysis=analysis)
 
 
 E = TypeVar('E')

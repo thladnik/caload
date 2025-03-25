@@ -126,6 +126,9 @@ def create_analysis(analysis_path: str, entity_schema: Union[List[Type[Entity]],
         # Add Analysis type
         analysis_type_row = EntityTypeTable(name='Analysis', parent=None)
         session.add(analysis_type_row)
+        # Add Link type
+        link_type_row = EntityTypeTable(name='Link', parent=None)
+        session.add(link_type_row)
 
         # Add custom types
         _create_entity_type(hierarchy, analysis_type_row)
@@ -300,8 +303,8 @@ class Analysis:
     _entity_type_pk_map: Dict[str, int]
     # Child entity type -> parent entity type
     _entity_type_hierachy_map: Dict[str, Union[str, None]]
-    # # Entity type name -> entity type row
-    _entity_type_row_map: Dict[str, EntityTypeTable]
+    # Entity type name -> entity type row
+    entity_type_row_map: Dict[str, EntityTypeTable]
 
     def __init__(self, path: str, mode: Mode = Mode.analyse, lazy_init: bool = False,
                  echo: bool = False, debug: bool = False, select_analysis: str = None):
@@ -310,7 +313,7 @@ class Analysis:
         self.mode = mode
         self._entity_type_pk_map = {}
         self._entity_type_hierachy_map = {}
-        self._entity_type_row_map = {}
+        self.entity_type_row_map = {}
 
         # Set path as posix
         self._analysis_path = Path(path).as_posix()
@@ -354,7 +357,7 @@ class Analysis:
         entity_type_rows = self.session.query(EntityTypeTable).order_by(EntityTypeTable.pk).all()
 
         # Create name to pk map
-        self._entity_type_row_map = {str(row.name): row for row in entity_type_rows}
+        self.entity_type_row_map = {str(row.name): row for row in entity_type_rows}
         self._entity_type_pk_map = {str(row.name): int(row.pk) for row in entity_type_rows}
 
         # Create hierarchy map
@@ -394,7 +397,7 @@ class Analysis:
             entity_id = [entity_id]
         rows = []
         for _id in entity_id:
-            row = EntityTable(parent=parent_entity_row, entity_type=self._entity_type_row_map[entity_type_name], id=_id)
+            row = EntityTable(parent=parent_entity_row, entity_type=self.entity_type_row_map[entity_type_name], id=_id)
             rows.append(row)
         self.session.add_all(rows)
         # Commit
@@ -447,7 +450,7 @@ class Analysis:
         if analysis_name is not None:
             query = query.filter(EntityTable.id == analysis_name)
 
-        self.root_entity = Entity(row=query.order_by(EntityTable.pk).first(), analysis=self)
+        self.root_entity = AnalysisEntity(row=query.order_by(EntityTable.pk).first(), analysis=self)
 
     def open_session(self, pool_size: int = 20, echo: bool = None):
 

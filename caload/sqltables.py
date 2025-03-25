@@ -7,7 +7,8 @@ from sqlalchemy.dialects.mysql import LONGBLOB, MEDIUMBLOB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 __all__ = ['SQLBase', 'EntityTypeTable', 'EntityTable',
-           'AttributeTable', 'TaskTable', 'EntityTaskTable']
+           'AttributeTable', 'TaskTable', 'EntityTaskTable',
+           'LinkTable']
 
 
 class SQLBase(DeclarativeBase):
@@ -45,6 +46,10 @@ class EntityTable(SQLBase):
     # One-to-Many
     children: Mapped[List['EntityTable']] = relationship('EntityTable', back_populates='parent', remote_side=[parent_pk])
     attributes: Mapped[List['AttributeTable']] = relationship('AttributeTable', back_populates='entity')
+
+    # Add Link relationships
+    links_to: Mapped[List['LinkTable']] = relationship('LinkTable', back_populates='linker')
+    linked_by: Mapped[List['LinkTable']] = relationship('LinkTable', back_populates='linkee')
 
     __table_args__ = (
         Index('ix_unique_id_per_parent_pk', 'parent_pk', 'id', unique=True),
@@ -102,6 +107,19 @@ class AttributeTable(SQLBase):
 
         # Otherwise write directly
         setattr(self, f'value_{self.data_type}', value)
+
+
+class LinkTable(SQLBase):
+    __tablename__ = 'links'
+
+    linker_pk: Mapped[int] = mapped_column(ForeignKey('entities.pk'), primary_key=True)
+    linkee_pk: Mapped[int] = mapped_column(ForeignKey('entities.pk'), primary_key=True)
+
+    entity_pk: Mapped[int] = mapped_column(ForeignKey('entities.pk'))
+
+    linker: Mapped['EntityTable'] = relationship('EntityTable', back_populates='links_to')
+    linkee: Mapped['EntityTable'] = relationship('EntityTable', back_populates='linked_by')
+    entity: Mapped['EntityTable'] = relationship('EntityTable')
 
 
 # Tasks

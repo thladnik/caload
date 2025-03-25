@@ -22,9 +22,10 @@ def tokenize(expression):
     token_pattern = r"""
         (?P<STRING_SINGLE>'[^']*')                               # Strings in single quotes
         |(?P<STRING_DOUBLE>"[^"]*")                              # Strings in double quotes
-        |(?P<DATETIME>\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\b)    # ISO 8601 datetime (YYYY-MM-DDTHH:MM:SS)
+        |(?P<DATETIME>\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\b)   # ISO 8601 datetime (YYYY-MM-DDTHH:MM:SS)
         |(?P<DATE>\b\d{4}-\d{2}-\d{2}\b)                         # Date (YYYY-MM-DD)
         |(?P<FLOAT>-?\d+\.\d+)                                   # Float numbers
+        |(?P<FLOAT_NOTRAIL>-?\d+\.)                              # Float numbers without explicit decimal
         |(?P<INTEGER>-?\d+)                                      # Integer numbers
         |(?P<BOOLEAN>\bTrue\b|\bFalse\b)                         # Boolean values
         |(?P<IDENTIFIER>\b[\w/]+\b)                              # Identifiers (like signal1 or name1/subname1)
@@ -46,18 +47,16 @@ def tokenize(expression):
         token_value = match.group(token_type)
 
         if token_type == 'DATETIME':
-            # Convert datetime string to datetime.datetime object
             token_value = datetime.strptime(token_value, '%Y-%m-%dT%H:%M:%S')
         elif token_type == 'DATE':
-            # Convert date string to datetime.date object only if it's not enclosed in quotes
             token_value = datetime.strptime(token_value, '%Y-%m-%d').date()
-        elif token_type == 'FLOAT':
+        elif token_type == 'FLOAT' or token_type == 'FLOAT_NOTRAIL':
             token_value = float(token_value)  # Convert float string to float
         elif token_type == 'INTEGER':
             token_value = int(token_value)  # Convert integer string to int
         elif token_type == 'BOOLEAN':
-            # Keep boolean values as is
-            token_value = True if token_value == 'True' else False
+            # Convert to boolean string to bool
+            token_value = True if token_value.lower() == 'true' else False
         elif token_type == 'STRING_SINGLE' or token_type == 'STRING_DOUBLE':
             # Strip the quotes around the string and treat it as a string
             token_value = token_value[1:-1]
@@ -259,9 +258,100 @@ def get_entity_query_by_attributes(entity_type_name: str, session: Session,
         query = query.filter(filters)
 
     return query
+#%%
+# NEW:
+from __future__ import annotations
+import operator
+import pprint
+from typing import List, Any, Union, Tuple, Callable
+
+
+class Attr:
+
+    def __init__(self, name: str):
+        self.name = name
+
+    def __repr__(self):
+        return f"Attr('{self.name}')"
+
+    def __eq__(self, other: Any):
+        return Filter(self, operator.eq, other)
+
+    def __lt__(self, other: Any):
+        return Filter(self, operator.lt, other)
+
+    def __le__(self, other):
+        return Filter(self, operator.le, other)
+
+    def __gt__(self, other: Any):
+        return Filter(self, operator.gt, other)
+
+    def __ge__(self, other):
+        return Filter(self, operator.ge, other)
+
+    def __invert__(self):
+        return Filter(self, operator.not_)
+
+    def exists(self):
+        return Filter(self, operator.contains)
+
+    def not_exists(self):
+        return Filter(Filter(self, operator.contains), operator.not_)
+
+
+class Filter:
+
+    args: Tuple[Union[Attr, Filter], Callable]
+
+    def __init__(self, *args):
+        self.args = args
+
+    def __repr__(self):
+        return f"Filter({self.args})"
+
+    def tree(self, level: int = 0):
+
+        operator_map = {
+            operator.and_: '&',
+            operator.or_: '|',
+            operator.xor: '^',
+
+            operator.eq: '==',
+            operator.lt: '<',
+            operator.gt: '>',
+            operator.le: '<=',
+            operator.ge: '>=',
+        }
+
+        _str = ''
+        for arg in self.args:
+            if isinstance(arg, Filter):
+                _str += arg.tree(level+1)
+            elif isinstance(arg, Attr):
+                _str += '\t' * level + str(arg)
+            elif arg in (operator.and_, operator.or_, operator.xor):
+                _str += '\n' + '\t' * level + f'{operator_map[arg]}\n'
+            elif arg in (operator.eq, operator.lt, operator.gt, operator.le, operator.ge):
+                _str += ' ' + operator_map[arg] + ' '
+            else:
+                _str += str(arg) + ' '
+
+        return _str
+
+    def __and__(self, other: Filter) -> Filter:
+        return Filter(self, operator.and_, other)
+
+    def __or__(self, other: Filter) -> Filter:
+        return Filter(self, operator.or_, other)
+
+    def __xor__(self, other: Filter) -> Filter:
+        return Filter(self, operator.xor, other)
+
+#%%
 
 
 if __name__ == '__main__':
+    # Test implicit (string) filters
     # expression = "(signal1 == 2024-09-06 AND signal2 > 2024-09-06T14:30:00 OR signal3 == '2024-08-02_fish1')"
     # expression = "(animal_id == 2024-08-02_fish1)"
     # expression = 'rec_id == "rec2" AND rec_date == 2024-07-07 AND animal_id == "2024-08-02_fish1"'
@@ -270,7 +360,6 @@ if __name__ == '__main__':
     #                      "(EXIST signal1) "
     #                      "AND rec_id == 'rec2' "
     #                      "AND NOT (rec_date == 2024-07-07 OR animal_id == '2024-08-02_fish1')")
-
     expression_string = 'bla < -5'
     parsed_expression = parse_boolean_expression(expression_string)
     pprint.pprint(parsed_expression)
@@ -278,3 +367,11 @@ if __name__ == '__main__':
     expression_string = 'bla < 5'
     parsed_expression = parse_boolean_expression(expression_string)
     pprint.pprint(parsed_expression)
+
+    pprint.pprint(
+        parse_expression(
+            tokenize('attr1 > 1. AND (attr2 == "one" OR attr3 <= 11) and (EXIST(attr4) or not(exist(attr5)))')))
+
+    # Test explicit filters
+    f = (Attr('attr1') > 1.0) & ((Attr('attr2') < -22) | (Attr('attr3') == 'bla'))
+    print(f.tree())
