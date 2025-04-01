@@ -17,7 +17,7 @@ from pandas._libs import lib
 from pandas._typing import Axis, IndexLabel, SortKind, ValueKeyFunc
 from sqlalchemy import case, func
 from sqlalchemy.dialects.mysql import insert as mysql_insert
-from sqlalchemy.orm import Query
+from sqlalchemy.orm import Query, aliased
 from tqdm import tqdm
 
 import caload
@@ -43,6 +43,7 @@ class EntityCollection:
     _entity_type: Union[Type[Entity], Type[E]]
     _entity_type_name: str
     _synced_dataframe: SyncedDataFrame = None
+    _pk_order: Union[None, List[int]] = None
 
     def __init__(self, entity_type: Union[str, Type[E]], analysis: Analysis, query: Query):
 
@@ -59,7 +60,7 @@ class EntityCollection:
 
         self.analysis = analysis
         self._query = query
-        self._query_custom_orderby = None
+        self._query_custom_orderby = False
         self._cache = pd.DataFrame()
         self._pending_changes: Dict[str, List[int]] = {}
 
@@ -174,6 +175,66 @@ class EntityCollection:
     def entity_type(self):
         return self._entity_type
 
+    @property
+    def query(self):
+        """Property which should be used *exclusively* to access the Query object.
+        This is important, because there is no default order to SELECTs (unless specified).
+        This means that repeated iterations over the EntityCollection instance
+        may return differently ordered results.
+        """
+        if not self._query_custom_orderby:
+            self._query = self._query.order_by(None).order_by('pk')
+
+        return self._query
+
+    @property
+    def dataframe(self):
+        if self._synced_dataframe is None:
+            self._synced_dataframe = SyncedDataFrame(entity_collection=self)
+        return self._synced_dataframe
+
+    @property
+    @retry_on_operational_failure
+    def attribute_rows(self) -> List[Tuple[str, str]]:
+        attr_query = (self.analysis.session.query(AttributeTable.name, AttributeTable.data_type)
+                      .join(EntityTable)
+                      .filter(EntityTable.pk.in_(self.query.subquery().primary_key))
+                      .join(EntityTypeTable)
+                      .filter(EntityTypeTable.name == self._entity_type_name)
+                      .distinct())
+        return [(row.name, row.data_type) for row in attr_query.all()]
+
+    @retry_on_operational_failure
+    def order_by(self, by: Union[List[str], None], ascending: List[bool] = None):
+
+        # Reset order to default
+        if by is None:
+            self._query = self._query.order_by(None)
+            self._query_custom_orderby = False
+            self._pk_order = None
+            return
+
+        if ascending is None:
+            ascending = [True] * len(by)
+
+        attribute_types = {n: t for n, t in self.attribute_rows}
+
+        for attr_name, asc in zip(by, ascending):
+
+            order = 'asc' if asc else 'desc'
+
+            attr_alias = aliased(AttributeTable)
+            self._query = (self._query
+                           .join(attr_alias)
+                           .filter(attr_alias.name == attr_name)
+                           .order_by(getattr(getattr(attr_alias, f'value_{attribute_types[attr_name]}'), order)()))
+
+        # First, set to custom order
+        self._query_custom_orderby = True
+
+        # Then, run query for first time to fetch ordered pks
+        self._pk_order = [row.pk for row in self.query.all()]
+
     def restart_session(self, *args, **kwargs):
         self.analysis.restart_session(*args, **kwargs)
 
@@ -233,39 +294,10 @@ class EntityCollection:
             # Update cache
             self._cache[df.columns] = df
 
-    @property
-    def query(self):
-        """Property which should be used *exclusively* to access the Query object.
-        This is important, because there is no default order to SELECTs (unless specified).
-        This means that repeated iterations over the EntityCollection instance
-        may return differently ordered results.
-        """
-        if self._query_custom_orderby is None:
-            self._query = self._query.order_by(None).order_by('pk')
-
-        return self._query
-
-    @property
-    def dataframe(self):
-        if self._synced_dataframe is None:
-            self._synced_dataframe = SyncedDataFrame(entity_collection=self)
-        return self._synced_dataframe
-
-    @property
-    @retry_on_operational_failure
-    def attribute_rows(self) -> List[Tuple[str, str]]:
-        attr_query = (self.analysis.session.query(AttributeTable.name, AttributeTable.data_type)
-                      .join(EntityTable)
-                      .filter(EntityTable.pk.in_(self.query.subquery().primary_key))
-                      .join(EntityTypeTable)
-                      .filter(EntityTypeTable.name == self._entity_type_name)
-                      .distinct())
-        return [(row.name, row.data_type) for row in attr_query.all()]
-
     def info(self):
 
         _info = {
-            'Entity type: ': self._entity_type,
+            'Entity type: ': self.entity_type,
             'Entity count': len(self),
             'Attributes': {name: data_type for name, data_type in self.attribute_rows}
         }
@@ -275,25 +307,29 @@ class EntityCollection:
     def dataframe_of(self, attribute_names: List[str] = None, reload_cached: bool = False) -> pd.DataFrame:
 
         # If all attributes are in cache, return cached result
-        if not reload_cached and len(set(attribute_names) & set(self._cache.columns)) == len(attribute_names):
-            return self._cache[attribute_names].copy()
+        loaded_attributes = set(attribute_names) & set(self._cache.columns)
+        if reload_cached or (len(loaded_attributes) < len(attribute_names)):
+            # return self._cache[attribute_names].copy()
 
-        # Check which attributes to load
-        if not reload_cached:
-            _attributes_cached = list(set(attribute_names) & set(self._cache.columns.tolist()))
-            _attributes_to_fetch = list(set(attribute_names) - set(self._cache.columns.tolist()))
-        else:
-            _attributes_cached = []
-            _attributes_to_fetch = attribute_names
+            # Check which attributes to load
+            if not reload_cached:
+                _attributes_cached = list(set(attribute_names) & set(self._cache.columns.tolist()))
+                _attributes_to_fetch = list(set(attribute_names) - set(self._cache.columns.tolist()))
+            else:
+                _attributes_cached = []
+                _attributes_to_fetch = attribute_names
 
-        if self.analysis.debug:
-            print('Cached attributes:', _attributes_cached)
-            print('Attributes to fetch: ', _attributes_to_fetch)
+            if self.analysis.debug:
+                print('Cached attributes:', _attributes_cached)
+                print('Attributes to fetch: ', _attributes_to_fetch)
 
-        # Load attributes from database
-        self._load_attributes(_attributes_to_fetch)
+            # Load attributes from database
+            self._load_attributes(_attributes_to_fetch)
 
         # Return final DataFrame
+        if self._query_custom_orderby:
+            return self._cache.loc[self._pk_order, attribute_names]
+
         return self._cache[attribute_names].copy()
 
     @retry_on_operational_failure
@@ -354,24 +390,27 @@ class EntityCollection:
             attr_type = attribute_types[attr_name]
 
             # Cast to type
-            if attr_type == 'int':
-                df_new[attr_name] = df_new[attr_name].astype(int)
-            elif attr_type == 'float':
-                df_new[attr_name] = df_new[attr_name].astype(float)
-            elif attr_type == 'str':
-                df_new[attr_name] = df_new[attr_name].astype(str)
-            elif attr_type == 'bool':
-                df_new[attr_name] = df_new[attr_name].astype(bool)
-            elif attr_type == 'date':
-                df_new[attr_name] = pd.to_datetime(df_new[attr_name].apply(lambda s: s.decode()), format='%Y-%m-%d')
-            elif attr_type == 'datetime':
-                df_new[attr_name] = pd.to_datetime(df_new[attr_name].apply(lambda s: s.decode()), format='%Y-%m-%d %H:%M:%S')
-            # Load blobs
-            elif attr_type == 'blob':
-                df_new[attr_name] = df_new[attr_name].apply(lambda s: pickle.loads(s) if s is not None else None)
-            # Load data from path
-            elif attr_type == 'path':
-                df_new[attr_name] = df_new[attr_name].apply(lambda s: caload.files.read(self.analysis, s) if s is not None else None)
+            try:
+                if attr_type == 'int':
+                    df_new[attr_name] = df_new[attr_name].astype(int)
+                elif attr_type == 'float':
+                    df_new[attr_name] = df_new[attr_name].astype(float)
+                elif attr_type == 'str':
+                    df_new[attr_name] = df_new[attr_name].astype(str)
+                elif attr_type == 'bool':
+                    df_new[attr_name] = df_new[attr_name].astype(bool)
+                elif attr_type == 'date':
+                    df_new[attr_name] = pd.to_datetime(df_new[attr_name].apply(lambda s: s.decode()), format='%Y-%m-%d')
+                elif attr_type == 'datetime':
+                    df_new[attr_name] = pd.to_datetime(df_new[attr_name].apply(lambda s: s.decode()), format='%Y-%m-%d %H:%M:%S')
+                # Load blobs
+                elif attr_type == 'blob':
+                    df_new[attr_name] = df_new[attr_name].apply(lambda s: pickle.loads(s) if s is not None else None)
+                # Load data from path
+                elif attr_type == 'path':
+                    df_new[attr_name] = df_new[attr_name].apply(lambda s: caload.files.read(self.analysis, s) if s is not None else None)
+            except ValueError:
+                raise RuntimeWarning(f'Failed to cast attribute {attr_name} to type {attr_type}')
 
         # Set row index to primary key
         df_new.set_index('pk', drop=True, inplace=True)
