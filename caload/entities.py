@@ -165,6 +165,11 @@ class EntityCollection:
         # Delete item from cache
         del self._cache[key]
 
+        # Delete item from SynedDataFrame if it's still in there
+        #  (may not be if deletion is caused by SyncedDataFrame.commit
+        if self._synced_dataframe is not None and key in self._synced_dataframe:
+            del self._synced_dataframe[key]
+
     @property
     def entity_type(self):
         return self._entity_type
@@ -173,7 +178,7 @@ class EntityCollection:
         self.analysis.restart_session(*args, **kwargs)
 
     @retry_on_operational_failure
-    def update(self, df: pd.DataFrame):  # , overwrite: bool = False):
+    def update(self, df: pd.DataFrame):
 
         _dtypes = ['str', 'float', 'int', 'date', 'datetime', 'bool', 'blob', 'path']
 
@@ -937,19 +942,14 @@ class SyncedDataFrame(pd.DataFrame):
         # Pass original call to parent
         pd.DataFrame.__setitem__(self, key, value)
 
-    # def __delitem__(self, key):
-    #  TODO: figure out a nice way to delete columns withouth going in circles between collection and syned data frame
-    #   probably good idea: remove deleted columns from DataFrame and mark them as deleted in a list,
-    #     pending a call to commit to finalize deletion in database via EntityCollection.__delitem__
-    #
-    #     if isinstance(key, str):
-    #         key = [key]
-    #
-    #     if isinstance(key, list):
-    #         for k in key:
-    #             self.loaded_columns.remove(k)
-    #     # Pass original call to parent
-    #     pd.DataFrame.__delitem__(self, key)
+    def __delitem__(self, key):
+
+        # Add to list of pending columns, to mark it for deletetion upon commit
+        if isinstance(key, str) and key in self.columns:
+            self.pending_columns.append(key)
+
+        # Pass original call to parent
+        pd.DataFrame.__delitem__(self, key)
 
     # Overwrite all functions that might alter the DataFrame's index
     #  Changing the index must be prevented, as it would alter the entity identities in the database
@@ -1002,7 +1002,15 @@ class SyncedDataFrame(pd.DataFrame):
         """Save all pending changes to the database
         """
 
-        # Call entity collection's update method with updated columns
+        # Get columns to be deleted (columns which are marked as pending, but don't exist in DataFrame)
+        columns_to_delete = list(set(self.pending_columns) - set(self.columns))
+
+        # Delete columns from collection and remove deleted columns from pending list
+        for k in columns_to_delete:
+            del self.entity_collection[k]
+            self.pending_columns.remove(k)
+
+        # Call entity collection's update (upsert) method with updated columns
         self.entity_collection.update(self[self.pending_columns])
 
         # Add changed columns to list of loaded one
