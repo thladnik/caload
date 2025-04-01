@@ -61,7 +61,9 @@ from tqdm import tqdm
 import caload
 from caload.entities import *
 
-__all__ = ['Animal', 'Recording', 'Roi', 'Phase', 'digest', 'schema']
+__all__ = ['Animal', 'Recording', 'Roi', 'Phase', 'AnimalCollection',
+           'RecordingCollection', 'RoiCollection', 'PhaseCollection',
+           'digest', 'schema']
 
 
 class AnimalCollection(EntityCollection):
@@ -426,8 +428,8 @@ def get_recording(animal: Animal, path: str) -> Recording:
 
     # Get recording
     rec_id = Path(path).as_posix().split('/')[-1]
-    expr = f'animal_id == "{animal.id}" AND rec_id == "{rec_id}"'
-    recording_collection = animal.analysis.get(Recording, expr)
+    # expr = f'animal_id == "{animal.id}" AND rec_id == "{rec_id}"'
+    recording_collection = animal.analysis.get(Recording, animal_id=animal.id, rec_id=rec_id)
     # Add recording
     if len(recording_collection) > 0:
         if len(recording_collection) > 1:

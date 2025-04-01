@@ -7,11 +7,14 @@ import pickle
 import pprint
 import shutil
 import time
-from typing import Any, Callable, Dict, List, TYPE_CHECKING, Tuple, Type, TypeVar, Union
+from typing import Any, Callable, Dict, Hashable, List, Sequence, TYPE_CHECKING, Tuple, Type, TypeVar, Union
 
 import numpy as np
 import pandas as pd
 import sqlalchemy.exc
+from pandas import DataFrame
+from pandas._libs import lib
+from pandas._typing import Axis, IndexLabel, SortKind, ValueKeyFunc
 from sqlalchemy import case, func
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.orm import Query
@@ -152,11 +155,19 @@ class EntityCollection:
 
     def __delitem__(self, key):
 
+        # Delete item from table
         query = (self.analysis.session.query(AttributeTable)
                  .filter(AttributeTable.name == key)
                  .filter(AttributeTable.entity_pk.in_(self.query.subquery().primary_key)))
         query.delete()
         self.analysis.session.commit()
+
+        # Delete item from cache
+        del self._cache[key]
+
+    @property
+    def entity_type(self):
+        return self._entity_type
 
     def restart_session(self, *args, **kwargs):
         self.analysis.restart_session(*args, **kwargs)
@@ -364,7 +375,7 @@ class EntityCollection:
         self._cache[df_new.columns] = df_new
 
     def where(self, *filter_expressions, **equalities) -> EntityCollection:
-        return self.analysis.get(self._entity_type, *filter_expressions, entity_query=self.query, **equalities)
+        return self.analysis.get(self.entity_type, *filter_expressions, entity_query=self.query, **equalities)
 
     @property
     def attributes(self):
@@ -858,6 +869,10 @@ E = TypeVar('E')
 
 class SyncedDataFrame(pd.DataFrame):
 
+    # TODO: required implementations
+    #    - sort_values() for inplace=False (inplace=True does not return new copy)
+    #    - all selection methods, like loc, iloc, etc
+
     def __init__(self, entity_collection: EntityCollection, *args, **kwargs):
 
         # Set stuff
@@ -887,6 +902,82 @@ class SyncedDataFrame(pd.DataFrame):
     def loaded_columns(self) -> List[str]:
         return object.__getattribute__(self, '_loaded_columns')
 
+    def __getitem__(self, item):
+
+        # Make sure all required columns are loaded from database
+        if isinstance(item, (list, str)):
+            self.load_columns(item if isinstance(item, list) else [item])
+
+        # Pass original call to parent
+        df = pd.DataFrame.__getitem__(self, item)
+
+        # If returned DataFrame has fewer rows,
+        #  we need to create a new EntityCollection and return its SynedDataFrame
+        if df.shape[0] < self.shape[0]:
+            entity_collection = self.entity_collection.analysis.get_by_pk(self.entity_collection.entity_type,
+                                                                          pk=df.index)
+
+            return entity_collection.dataframe
+
+        return df
+
+    def __setitem__(self, key, value):
+
+        _key = key
+        if isinstance(_key, str):
+            _key = [_key]
+
+        if isinstance(_key, list):
+            # Eliminate duplicates
+            _new = list(set(_key) - set(self.pending_columns))
+
+            # Add newly added ones to list
+            self.pending_columns.extend(_new)
+
+        # Pass original call to parent
+        pd.DataFrame.__setitem__(self, key, value)
+
+    # def __delitem__(self, key):
+    #  TODO: figure out a nice way to delete columns withouth going in circles between collection and syned data frame
+    #   probably good idea: remove deleted columns from DataFrame and mark them as deleted in a list,
+    #     pending a call to commit to finalize deletion in database via EntityCollection.__delitem__
+    #
+    #     if isinstance(key, str):
+    #         key = [key]
+    #
+    #     if isinstance(key, list):
+    #         for k in key:
+    #             self.loaded_columns.remove(k)
+    #     # Pass original call to parent
+    #     pd.DataFrame.__delitem__(self, key)
+
+    # Overwrite all functions that might alter the DataFrame's index
+    #  Changing the index must be prevented, as it would alter the entity identities in the database
+    def _raise_index_exception(self):
+        raise Exception('Resetting index of SynedDataFrame is a big no-no. '
+                        'Index contains entity primary keys. '
+                        'Please create static copy of DataFrame instead, using SynedDataFrame.to_static()')
+
+    def reset_index(self, *args, **kwargs):
+        self._raise_index_exception()
+
+    def set_index(self, *args, **kwargs):
+        self._raise_index_exception()
+
+    def reindex(self, *args, **kwargs):
+        self._raise_index_exception()
+
+    def reindex_like(self, *args, **kwargs):
+        self._raise_index_exception()
+
+    def to_static(self):
+
+        # Load all columns
+        self.load_columns(self.columns)
+
+        # Return DataFrame
+        return pd.DataFrame(data=self)
+
     def load_columns(self, column_names: List[str]):
 
         # Compile list of attributes to fetch (attributes which are not loaded and weren't newly added)
@@ -906,31 +997,6 @@ class SyncedDataFrame(pd.DataFrame):
             #  to be set as updated_columns, so we remove them here
             _new_updated_columns = list(set(self.pending_columns) - set(attributes_to_fetch))
             object.__setattr__(self, '_pending_columns', _new_updated_columns)
-
-    def __getitem__(self, item):
-
-        # Make sure all required columns are loaded from database
-        if isinstance(item, (list, str)):
-            self.load_columns(item if isinstance(item, list) else [item])
-
-        # Pass original call to parent
-        return pd.DataFrame.__getitem__(self, item)
-
-    def __setitem__(self, key, value):
-
-        _key = key
-        if isinstance(_key, str):
-            _key = [_key]
-
-        if isinstance(_key, list):
-            # Eliminate duplicates
-            _new = list(set(_key) - set(self.pending_columns))
-
-            # Add newly added ones to list
-            self.pending_columns.extend(_new)
-
-        # Pass original call to parent
-        pd.DataFrame.__setitem__(self, key, value)
 
     def commit(self):
         """Save all pending changes to the database

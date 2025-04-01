@@ -11,7 +11,7 @@ import logging
 import multiprocessing as mp
 import os
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Tuple, Type, TypeVar, Union
+from typing import Any, Callable, Dict, Iterable, List, Tuple, Type, TypeVar, Union
 
 import yaml
 from sqlalchemy import Engine, create_engine, text
@@ -497,8 +497,10 @@ class Analysis:
         self.open_session(*args, **kwargs)
         self.session.rollback()
 
-    def get(self, entity_type: Union[str, Type[EntityType]], *filter_expressions: str,
-            entity_query: Query = None, **equalities: Dict[str, Any]) -> EntityType.collection_type:
+    def get(self, entity_type: Union[str, Type[EntityType]],
+            *filter_expressions: str,
+            entity_query: Query = None,
+            **equalities: Any) -> EntityType.collection_type:
 
         self.open_session()
 
@@ -528,6 +530,27 @@ class Analysis:
         query = caload.filter.get_entity_query_by_attributes(entity_type_name, self.session, expr, entity_query=entity_query)
 
         # Return collection for resulting query
+        return entity_type.collection_type(entity_type, analysis=self, query=query)
+
+    def get_by_pk(self, entity_type: Union[str, Type[EntityType]], pk: Union[int, Iterable[int]]):
+
+        # Get entity name
+        if isinstance(entity_type, str):
+            entity_type = Entity
+            entity_type_name = entity_type
+        else:
+            if type(entity_type) is not type or not issubclass(entity_type, Entity):
+                raise TypeError('Entity type has to be either str or a subclass of Entity')
+
+            entity_type_name = entity_type.__name__
+
+        if isinstance(pk, int):
+            pk = [pk]
+
+        # Create base query
+        query = self.session.query(EntityTable).join(EntityTypeTable).filter(EntityTypeTable.name == entity_type_name)
+        query = query.filter(EntityTable.pk.in_(pk))
+
         return entity_type.collection_type(entity_type, analysis=self, query=query)
 
     def get_temp_path(self, path: str):
