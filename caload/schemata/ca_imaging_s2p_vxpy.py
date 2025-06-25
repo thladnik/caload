@@ -143,7 +143,15 @@ class Phase(Entity):
 schema = [Animal, Recording, Roi, Phase]
 
 
-def digest(analysis: caload.analysis.Analysis, data_path: Union[str, os.PathLike]):
+def digest(analysis: caload.analysis.Analysis, data_path: Union[str, os.PathLike],
+           sync_type: str = None, sync_signal: str = None, sync_signal_time: str = None):
+
+    if sync_signal is None:
+        sync_signal = 'ai_y_mirror_in'
+        sync_signal_time = 'ai_y_mirror_in_time'
+
+    if sync_type is None:
+        sync_type = 'y_mirror'
 
     # Scan for data folders
     folder_list = scan_folder(data_path, [])
@@ -175,14 +183,23 @@ def digest(analysis: caload.analysis.Analysis, data_path: Union[str, os.PathLike
         print('Calculate frame timing of signal')
         with h5py.File(os.path.join(recording_path, 'Io.hdf5'), 'r') as io_file:
 
-            mirror_position = np.squeeze(io_file['ai_y_mirror_in'])[:]
-            mirror_time = np.squeeze(io_file['ai_y_mirror_in_time'])[:]
+            mirror_position = np.squeeze(io_file[sync_signal])[:]
+            mirror_time = np.squeeze(io_file[sync_signal_time])[:]
 
-            # Calculate frame timing
-            frame_idcs, frame_times = calculate_ca_frame_times(mirror_position, mirror_time)
+            if sync_type == 'y_mirror':
+                # Calculate frame timing
+                frame_idcs, frame_times = calculate_ca_frame_times_from_y_mirror(mirror_position, mirror_time)
+            else:
+                raise Exception('Unknown sync type')
 
-            record_group_ids = io_file['__record_group_id'][:].squeeze()
-            record_group_ids_time = io_file['__time'][:].squeeze()
+            # Interpolate record group IDs to imaging frame time
+            try:
+                record_group_ids = io_file['__record_group_id'][:].squeeze()
+                record_group_ids_time = io_file['__time'][:].squeeze()
+            except KeyError as _:
+                # For backwards compatibility to pre-2023
+                record_group_ids = io_file['record_group_id'][:].squeeze()
+                record_group_ids_time = io_file['global_time'][:].squeeze()
 
             ca_rec_group_id_fun = scipy.interpolate.interp1d(record_group_ids_time, record_group_ids, kind='nearest')
 
@@ -479,7 +496,7 @@ def unravel_dict(dict_data: dict, entity: caload.entities.Entity, path: str):
         entity[f'{path}/{key}'] = item
 
 
-def calculate_ca_frame_times(mirror_position: np.ndarray, mirror_time: np.ndarray):
+def calculate_ca_frame_times_from_y_mirror(mirror_position: np.ndarray, mirror_time: np.ndarray):
 
     peak_prominence = (mirror_position.max() - mirror_position.min()) / 4
     peak_idcs, _ = scipy.signal.find_peaks(mirror_position, prominence=peak_prominence)

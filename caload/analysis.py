@@ -272,9 +272,9 @@ def delete_analysis(analysis_path: str = None):
     print(f'Successfully deleted analysis {analysis_path}')
 
 
-def digest_data(analysis: Analysis, digest_fun: Callable, data_root_path: Union[str, os.PathLike]):
+def digest_data(analysis: Analysis, digest_fun: Callable, data_root_path: Union[str, os.PathLike], *args, **kwargs):
     analysis.mode = Mode.create
-    digest_fun(analysis, data_root_path)
+    digest_fun(analysis, data_root_path, *args, **kwargs)
     analysis.mode = Mode.analyse
 
 
