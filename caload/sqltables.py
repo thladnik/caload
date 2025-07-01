@@ -2,6 +2,7 @@ import pickle
 from datetime import date, datetime
 from typing import List
 
+import numpy as np
 from sqlalchemy import Index, ForeignKey, String, create_engine
 from sqlalchemy.dialects.mysql import LONGBLOB, MEDIUMBLOB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -99,6 +100,10 @@ class AttributeTable(SQLBase):
         if self.data_type == 'blob':
             self.value_blob = pickle.dumps(value)
             return
+
+        # Make NaN's compatible
+        if self.data_type == 'float' and np.isnan(value):
+            value = None
 
         # Otherwise write directly
         setattr(self, f'value_{self.data_type}', value)

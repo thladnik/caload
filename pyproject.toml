@@ -32,6 +32,7 @@ dependencies = [
     'matplotlib',
     'numpy',
     'tifffile',
+    'pymysql',
     'pyyaml',
     'scipy',
     'tqdm',

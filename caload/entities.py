@@ -392,7 +392,9 @@ class EntityCollection:
             # Cast to type
             try:
                 if attr_type == 'int':
-                    df_new[attr_name] = df_new[attr_name].astype(int)
+                    # TODO: Int conversion regularly throws pandas.errors.IntCastingNaNError
+                    #  because there's no valid value for empty rows (i.e. Nones), ignore for now
+                    df_new[attr_name] = df_new[attr_name].astype(int, errors='ignore')
                 elif attr_type == 'float':
                     df_new[attr_name] = df_new[attr_name].astype(float)
                 elif attr_type == 'str':
