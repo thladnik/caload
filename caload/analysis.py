@@ -335,6 +335,15 @@ class Analysis:
         # Select analysis entity row
         self.select_analysis(select_analysis)
 
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # Remove unpicklable attributes
+        if 'session' in state:
+            del state['session']
+        if 'sql_engine' in state:
+            del state['sql_engine']
+        return state
+
     def __repr__(self):
         return f"Analysis('{self.analysis_path}')"
 

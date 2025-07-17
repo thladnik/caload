@@ -662,6 +662,14 @@ class Entity:
 
         self.load()
 
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # Remove unpicklable attributes
+        if self._row is not None:
+            state['_row_pk'] = self._row.pk
+        state['_row'] = None
+        return state
+
     def __repr__(self):
         return f"{self.row.entity_type.name}(id='{self.row.id}', parent={self.parent})"
 
