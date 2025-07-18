@@ -291,63 +291,59 @@ def digest(analysis: caload.analysis.Analysis, data_path: Union[str, os.PathLike
         # Commit rois
         analysis.session.commit()
 
-        print('Add display phase data')
-        with h5py.File(os.path.join(recording_path, 'Display.hdf5'), 'r') as disp_file:
+        print(f'Process directory data in {recording_path}')
+        for data_fn in os.listdir(recording_path):
+            if not any([data_fn.lower().endswith(fn) for fn in ['.h5', 'hdf5']]):
+                continue
 
-            # Get attributes
-            recording.update({f'display/attrs/{k}': v for k, v in disp_file.attrs.items()})
+            # Get short name for attribute names
+            fn_short = data_fn.split('.')[0].lower()
+            with h5py.File(os.path.join(recording_path, data_fn), 'r') as h5file:
 
-            for key1, member1 in tqdm(disp_file.items()):
-
-                # If dataset, write to file
-                if isinstance(member1, h5py.Dataset):
-                    recording[f'display/{key1}'] = np.squeeze(member1[:])
-                    continue
-
-                # Otherwise it's a group -> keep going
-
-                # Add phase
-                if 'phase' in key1:
-                    phase_id = key1
-
-                    phase_id_int = int(key1.replace('phase', ''))
-                    phase = recording.add_child_entity(Phase, entity_id=phase_id)
-                    phase['animal_id'] = animal.id
-                    phase['rec_id'] = recording.id
-                    phase['phase_id'] = phase_id
-                    phase['phase_id_int'] = phase_id_int
-
-                    # Add calcium start/end indices
-                    in_phase_idcs = np.where(record_group_ids == phase_id_int)[0]
-                    start_index = np.argmin(np.abs(frame_times - frame_times[in_phase_idcs[0]]))
-                    end_index = np.argmin(np.abs(frame_times - frame_times[in_phase_idcs[-1]]))
-                    phase['ca_start_index'] = start_index
-                    phase['ca_end_index'] = end_index
-
-                    # Write attributes
-                    phase.update({k: v for k, v in member1.attrs.items()})
-
-                    # Write datasets
-                    for key2, member2 in member1.items():
-                        if isinstance(member2, h5py.Dataset):
-                            phase[key2] = np.squeeze(member2[:])
-
-                # Add other data
-                else:
-                    # Write attributes
-                    recording.update({f'display/{key1}/{k}': v for k, v in member1.attrs.items()})
-
-                    # Get datasets
-                    for key2, member2 in member1.items():
-                        if isinstance(member2, h5py.Dataset):
-                            recording[f'display/{key1}/{key2}'] = np.squeeze(member2[:])
+                print(f'> {data_fn}')
+                # Get attributes
+                recording.update({f'{fn_short}/attrs/{k}': v for k, v in h5file.attrs.items()})
+                for key1, member1 in tqdm(h5file.items()):
+                    # If dataset, write to file
+                    if isinstance(member1, h5py.Dataset):
+                        recording[f'{fn_short}/{key1}'] = np.squeeze(member1[:])
+                        continue
+                    # Otherwise it's a group -> keep going
+                    # Add phase
+                    if 'phase' in key1:
+                        phase_id = key1
+                        phase_id_int = int(key1.replace('phase', ''))
+                        phase = recording.add_child_entity(Phase, entity_id=phase_id)
+                        phase['animal_id'] = animal.id
+                        phase['rec_id'] = recording.id
+                        phase['phase_id'] = phase_id
+                        phase['phase_id_int'] = phase_id_int
+                        # Add calcium start/end indices
+                        in_phase_idcs = np.where(record_group_ids == phase_id_int)[0]
+                        start_index = np.argmin(np.abs(frame_times - frame_times[in_phase_idcs[0]]))
+                        end_index = np.argmin(np.abs(frame_times - frame_times[in_phase_idcs[-1]]))
+                        phase['ca_start_index'] = start_index
+                        phase['ca_end_index'] = end_index
+                        # Write attributes
+                        phase.update({k: v for k, v in member1.attrs.items()})
+                        # Write datasets
+                        for key2, member2 in member1.items():
+                            if isinstance(member2, h5py.Dataset):
+                                phase[key2] = np.squeeze(member2[:])
+                    # Add other data
+                    else:
+                        # Write attributes
+                        recording.update({f'{fn_short}/{key1}/{k}': v for k, v in member1.attrs.items()})
+                        # Get datasets
+                        for key2, member2 in member1.items():
+                            if isinstance(member2, h5py.Dataset):
+                                recording[f'{fn_short}/{key1}/{key2}'] = np.squeeze(member2[:])
 
         # Commit phases and display data
         analysis.session.commit()
 
 
 def scan_folder(root_path: str, recording_list: List[str]) -> List[str]:
-
     for fld in os.listdir(root_path):
         current_path = os.path.join(root_path, fld)
 
@@ -369,7 +365,6 @@ def scan_folder(root_path: str, recording_list: List[str]) -> List[str]:
 
 
 def get_animal(analysis: caload.analysis.Analysis, path: str) -> Animal:
-
     # Create animal
     path_parts = Path(path).as_posix().split('/')
     animal_id = path_parts[-2]
