@@ -238,6 +238,7 @@ def delete_analysis(analysis_path: str = None):
 
     if verification_str != config['dbname']:
         print('Abort.')
+        return
 
     print(f'Deleting all data for analysis {analysis_path}')
 
