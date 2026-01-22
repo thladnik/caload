@@ -68,7 +68,7 @@ Animal
 from __future__ import annotations
 import os
 from pathlib import Path
-from typing import List, Tuple, Type, Union
+from typing import Callable, List, Tuple, Type, Union
 
 import h5py
 import numpy as np
@@ -165,7 +165,7 @@ schema = [Animal, Recording, Roi, Phase]
 
 def digest(analysis: caload.analysis.Analysis, data_path: Union[str, os.PathLike],
            sync_type: str = None, sync_signal: str = None, sync_signal_time: str = None,
-           frame_avg_num: int = 1):
+           frame_avg_num: Union[int, Callable] = 1):
 
     if sync_signal is None:
         sync_signal = 'ai_y_mirror_in'
@@ -239,8 +239,16 @@ def digest(analysis: caload.analysis.Analysis, data_path: Union[str, os.PathLike
                 print(f'Recording already exists with {len(recording.rois)} ROIs. Skipping')
                 continue
 
+            if isinstance(frame_avg_num, int):
+                frame_avg_num_cur = frame_avg_num
+            else:
+                if not callable(frame_avg_num):
+                    raise Exception('frame_avg_num must be int or callable function')
+
+                frame_avg_num_cur = frame_avg_num(animal.id, recording.id)
+
             # Get frame times for this layer
-            frame_times = frame_times_all[int(layer_idx + frame_avg_num // 2)::(layer_num * frame_avg_num)]
+            frame_times = frame_times_all[int(layer_idx + frame_avg_num_cur // 2)::(layer_num * frame_avg_num_cur)]
 
             # Load suite2p's analysis options
             print('Include suite2p ops')
